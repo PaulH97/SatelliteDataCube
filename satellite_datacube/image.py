@@ -7,8 +7,8 @@ from rasterio.mask import mask
 import pandas as pd 
 import fiona
 from datetime import datetime
-from utils import patchify, save_patch
-from band import SatelliteBand
+from .utils import patchify, save_patch
+from .band import SatelliteBand
 
 class SatelliteImage:
     def __init__(self):
