@@ -1,0 +1,2 @@
+# SatelliteDataCube
+The main purpose of the classes and functions is to provide users with an ordered structure of their satellite data and also to support the pre-processing of this data, especially for machine learning applications.
