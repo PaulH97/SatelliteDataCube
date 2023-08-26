@@ -6,8 +6,9 @@ import re
 from rasterio.mask import mask
 import pandas as pd 
 import fiona
+from datetime import datetime
 from utils import patchify, save_patch
-from satellite_band import SatelliteBand
+from band import SatelliteBand
 
 class SatelliteImage:
     def __init__(self):
@@ -180,9 +181,9 @@ class Sentinel2(SatelliteImage):
     
     def __init__(self, si_folder):
         super().__init__()
-        self.folder = si_folder # D:\WeMonitor\Data\Landslides\S2\Thrissur\20171110
-        self.location = os.path.basename(os.path.dirname(self.folder)) # Thrissur
-        self.date = datetime.strptime(os.path.basename(self.folder), "%Y%m%d") # 20171110
+        self.folder = si_folder #
+        self.location = os.path.basename(os.path.dirname(self.folder))
+        self.date = datetime.strptime(os.path.basename(self.folder), "%Y%m%d")
 
     def calculate_indices(self, save_file=True):
         

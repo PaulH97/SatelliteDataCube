@@ -5,7 +5,7 @@ from matplotlib import pyplot as plt
 import json
 import h5py
 from utils import patchify, select_patches
-from satellite_image import Sentinel2
+from image import Sentinel2
 
 class SatelliteDataCube:
     def __init__(self, base_folder, parameters, preprocess=True):
