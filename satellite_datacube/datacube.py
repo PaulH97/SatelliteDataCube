@@ -98,6 +98,7 @@ class SatelliteDataCube:
         of the satellite images, are available. If required data for the desired timeseries 
         length isn't already present, it is built using the `create_global_data` method. 
         Otherwise, it's loaded using the `load_global_data` method.
+        
         2. Creating or loading patches: This step divides satellite images into patches for 
         both image and mask data. If patches meeting the desired size aren't already loaded, 
         they are processed using the `process_patches` method. If they are present, they are 
