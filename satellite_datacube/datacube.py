@@ -5,6 +5,7 @@ from matplotlib import pyplot as plt
 import json
 from .utils import patchify, select_patches, create_and_select_patches
 from .image import Sentinel2
+import random
 
 # TODO:
 # - exclude patches as self attribute -> we want to create multiple patches and not store a specific one in the data cube.. instead we want to use a load function to load it
@@ -25,15 +26,14 @@ class SatelliteDataCube:
         self.timeseries_length = parameters["timeseries_length"]
         self.patch_size = parameters["patch_size"]
         self.bad_pixel_limit = parameters["bad_pixel_limit"]
+        self.satellite_images = self.load_satellite_images()
         self.global_mask = None
-        self.satellite_images = {}
         self.selected_timeseries = {} 
         self.patches = {}
         self.seed = 42
 
         if load_data:
             self.global_mask = self.load_global_mask()
-            self.satellite_images = self.load_satellite_images()
             self.selected_timeseries = self.load_timeseries() # single selected ts that can be chnaged with function load_ts from json
             self.patches = self.load_patches()
             
@@ -120,6 +120,41 @@ class SatelliteDataCube:
             print("Loading patches as empty dictonary")
         return patches
 
+    def load_satellite_images(self):
+        """
+        Initialize satellite images by scanning the base folder and processing valid satellite image directories.
+
+        This function scans the base folder for directories with numeric names, assuming each such directory 
+        corresponds to a satellite image. For every valid directory found, an instance of the `Sentinel2` class 
+        is created to represent the satellite image, and the resulting instances are stored in a dictionary 
+        where the keys are the indices and the values are the `Sentinel2` instances.
+
+        Note:
+        The function assumes that valid satellite image directories in the base folder have numeric names.
+
+        Returns:
+        - dict: A dictionary where keys are indices of the satellite images and values are corresponding 
+                `Sentinel2` instances representing the images.
+
+        Example:
+        Given a base folder structure like:
+        base_folder/
+        ├── 20180830/
+        ├── 20180911/
+        ├── temp/
+        Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
+        with their corresponding `Sentinel2` instances.
+        """
+        print("Initializing satellite images")
+        return {
+            i: Sentinel2(si_folder)
+            for i, si_folder in enumerate(
+                si_folder.path 
+                for si_folder in os.scandir(self.base_folder) 
+                if os.path.isdir(si_folder.path) and si_folder.name.isdigit()
+            )
+        }
+
     def load_or_built_global_mask(self):
         """
         Ensure that the global dataset is either loaded from existing storage or constructed afresh.
@@ -184,50 +219,6 @@ class SatelliteDataCube:
             patches = self.create_patches(patch_size=self.patches_size, timeseriesLength=self.timeseries_length, output_folder=patches_folder)
         return patches
 
-    def load_satellite_images(self):
-        """
-        Initialize satellite images by scanning the base folder and processing valid satellite image directories.
-
-        This function scans the base folder for directories with numeric names, assuming each such directory 
-        corresponds to a satellite image. For every valid directory found, an instance of the `Sentinel2` class 
-        is created to represent the satellite image, and the resulting instances are stored in a dictionary 
-        where the keys are the indices and the values are the `Sentinel2` instances.
-
-        Note:
-        The function assumes that valid satellite image directories in the base folder have numeric names.
-
-        Returns:
-        - dict: A dictionary where keys are indices of the satellite images and values are corresponding 
-                `Sentinel2` instances representing the images.
-
-        Example:
-        Given a base folder structure like:
-        base_folder/
-        ├── 20180830/
-        ├── 20180911/
-        ├── temp/
-        Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
-        with their corresponding `Sentinel2` instances.
-        """
-        print("Initializing satellite images")
-        return {
-            i: Sentinel2(si_folder)
-            for i, si_folder in enumerate(
-                si_folder.path 
-                for si_folder in os.scandir(self.base_folder) 
-                if os.path.isdir(si_folder.path) and si_folder.name.isdigit()
-            )
-        }
-
-    def update_parameters(self):
-        """
-        In case the user forgets to set load_data=True when init the class or when changes are made to load the correct data
-        """
-        self.global_mask = self.load_or_built_global_mask()
-        self.satellite_images = self.load_satellite_images()
-        self.selected_timeseries = self.load_or_built_timeseries() 
-        return 
-    
     def create_global_mask(self):
         """
         Generate a global mask for the data cube by aggregating masks from individual satellite images.
@@ -254,9 +245,72 @@ class SatelliteDataCube:
                 mask_bool = si_mask >= 1
                 global_masks.append(mask_bool)
             satellite_image.unload_mask()
-        global_mask = np.logical_or.reduce(global_masks).astype(int)
-        return global_mask
+        self.global_mask = np.logical_or.reduce(global_masks).astype(int)
+        return self.global_mask
 
+    class SatelliteHandler:
+    # Assuming other parts of the class are defined above this
+
+    # def _get_image_by_index(self, idx):
+    #     return list(self.satellite_images.values())[idx]
+
+    # def _is_image_quality_acceptable(self, image):
+    #     return image._badPixelRatio <= self.bad_pixel_limit and image not in self.timeseries
+
+    # def _find_acceptable_neighbor(self, target_idx, max_search_limit=5):
+    #     """Search for the nearest good quality image before and after the current index"""
+    #     max_index = len(self.satellite_images.values()) - 1
+    #     offset = 1
+    #     while offset <= max_search_limit:
+    #         for direction in [-1, 1]:
+    #             new_idx = target_idx + (direction * offset)
+    #             if 0 <= new_idx <= max_index:
+    #                 neighbor = self._get_image_by_index(new_idx)
+    #                 if self._is_image_quality_acceptable(neighbor):
+    #                     return neighbor
+    #         offset += 1
+    #     return None
+
+    # def _get_best_alternative(self, alternatives):
+    #     alternatives.sort(key=lambda x: x[1])  # Sort by bad pixel ratio (best first)
+    #     for alternative in alternatives:
+    #         si = alternative[0]
+    #         if self._is_image_quality_acceptable(si):
+    #             return si
+    #     return None
+
+    # def create_timeseries(self):
+    #     print(f"Selecting timeseries of length {self.timeseries_length} with bad pixel limit of {self.bad_pixel_limit} % for each satellite image")
+
+    #     self.timeseries = []
+    #     max_index = len(self.satellite_images.values()) - 1
+    #     selected_indices = np.linspace(0, max_index, self.timeseries_length, dtype=int)
+
+    #     for target_idx in selected_indices:
+    #         print("[" + " ".join(str(x) for x in range(len(self.timeseries) + 1)) + "]", end='\r')
+            
+    #         satellite_image = self._get_image_by_index(target_idx)
+    #         if self._is_image_quality_acceptable(satellite_image):
+    #             self.timeseries.append(satellite_image)
+    #         else:
+    #             acceptable_neighbor = self._find_acceptable_neighbor(target_idx)
+    #             if acceptable_neighbor:
+    #                 self.timeseries.append(acceptable_neighbor)
+    #             else:
+    #                 alternatives = [(img, img._badPixelRatio) for idx, img in self.satellite_images.items() if img not in self.timeseries]
+    #                 best_alternative = self._get_best_alternative(alternatives)
+    #                 if best_alternative:
+    #                     self.timeseries.append(best_alternative)
+
+    #     self.timeseries = sorted(self.timeseries, key=lambda image: image.date)
+    #     tsIdx = [idx for idx, si in self.satellite_images.items() if si in self.timeseries]
+    #     tsDate = [int(si.date.strftime("%Y%m%d")) for si in self.timeseries]
+
+    #     self.selected_timeseries[f"ts-{self.timeseries_length}"] = np.array([tsIdx, tsDate])
+    #     return self.selected_timeseries
+
+    
+    
     def create_timeseries(self):
         """
         Select a timeseries of satellite images based on specified length and bad pixel limit.
@@ -283,21 +337,15 @@ class SatelliteDataCube:
         the return value will be:
         array([[     0,      5,     10],
                 [20220101, 20220601, 20221101]])
-        """
-        def is_useful_image(satellite_image, bad_pixel_limit, timeseries):
-            satellite_image.calculate_bad_pixels()
-            satellite_image.unload_mask()
-            return satellite_image._badPixelRatio <= bad_pixel_limit and satellite_image not in timeseries
-        
+        """        
         print(f"Selecting timeseries of length {self.timeseries_length} with bad pixel limit of {self.bad_pixel_limit} % for each satellite image")
         timeseries = []
         max_index = len(self.satellite_images.values()) - 1
         selected_indices = np.linspace(0, max_index, self.timeseries_length, dtype=int)
-        selected_timeseries = {}
         for target_idx in selected_indices:
             print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
             satellite_image = list(self.satellite_images.values())[target_idx]
-            if is_useful_image(satellite_image, self.bad_pixel_limit, timeseries):
+            if satellite_image._badPixelRatio <= self.bad_pixel_limit and satellite_image not in timeseries:
                 timeseries.append(satellite_image)
             else:
                 # Search for the nearest good quality image before and after the current index
@@ -314,7 +362,7 @@ class SatelliteDataCube:
                         if 0 <= new_idx <= max_index:
                             neighbor_satellite_image = list(self.satellite_images.values())[new_idx]
                             # If the neighboring image is useful, append it
-                            if is_useful_image(neighbor_satellite_image, self.bad_pixel_limit, timeseries):
+                            if satellite_image._badPixelRatio <= self.bad_pixel_limit and satellite_image not in timeseries:
                                 timeseries.append(neighbor_satellite_image)
                                 found_good_image = True
                                 break  # Exit the inner loop
@@ -336,11 +384,12 @@ class SatelliteDataCube:
         timeseries = sorted(timeseries, key=lambda image: image.date)
         tsIdx = [idx for idx, si in self.satellite_images.items() if si in timeseries]
         tsDate = [int(si.date.strftime("%Y%m%d")) for si in self.satellite_images.values() if si in timeseries]
-        selected_timeseries[f"ts-{self.timeseries_length}"] = np.array([tsIdx, tsDate])
-        return selected_timeseries
+        self.selected_timeseries[f"ts-{self.timeseries_length}"] = np.array([tsIdx, tsDate])
+        return self.selected_timeseries
          
     def create_patches(self, source, indices=False):
-        
+        if not self.selected_timeseries:
+            self.load_or_built_timeseries()
         si_timeseries = [self.satellite_images[idx] for idx in self.selected_timeseries[0]] # [1] for getting date of ts 
         patches = {source: []} # source could be img, msk
         for image in si_timeseries:
@@ -348,71 +397,49 @@ class SatelliteDataCube:
             patches[source].append(patches)
             image.unload_bands()
             image.unload_mask()
+        # convert it to an array of pattern NxTxCxHxW where N is the number of satellite images in timeseries
+        self.patches[source] = np.swapaxes(np.array(patches),0,1) 
+        return self.patches
+
+    def select_patches(self, class_values, seed, class_ratio=(100,0)):
+        if not self.global_mask:
+            self.load_or_built_global_mask()
+        random.seed(seed)
+        class_ratio= [i / 100 for i in class_ratio]
+        global_mask_patches = patchify(self.global_mask, self.patch_size)
+        class_indices = [idx for idx, patch in enumerate(global_mask_patches) if np.any(np.isin(patch, class_values))]
+        no_class_indices = [idx for idx, patch in enumerate(global_mask_patches) if not np.any(np.isin(patch, class_values))]
+        num_noclass_patches = int((len(class_indices) / class_ratio[0]) * class_ratio[1])
+        no_class_indices = random.sample(no_class_indices, num_noclass_patches)
+        return class_indices + no_class_indices
+            
+    def filter_patches(self, patches_idx):
+        for patchType, patchArray in self.patches.items():
+            patches = [patchArray[idx] for idx in patches_idx]
+            self.patches[patchType] = patches    
+        return self.patches
         
-        patches = np.swapaxes(np.array(patches),0,1) # convert it to an array of pattern BxTxCxHxW
-        return patches
-
-    def create_patches(self, patch_size, timeseries_length, patches_folder="", ratio_classes=(100,0), indices=False):
-        """
-        Process and create patches from satellite images based on the specified patch size and timeseries length.
-
-        This function divides satellite images into patches and optionally selects a subset of them based on 
-        a given ratio between target classes and the background. The patches are stored in a dictionary with 
-        keys representing different types of data and values being the patches themselves, following the TxCxHxW format:
-        - T: Time
-        - C: Channels (bands)
-        - H: Height
-        - W: Width
-
-        The dictionary contains:
-        - 'img': Patches from multi-spectral images for each timestep.
-        - 'msk': Binary mask patches corresponding to each timestep.
-        - 'msk_gb': A single binary mask for the entire timeseries, without the time axis.
-
-        Parameters:
-        - patch_size (int): Desired size of the patches.
-        - timeseries_length (int): Length of the timeseries, used to retrieve the appropriate timeseries from global data.
-        - ratio_classes (tuple, optional): Tuple containing the ratio between target class and background. Defaults to (100,0).
-        - indices (bool, optional): If true, specific indices will be used. Defaults to False.
-
-        Returns:
-        - dict: A dictionary containing processed patches. The keys are 'img', 'msk', and 'msk_gb', 
-                and the values are the corresponding patches.
-
-        Example:
-        Given a timeseries of satellite images, calling `process_patches(256, 5)` 
-        might return a dictionary where:
-        'img': (74,5,10,256,256) 
-        'msk': (74,5,1,256,256)
-        'msk_gb': (74,1,256,256)
-        """
-        print(f"Creating patches with size {patch_size} and ratio of {ratio_classes} between target class and background")
-        self._ensure_global_mask_loaded_or_built()
-        global_mask_patches = patchify(self.global_mask, patch_size)
-        selected_indices = select_patches(global_mask_patches, ratio_classes, seed=self.seed)
-        si_timeseries = [self.satellite_images[idx] for idx in self.selected_timeseries[f"ts{timeseries_length}"][0]] # [1] for getting date of ts 
-        patches = {"img": [], "msk": []}
-        for image in si_timeseries:
-            print(f"Start with satellite image at {image.date} in timeseries")
-            X_selected_patches, y_selected_patches = create_and_select_patches(image, selected_indices, indices=indices)
-            patches["img"].append(X_selected_patches)
-            patches["msk"].append(y_selected_patches)
-        
-        patches = {patchType: np.swapaxes(np.array(patchValues),0,1) for patchType, patchValues in patches.items()}
-        patches["msk_gb"] = np.array([global_mask_patches[idx] for idx in selected_indices])
-        self.save_patches(patches=patches, output_folder=patches_folder)
-        return patches
-
-    def save_patches(self, patches, patches_folder=""):
-        timeseriesLength = patches["img"].shape[1]
-        print(timeseriesLength)
+    def save_patches(self, patches_folder=""):
         patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
         if not os.path.exists(patches_folder):
             os.makedirs(patches_folder)
-        for patchType, patchArray in patches.items():
+        for patchType, patchArray in self.patches.items():
             print(patchType, patchArray.shape)  
-            np.save(os.path.join(patches_folder, f"{patchType}_patches_ts-{timeseriesLength}.npy"), patchArray)
-
+            np.save(os.path.join(patches_folder, f"{patchType}_patches_ts-{self.timeseries_length}.npy"), patchArray)
+        return
+    
+    def process_patches(self, sources, indices=False, patches_folder=""):
+        
+        patches_idx = self.select_patches(class_values=[1])
+        for source in sources:
+            if source in ["img", "msk"]:
+                self.patches[source] = self.create_patches(source=source, indices=indices, patches_folder=patches_folder)
+            else:
+                self.patches[source] = patchify(self.global_mask, self.patch_size)
+        self.filter_patches(patches_idx=patches_idx)
+        self.save_patches()
+        return self.patches
+           	
     def process_patches(self, patch_size, patch_folder):
         """
         Preprocess the satellite data to prepare it for further analysis or modeling.
@@ -438,7 +465,7 @@ class SatelliteDataCube:
         """
         self.load_or_built_global_mask()
         self.load_or_built_timeseries()
-        patches = self.load_or_built_patches(patches_size=patch_size, patches_folder=patch_folder)
+        
         return patches
 
     def sanity_check(self, patches):

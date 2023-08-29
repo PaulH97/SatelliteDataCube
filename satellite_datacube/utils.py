@@ -7,14 +7,11 @@ def patchify(source_array, patch_size):
     """Utility function to create patches from a source array."""
     num_bands, size_x, size_y = source_array.shape
     patches = []
-        
     for i in range(0, size_x, patch_size):
         for j in range(0, size_y, patch_size):
-            
             patch = source_array[:, i:i+patch_size, j:j+patch_size]
             if patch.shape == (num_bands, patch_size, patch_size):
                 patches.append(patch)
-                
     return patches
 
 def save_patch(output_folder, i, j, patch, template_meta, patch_size, source):
