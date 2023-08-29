@@ -9,7 +9,6 @@ setup(
         'rasterio',
         'matplotlib',
         'simplejson', 
-        'h5py',
         'fiona',
         'pandas',
     ],

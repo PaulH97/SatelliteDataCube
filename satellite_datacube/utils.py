@@ -41,3 +41,12 @@ def select_patches(global_mask_patches, ratio_classes, seed):
     num_noclass_patches = int((len(class_indices) / ratio_classes[0]) * ratio_classes[1])
     no_class_indices = random.sample(no_class_indices, num_noclass_patches)
     return class_indices + no_class_indices
+
+def create_and_select_patches(satellite_image, patch_size, selected_indices, indices=False):
+    X_patches = satellite_image.process_patches(patch_size, source="img", indices=indices)
+    y_patches = satellite_image.process_patches(patch_size, source="msk", indices=indices)
+    X_selected_patches = [X_patches[idx] for idx in selected_indices]
+    y_selected_patches = [y_patches[idx] for idx in selected_indices]
+    satellite_image.unload_bands()
+    satellite_image.unload_mask()
+    return X_selected_patches, y_selected_patches

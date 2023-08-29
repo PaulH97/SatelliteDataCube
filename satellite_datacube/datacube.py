@@ -3,60 +3,41 @@ import numpy as np
 import rasterio
 from matplotlib import pyplot as plt
 import json
-import h5py
-from .utils import patchify, select_patches
+from .utils import patchify, select_patches, create_and_select_patches
 from .image import Sentinel2
+
+# TODO:
+# - exclude patches as self attribute -> we want to create multiple patches and not store a specific one in the data cube.. instead we want to use a load function to load it
+# - same with dc parameters - we constantly want to chnage these values -> do not store them as attributes? Or create new datacube for new values? 
+# - smarter if i init the datacube once and then use functions to change values -> 
+
+# Should i use the class with a fixed timeseries and patches attribute? 
+# So whenever i want to create patches with different sizes or different selected timesteps i need to initialize a new object -> exactly!!
+# - i can implemnt self.patches, self.timeseries and self.global_mask
+
+# when i want to chnage the patch_size or the selected ts the best way would be to create new instances! -> otherwise it is confusing - it is able but not recommended
+# make it optinal to give the functions the parameters timeseries_length, patch_size or bad_pixel_limit
 
 class SatelliteDataCube:
     def __init__(self, base_folder, parameters, load_data=True):
-        """
-        Initialize an instance of the SatelliteDataCube class.
 
-        This constructor sets up the necessary attributes for the SatelliteDataCube based on the provided parameters. 
-        It also has an option to immediately load data upon initialization, which can be controlled with the `load_data` flag.
-
-        Parameters:
-        - base_folder (str): Path to the base directory that contains the satellite data. This directory might include 
-                            satellite images, global data, patches, and other related data. The satellite images should be stored 
-                            in this base_folder as directories with the date as name like 20180830.
-        - parameters (dict): A dictionary containing various configuration parameters for preprocessing and other operations. 
-                            Expected keys include 'timeseriesLength', 'badPixelLimit', and 'patchSize'.
-        - load_data (bool, optional): A flag to determine whether the satellite data should be loaded immediately upon 
-                                    initialization. If set to True, the constructor will attempt to load satellite images, 
-                                    global data, and patches. Defaults to True.
-
-        Attributes:
-        - parameters (dict): Stores the provided preprocessing parameters.
-        - base_folder (str): Holds the path to the base directory containing satellite data.
-        - global_data_file (str): Path to the HDF5 file that might contain global data.
-        - seed (int): Seed value for any random operations to ensure reproducibility.
-        - satellite_images (dict, optional): Dictionary of satellite images, initialized only if `load_data` is True.
-        - global_data (dict, optional): Dictionary containing global data (selected timeseries + global mask), loaded or initialized based on the presence 
-                                        of the global data file and the `load_data` flag.
-        - patches (dict, optional): Dictionary containing processed patches, loaded if `load_data` is True.
-
-        Example:
-        To initialize a SatelliteDataCube with specific parameters and immediate data loading:
-        ```
-        parameters = {
-            'timeseriesLength': 12,
-            'badPixelLimit': 5,
-            'patchSize': 256
-        }
-        cube = SatelliteDataCube("/path/to/base_folder", parameters)
-        ```
-        """
-        self.parameters = parameters
-        self.base_folder = base_folder
-        self.global_data_file = os.path.join(self.base_folder, "global_data.hdf5")
+        self.base_folder = base_folder 
+        self.timeseries_length = parameters["timeseries_length"]
+        self.patch_size = parameters["patch_size"]
+        self.bad_pixel_limit = parameters["bad_pixel_limit"]
+        self.global_mask = None
+        self.satellite_images = {}
+        self.selected_timeseries = {} 
+        self.patches = {}
         self.seed = 42
 
-        self._print_initialization_info()
-
         if load_data:
-            self.satellite_images = self.initiate_satellite_images()
-            self.global_data = self.load_global_data() if os.path.exists(self.global_data_file) else {}
-            self.patches = self.load_patches_as_tchw()
+            self.global_mask = self.load_global_mask()
+            self.satellite_images = self.load_satellite_images()
+            self.selected_timeseries = self.load_timeseries() # single selected ts that can be chnaged with function load_ts from json
+            self.patches = self.load_patches()
+            
+        self._print_initialization_info()
 
     def _print_initialization_info(self) -> None:
         """
@@ -88,34 +69,58 @@ class SatelliteDataCube:
         print(f"- limit of bad pixel per satellite image in timeseries: {self.parameters['badPixelLimit']}%")
         print(f"- patch size of {self.parameters['patchSize']}")
 
-    def preprocess(self):
+    def load_global_mask(self):
+        print(f"Loading global_mask from: {self.base_folder}")
+        global_mask_path = os.path.join(self.base_folder, "global_mask.npy")
+        if os.path.exists(global_mask_path):
+            return np.load(os.path.join(self.base_folder, "global_mask.npy"))
+        else:
+            print(f"Could not find global_mask file in: {self.base_folder}. If you want to create a global mask for the timeseries please use create_global_mask().")
+            return None 
+
+    def load_timeseries(self):
+        print(f"Loading selected timeseries from: {self.base_folder}")
+        selected_ts_path = os.path.join(self.base_folder, "selected_timeseries.json")
+        if os.path.exists(selected_ts_path):
+            with open(selected_ts_path, 'r') as file:
+                timeseries = json.load(file)
+                return timeseries[f"ts-{self.timseries_length}"]
+        else:
+            print(f"Could not find selected_timeseries file in: {self.base_folder}. If you want to create a global mask for the timeseries please use create_timeseries().")
+            return None 
+
+    def load_patches(self, patches_folder=""):
         """
-        Preprocess the satellite data to prepare it for further analysis or modeling.
+        Load patches from the saved .npy files and format them as TCHW (Time, Channel, Height, Width).
 
-        The preprocessing steps include:
-        1. Building or loading global data: This ensures that the necessary global datasets, 
-        which might include various datasets representing different aspects or metadata 
-        of the satellite images, are available. If required data for the desired timeseries 
-        length isn't already present, it is built using the `create_global_data` method. 
-        Otherwise, it's loaded using the `load_global_data` method.
-        
-        2. Creating or loading patches: This step divides satellite images into patches for 
-        both image and mask data. If patches meeting the desired size aren't already loaded, 
-        they are processed using the `process_patches` method. If they are present, they are 
-        loaded using the `load_patches_as_tchw` method.
+        This function searches for saved patches in the base folder with names corresponding to 'img', 'msk', and 'msk_gb' and containing 
+        information about the length of the timeseries. If found, it loads the patches into a dictionary, where the keys are the patch names 
+        and the values are the loaded patches. If no patches are found, it returns an empty dictionary.
 
-        Attributes Updated:
-        - global_data: Contains the global datasets after the preprocessing.
-        - patches: Contains the processed patches after the preprocessing.
-        
         Returns:
-        None
-        """
-        self.global_data = self._ensure_global_data_loaded_or_built()
-        self.patches = self._ensure_patches_loaded_or_processed()
-        return
+        - dict: A dictionary containing loaded patches. The potential keys are 'img', 'msk', and 'msk_gb', 
+                and the values are the corresponding patches formatted as NTCHW.
 
-    def _ensure_global_data_loaded_or_built(self):
+        Example:
+        If 'img_patches_ts-6.npy' exists in the patches folder and contains image patches, the returned dictionary might look like:
+        {
+            'img': np.ndarray of shape (num_patches, num_timesteps, num_channels, patch_height, patch_width),
+            ...
+        }
+        """
+        patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
+        patches = {}
+        for patchName in ["img", "msk", "msk_gb"]:
+            patchPath = os.path.join(patches_folder, f"{patchName}_patches_ts-{self.timeseries_length}.npy")
+            if os.path.exists(patchPath):
+                patches[patchName] = np.load(patchPath)
+        if patches:
+            print("Loading patches as dictonary with keys [img, msk, msk_gb] from .npy files")
+        else:
+            print("Loading patches as empty dictonary")
+        return patches
+
+    def load_or_built_global_mask(self):
         """
         Ensure that the global dataset is either loaded from existing storage or constructed afresh.
 
@@ -131,11 +136,21 @@ class SatelliteDataCube:
         If the global data for a specified timeseries length isn't loaded or doesn't meet the desired criteria, 
         the method might process and return global data containing elements like 'global_mask' and 'timeseries'.
         """
-        if not self.global_data or f"ts{self.parameters['timeseriesLength']}" not in self.global_data:
-            return self.create_global_data(self.parameters["timeseriesLength"], self.parameters["badPixelLimit"])
-        return self.load_global_data()
+        if not self.global_mask:
+            self.global_mask = self.create_global_mask()
+        else:
+            self.global_mask = self.load_global_mask()
+        return 
+    
+    def load_or_built_timeseries(self):
 
-    def _ensure_patches_loaded_or_processed(self):
+        if not self.selected_timeseries:
+            self.selected_timeseries = self.create_timeseries(timeseries_length=self.timeseries_length)
+        else:
+            self.selected_timeseries = self.load_timeseries()
+        return 
+
+    def load_or_built_patches(self, patches_folder=""):
         """
         Ensure that the satellite image patches are either loaded from existing storage or processed anew.
 
@@ -158,11 +173,18 @@ class SatelliteDataCube:
             'msk_gb': np.ndarray of shape (num_patches, num_channels, patch_height, patch_width)
         }
         """
-        if not self.patches or self.patches[next(iter(self.patches))].shape[-1] != self.parameters["patchSize"]:
-            return self.process_patches(self.parameters["patchSize"], self.parameters["timeseriesLength"])
-        return self.load_patches_as_tchw()
+        patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
+        if os.path.exists(patches_folder):
+            patches = self.load_patches(self.timeseries_length, patches_folder=patches_folder)
+            if patches['img'].shape[-1] == self.patches_size:
+                return patches
+            else:
+                patches = self.create_patches(patch_size=self.patches_size, timeseries_length=self.timeseries_length, output_folder=patches_folder)
+        else:
+            patches = self.create_patches(patch_size=self.patches_size, timeseriesLength=self.timeseries_length, output_folder=patches_folder)
+        return patches
 
-    def initiate_satellite_images(self):
+    def load_satellite_images(self):
         """
         Initialize satellite images by scanning the base folder and processing valid satellite image directories.
 
@@ -184,7 +206,7 @@ class SatelliteDataCube:
         ├── 20180830/
         ├── 20180911/
         ├── temp/
-        Calling `initiate_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
+        Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
         with their corresponding `Sentinel2` instances.
         """
         print("Initializing satellite images")
@@ -196,38 +218,16 @@ class SatelliteDataCube:
                 if os.path.isdir(si_folder.path) and si_folder.name.isdigit()
             )
         }
+
+    def update_parameters(self):
+        """
+        In case the user forgets to set load_data=True when init the class or when changes are made to load the correct data
+        """
+        self.global_mask = self.load_or_built_global_mask()
+        self.satellite_images = self.load_satellite_images()
+        self.selected_timeseries = self.load_or_built_timeseries() 
+        return 
     
-    def create_global_data(self, timeseries_length, bad_pixel_limit):
-        """
-        Construct and store a global dataset based on specified timeseries length and a bad pixel threshold.
-
-        This function creates a global dataset that includes:
-        1. A global mask which aggregates mask information from all satellite images.
-        2. A selected timeseries of satellite images that adhere to the provided timeseries length and 
-        bad pixel limit criteria.
-
-        After constructing the global dataset, it's saved using the `save_global_data` method to ensure persistence.
-
-        Parameters:
-        - timeseries_length (int): Desired number of satellite images in the timeseries.
-        - bad_pixel_limit (float): Maximum allowable percentage of bad pixels in an image for it to be 
-                                considered in the timeseries.
-
-        Returns:
-        - dict: A dictionary containing the constructed global data. The keys include 'global_mask' for the 
-                aggregated mask and 'timeseries' for the selected sequence of satellite images.
-
-        Example:
-        Given satellite images with varying levels of bad pixels, calling `create_global_data(10, 5)` 
-        might return a dictionary with a global mask and a timeseries of 10 images, each having 
-        less than 5% bad pixels.
-        """
-        global_data_methods = {'global_mask': self.create_global_mask,'timeseries': lambda: self.select_timeseries(timeseries_length, bad_pixel_limit)}
-        for method in global_data_methods.values():    
-                method()
-        self.save_global_data()
-        return self.global_data
-
     def create_global_mask(self):
         """
         Generate a global mask for the data cube by aggregating masks from individual satellite images.
@@ -254,66 +254,10 @@ class SatelliteDataCube:
                 mask_bool = si_mask >= 1
                 global_masks.append(mask_bool)
             satellite_image.unload_mask()
-        self.global_data["global_mask"] = np.logical_or.reduce(global_masks).astype(int)
-        return 
+        global_mask = np.logical_or.reduce(global_masks).astype(int)
+        return global_mask
 
-    def load_global_data(self):
-        """
-        Retrieve the global data of satellite images from an HDF5 file stored in the base folder.
-
-        This function reads from the HDF5 file specified by the instance's 'global_data_file' attribute, 
-        which may contain various datasets representing different aspects or metadata of satellite images. 
-        The datasets are loaded into a dictionary and returned.
-
-        Note:
-        The loaded file's path is determined by the instance's 'global_data_file' attribute.
-
-        Returns:
-        - dict: A dictionary where the keys are the dataset names and the values are the corresponding loaded data arrays.
-
-        Example:
-        If the HDF5 file contains datasets named 'timeseries' and 'metadata', the returned dictionary might look like:
-        {
-            'timeseries': np.ndarray,
-            'global_mask': np.ndarray,
-            ...
-        }
-        """
-        print(f"Loading global data from: {self.global_data_file}")
-        data_dict = {}
-        with h5py.File(self.global_data_file, 'r') as hf:
-            for key in hf.keys():
-                data_dict[key] = np.array(hf[key])
-        return data_dict
-
-    def save_global_data(self):
-        """
-        Save the global data of the satellite images to an HDF5 file.
-
-        This function saves the global data to an HDF5 file located in the base folder. It contains the selected steps (dates) from the timeseries and a global mask for
-        the entire timeseries of the data cube. If any datasets with the same key already exist in the HDF5 file,
-        they will be deleted and replaced with the new data.
-
-        Note:
-        The saved file's path is determined by the instance's 'global_data_file' attribute.
-
-        Example:
-        If the instance's global_data contains:
-        {
-            'timeseries': np.ndarray,
-            'global_mask': np.ndarray,
-            ...
-        }
-        Calling `save_global_data()` will save these arrays to the specified HDF5 file in the base folder.
-        """
-        print(f"Saving global data in: {self.global_data_file}")
-        with h5py.File(self.global_data_file, 'a') as hf: 
-            for key, value in self.global_data.items():
-                if key in hf:
-                    del hf[key] # delete the existing dataset so it can be overwritten
-                hf.create_dataset(key, data=value)
-
-    def select_timeseries(self, timeseries_length, bad_pixel_limit ):
+    def create_timeseries(self):
         """
         Select a timeseries of satellite images based on specified length and bad pixel limit.
 
@@ -340,21 +284,20 @@ class SatelliteDataCube:
         array([[     0,      5,     10],
                 [20220101, 20220601, 20221101]])
         """
-    
         def is_useful_image(satellite_image, bad_pixel_limit, timeseries):
             satellite_image.calculate_bad_pixels()
             satellite_image.unload_mask()
             return satellite_image._badPixelRatio <= bad_pixel_limit and satellite_image not in timeseries
         
-        print(f"Selecting timeseries of length {timeseries_length} with bad pixel limit of {bad_pixel_limit} % for each satellite image")
+        print(f"Selecting timeseries of length {self.timeseries_length} with bad pixel limit of {self.bad_pixel_limit} % for each satellite image")
         timeseries = []
         max_index = len(self.satellite_images.values()) - 1
-        selected_indices = np.linspace(0, max_index, timeseries_length, dtype=int)
-        
+        selected_indices = np.linspace(0, max_index, self.timeseries_length, dtype=int)
+        selected_timeseries = {}
         for target_idx in selected_indices:
             print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
             satellite_image = list(self.satellite_images.values())[target_idx]
-            if is_useful_image(satellite_image, bad_pixel_limit, timeseries):
+            if is_useful_image(satellite_image, self.bad_pixel_limit, timeseries):
                 timeseries.append(satellite_image)
             else:
                 # Search for the nearest good quality image before and after the current index
@@ -371,7 +314,7 @@ class SatelliteDataCube:
                         if 0 <= new_idx <= max_index:
                             neighbor_satellite_image = list(self.satellite_images.values())[new_idx]
                             # If the neighboring image is useful, append it
-                            if is_useful_image(neighbor_satellite_image, bad_pixel_limit, timeseries):
+                            if is_useful_image(neighbor_satellite_image, self.bad_pixel_limit, timeseries):
                                 timeseries.append(neighbor_satellite_image)
                                 found_good_image = True
                                 break  # Exit the inner loop
@@ -393,10 +336,23 @@ class SatelliteDataCube:
         timeseries = sorted(timeseries, key=lambda image: image.date)
         tsIdx = [idx for idx, si in self.satellite_images.items() if si in timeseries]
         tsDate = [int(si.date.strftime("%Y%m%d")) for si in self.satellite_images.values() if si in timeseries]
-        self.global_data[f"ts{timeseries_length}"] = np.array([tsIdx, tsDate])
-        return np.array([tsIdx, tsDate])
- 
-    def process_patches(self, patch_size, timeseriesLength, ratio_classes=(100,0), indices=False):
+        selected_timeseries[f"ts-{self.timeseries_length}"] = np.array([tsIdx, tsDate])
+        return selected_timeseries
+         
+    def create_patches(self, source, indices=False):
+        
+        si_timeseries = [self.satellite_images[idx] for idx in self.selected_timeseries[0]] # [1] for getting date of ts 
+        patches = {source: []} # source could be img, msk
+        for image in si_timeseries:
+            patches = image.process_patches(self.patch_size, source=source, indices=indices) # returns list of patches
+            patches[source].append(patches)
+            image.unload_bands()
+            image.unload_mask()
+        
+        patches = np.swapaxes(np.array(patches),0,1) # convert it to an array of pattern BxTxCxHxW
+        return patches
+
+    def create_patches(self, patch_size, timeseries_length, patches_folder="", ratio_classes=(100,0), indices=False):
         """
         Process and create patches from satellite images based on the specified patch size and timeseries length.
 
@@ -431,60 +387,58 @@ class SatelliteDataCube:
         'msk_gb': (74,1,256,256)
         """
         print(f"Creating patches with size {patch_size} and ratio of {ratio_classes} between target class and background")
-        def create_and_select_patches(image, selected_indices):
-            X_patches = image.process_patches(patch_size, source="img", indices=indices)
-            y_patches = image.process_patches(patch_size, source="msk", indices=indices)
-            X_selected_patches = [X_patches[idx] for idx in selected_indices]
-            y_selected_patches = [y_patches[idx] for idx in selected_indices]
-            image.unload_bands()
-            image.unload_mask()
-            return X_selected_patches, y_selected_patches
-        
-        global_mask_patches = patchify(self.global_data["global_mask"], patch_size)
+        self._ensure_global_mask_loaded_or_built()
+        global_mask_patches = patchify(self.global_mask, patch_size)
         selected_indices = select_patches(global_mask_patches, ratio_classes, seed=self.seed)
-        si_timeseries = [self.satellite_images[idx] for idx in self.global_data[f"ts{timeseriesLength}"][0]] # [1] for getting date of ts 
+        si_timeseries = [self.satellite_images[idx] for idx in self.selected_timeseries[f"ts{timeseries_length}"][0]] # [1] for getting date of ts 
         patches = {"img": [], "msk": []}
         for image in si_timeseries:
             print(f"Start with satellite image at {image.date} in timeseries")
-            X_selected_patches, y_selected_patches = create_and_select_patches(image, selected_indices)
+            X_selected_patches, y_selected_patches = create_and_select_patches(image, selected_indices, indices=indices)
             patches["img"].append(X_selected_patches)
             patches["msk"].append(y_selected_patches)
         
         patches = {patchType: np.swapaxes(np.array(patchValues),0,1) for patchType, patchValues in patches.items()}
         patches["msk_gb"] = np.array([global_mask_patches[idx] for idx in selected_indices])
-        for patchType, patchArray in patches.items():
-            print(patchType, patchArray.shape)  
-            np.save(os.path.join(self.base_folder, f"{patchType}_patches.npy"), patchArray)
+        self.save_patches(patches=patches, output_folder=patches_folder)
         return patches
 
-    def load_patches_as_tchw(self):
+    def save_patches(self, patches, patches_folder=""):
+        timeseriesLength = patches["img"].shape[1]
+        print(timeseriesLength)
+        patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
+        if not os.path.exists(patches_folder):
+            os.makedirs(patches_folder)
+        for patchType, patchArray in patches.items():
+            print(patchType, patchArray.shape)  
+            np.save(os.path.join(patches_folder, f"{patchType}_patches_ts-{timeseriesLength}.npy"), patchArray)
+
+    def process_patches(self, patch_size, patch_folder):
         """
-        Load patches from the saved .npy files and format them as TCHW (Time, Channel, Height, Width).
+        Preprocess the satellite data to prepare it for further analysis or modeling.
 
-        This function searches for saved patches with names corresponding to 'img', 'msk', and 'msk_gb' 
-        in the base folder. If found, it loads the patches into a dictionary, where the keys are the patch names 
-        and the values are the loaded patches. If no patches are found, it returns an empty dictionary.
+        The preprocessing steps include:
+        1. Building or loading global data: This ensures that the necessary global datasets, 
+        which might include various datasets representing different aspects or metadata 
+        of the satellite images, are available. If required data for the desired timeseries 
+        length isn't already present, it is built using the `create_global_data` method. 
+        Otherwise, it's loaded using the `load_global_data` method.
+        
+        2. Creating or loading patches: This step divides satellite images into patches for 
+        both image and mask data. If patches meeting the desired size aren't already loaded, 
+        they are processed using the `process_patches` method. If they are present, they are 
+        loaded using the `load_patches_as_tchw` method.
 
+        Attributes Updated:
+        - global_data: Contains the global datasets after the preprocessing.
+        - patches: Contains the processed patches after the preprocessing.
+        
         Returns:
-        - dict: A dictionary containing loaded patches. The potential keys are 'img', 'msk', and 'msk_gb', 
-                and the values are the corresponding patches formatted as NTCHW.
-
-        Example:
-        If 'img_patches.npy' exists in the base folder and contains image patches, the returned dictionary might look like:
-        {
-            'img': np.ndarray of shape (num_patches, num_timesteps, num_channels, patch_height, patch_width),
-            ...
-        }
+        None
         """
-        patches = {}
-        for patchName in ["img", "msk", "msk_gb"]:
-            patchPath = os.path.join(self.base_folder, f"{patchName}_patches.npy")
-            if os.path.exists(patchPath):
-                patches[patchName] = np.load(patchPath)
-        if patches:
-            print("Loading patches as dictonary with keys [img, msk, msk_gb] from .npy files")
-        else:
-            print("Loading patches as empty dictonary")
+        self.load_or_built_global_mask()
+        self.load_or_built_timeseries()
+        patches = self.load_or_built_patches(patches_size=patch_size, patches_folder=patch_folder)
         return patches
 
     def sanity_check(self, patches):
