@@ -3,7 +3,7 @@ import numpy as np
 import rasterio
 from matplotlib import pyplot as plt
 import json
-from .utils import patchify, select_patches, create_and_select_patches
+from .utils import patchify
 from .image import Sentinel2
 import random
 
@@ -23,22 +23,22 @@ class SatelliteDataCube:
     def __init__(self, base_folder, parameters, load_data=True):
 
         self.base_folder = base_folder 
-        self.timeseries_length = parameters["timeseries_length"]
-        self.patch_size = parameters["patch_size"]
-        self.bad_pixel_limit = parameters["bad_pixel_limit"]
-        self.satellite_images = self.load_satellite_images()
+        self.timeseries_length = parameters["timeseries_length"] if "timeseries_length" in parameters else None
+        self.patch_size = parameters["patch_size"] if "patch_size" in parameters else None
+        self.satellite_images = {}
         self.global_mask = None
         self.selected_timeseries = {} 
         self.patches = {}
         self.seed = 42
-
+        
+        self._print_initialization_info()
+        
         if load_data:
+            self.satellite_images = self.load_satellite_images()
             self.global_mask = self.load_global_mask()
-            self.selected_timeseries = self.load_timeseries() # single selected ts that can be chnaged with function load_ts from json
+            self.selected_timeseries = self.load_timeseries()
             self.patches = self.load_patches()
             
-        self._print_initialization_info()
-
     def _print_initialization_info(self) -> None:
         """
         Display detailed initialization information about the data-cube.
@@ -62,32 +62,35 @@ class SatelliteDataCube:
         - patch size of 256
         """
         divider = "-" * 20
-        print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
+        #print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
+        print(f"{2*divider}")
         print("Initializing data-cube with following parameter:")
         print(f"- base folder: {self.base_folder}")
-        print(f"- length of timeseries: {self.parameters['timeseriesLength']}")
-        print(f"- limit of bad pixel per satellite image in timeseries: {self.parameters['badPixelLimit']}%")
-        print(f"- patch size of {self.parameters['patchSize']}")
+        print(f"- length of timeseries: {self.timeseries_length}")
+        print(f"- patch size of {self.patch_size}")
+        print(f"{2*divider}")
 
     def load_global_mask(self):
-        print(f"Loading global_mask from: {self.base_folder}")
         global_mask_path = os.path.join(self.base_folder, "global_mask.npy")
         if os.path.exists(global_mask_path):
-            return np.load(os.path.join(self.base_folder, "global_mask.npy"))
+            print(f"Loaded global_mask from: {global_mask_path}")
+            return np.load(global_mask_path)
         else:
-            print(f"Could not find global_mask file in: {self.base_folder}. If you want to create a global mask for the timeseries please use create_global_mask().")
+            print(f"Could not find global_mask file in: {self.base_folder}", "If you want to create a global mask for the timeseries please use create_global_mask().")
             return None 
 
     def load_timeseries(self):
-        print(f"Loading selected timeseries from: {self.base_folder}")
         selected_ts_path = os.path.join(self.base_folder, "selected_timeseries.json")
         if os.path.exists(selected_ts_path):
             with open(selected_ts_path, 'r') as file:
                 timeseries = json.load(file)
-                return timeseries[f"ts-{self.timseries_length}"]
+                print(f"Loaded all available selected timeseries of file: {selected_ts_path}")
+                if not any(str(self.timeseries_length) in key for key in timeseries.keys()): 
+                    print(f"Could not find timeseries with {self.timeseries_length} inside selected timeseries file. Please use create_timeseries().")
+                return timeseries
         else:
-            print(f"Could not find selected_timeseries file in: {self.base_folder}. If you want to create a global mask for the timeseries please use create_timeseries().")
-            return None 
+            print(f"Could not find selected_timeseries file: {selected_ts_path}")
+            return {}
 
     def load_patches(self, patches_folder=""):
         """
@@ -115,9 +118,9 @@ class SatelliteDataCube:
             if os.path.exists(patchPath):
                 patches[patchName] = np.load(patchPath)
         if patches:
-            print("Loading patches as dictonary with keys [img, msk, msk_gb] from .npy files")
+            print(f"Loading patches as dictonary with keys [img, msk, msk_gb] from {patches_folder}")
         else:
-            print("Loading patches as empty dictonary")
+            print(f"Could not find patches in: {patches_folder}", "If you want to select a timeseries please use create_patches().")
         return patches
 
     def load_satellite_images(self):
@@ -248,145 +251,73 @@ class SatelliteDataCube:
         self.global_mask = np.logical_or.reduce(global_masks).astype(int)
         return self.global_mask
 
-    class SatelliteHandler:
-    # Assuming other parts of the class are defined above this
+    def create_timeseries(self, save=True):
 
-    # def _get_image_by_index(self, idx):
-    #     return list(self.satellite_images.values())[idx]
+        def _get_image_by_index(idx):
+            return list(self.satellite_images.values())[idx]
 
-    # def _is_image_quality_acceptable(self, image):
-    #     return image._badPixelRatio <= self.bad_pixel_limit and image not in self.timeseries
+        def _is_image_quality_acceptable(image, bad_pixel_limit=15):
+            image.calculate_bad_pixels()
+            return image._badPixelRatio <= bad_pixel_limit and image not in timeseries
 
-    # def _find_acceptable_neighbor(self, target_idx, max_search_limit=5):
-    #     """Search for the nearest good quality image before and after the current index"""
-    #     max_index = len(self.satellite_images.values()) - 1
-    #     offset = 1
-    #     while offset <= max_search_limit:
-    #         for direction in [-1, 1]:
-    #             new_idx = target_idx + (direction * offset)
-    #             if 0 <= new_idx <= max_index:
-    #                 neighbor = self._get_image_by_index(new_idx)
-    #                 if self._is_image_quality_acceptable(neighbor):
-    #                     return neighbor
-    #         offset += 1
-    #     return None
+        def _find_acceptable_neighbor(target_idx, max_search_limit=5):
+            """Search for the nearest good quality image before and after the current index"""
+            max_index = len(self.satellite_images.values()) - 1
+            offset = 1
+            while offset <= max_search_limit:
+                for direction in [-1, 1]:
+                    new_idx = target_idx + (direction * offset)
+                    if 0 <= new_idx <= max_index:
+                        neighbor = _get_image_by_index(new_idx)
+                        if _is_image_quality_acceptable(neighbor):
+                            return neighbor
+                offset += 1
+            return None
 
-    # def _get_best_alternative(self, alternatives):
-    #     alternatives.sort(key=lambda x: x[1])  # Sort by bad pixel ratio (best first)
-    #     for alternative in alternatives:
-    #         si = alternative[0]
-    #         if self._is_image_quality_acceptable(si):
-    #             return si
-    #     return None
+        def _get_best_alternative(alternatives):
+            alternatives.sort(key=lambda x: x[1])  # Sort by bad pixel ratio (best first)
+            for alternative in alternatives:
+                si = alternative[0]
+                if _is_image_quality_acceptable(si):
+                    return si
+            return None
 
-    # def create_timeseries(self):
-    #     print(f"Selecting timeseries of length {self.timeseries_length} with bad pixel limit of {self.bad_pixel_limit} % for each satellite image")
-
-    #     self.timeseries = []
-    #     max_index = len(self.satellite_images.values()) - 1
-    #     selected_indices = np.linspace(0, max_index, self.timeseries_length, dtype=int)
-
-    #     for target_idx in selected_indices:
-    #         print("[" + " ".join(str(x) for x in range(len(self.timeseries) + 1)) + "]", end='\r')
-            
-    #         satellite_image = self._get_image_by_index(target_idx)
-    #         if self._is_image_quality_acceptable(satellite_image):
-    #             self.timeseries.append(satellite_image)
-    #         else:
-    #             acceptable_neighbor = self._find_acceptable_neighbor(target_idx)
-    #             if acceptable_neighbor:
-    #                 self.timeseries.append(acceptable_neighbor)
-    #             else:
-    #                 alternatives = [(img, img._badPixelRatio) for idx, img in self.satellite_images.items() if img not in self.timeseries]
-    #                 best_alternative = self._get_best_alternative(alternatives)
-    #                 if best_alternative:
-    #                     self.timeseries.append(best_alternative)
-
-    #     self.timeseries = sorted(self.timeseries, key=lambda image: image.date)
-    #     tsIdx = [idx for idx, si in self.satellite_images.items() if si in self.timeseries]
-    #     tsDate = [int(si.date.strftime("%Y%m%d")) for si in self.timeseries]
-
-    #     self.selected_timeseries[f"ts-{self.timeseries_length}"] = np.array([tsIdx, tsDate])
-    #     return self.selected_timeseries
-
-    
-    
-    def create_timeseries(self):
-        """
-        Select a timeseries of satellite images based on specified length and bad pixel limit.
-
-        The function aims to select a set of satellite images that fall within the defined 
-        timeseries length while ensuring that each image's bad pixel ratio does not exceed 
-        the specified limit. If a target image exceeds the bad pixel ratio, the function 
-        searches for neighboring images that meet the criteria. 
-
-        Parameters:
-        - timeseries_length (int): Desired number of satellite images in the timeseries.
-        - bad_pixel_limit (float): Maximum acceptable bad pixel ratio (in percentage) for each image.
-
-        Returns:
-        - np.ndarray: A 2D array where the first row contains indices of selected satellite images 
-                        and the second row contains corresponding dates in YYYYMMDD format.
-
-        Note:
-        The function also updates the instance's global_data attribute with the selected timeseries data.
-
-        Example:
-        Given satellite_images = {0: SatelliteImage(date="20220101"), 1: SatelliteImage(date="20220201"), ...}
-        If selected images are from indices [0, 5, 10], with dates ["20220101", "20220601", "20221101"],
-        the return value will be:
-        array([[     0,      5,     10],
-                [20220101, 20220601, 20221101]])
-        """        
-        print(f"Selecting timeseries of length {self.timeseries_length} with bad pixel limit of {self.bad_pixel_limit} % for each satellite image")
+        print(f"Selecting timeseries with {self.timeseries_length} satellite images of data-cube")
         timeseries = []
         max_index = len(self.satellite_images.values()) - 1
         selected_indices = np.linspace(0, max_index, self.timeseries_length, dtype=int)
+
         for target_idx in selected_indices:
             print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
-            satellite_image = list(self.satellite_images.values())[target_idx]
-            if satellite_image._badPixelRatio <= self.bad_pixel_limit and satellite_image not in timeseries:
+            satellite_image = _get_image_by_index(target_idx)
+            if _is_image_quality_acceptable(satellite_image):
                 timeseries.append(satellite_image)
             else:
-                # Search for the nearest good quality image before and after the current index
-                offset = 1
-                found_good_image = False
-                max_search_limit = 5
-                alternatives = []
-                while not found_good_image and offset <= max_search_limit:
-                    # Try looking both before and after
-                    for direction in [-1, 1]:
-                        # Calculate new index
-                        new_idx = target_idx + (direction * offset)
-                        # Check if the new index is valid
-                        if 0 <= new_idx <= max_index:
-                            neighbor_satellite_image = list(self.satellite_images.values())[new_idx]
-                            # If the neighboring image is useful, append it
-                            if satellite_image._badPixelRatio <= self.bad_pixel_limit and satellite_image not in timeseries:
-                                timeseries.append(neighbor_satellite_image)
-                                found_good_image = True
-                                break  # Exit the inner loop
-                            else:
-                                # Add to alternative list with its bad pixel ratio
-                                alternatives.append((neighbor_satellite_image, neighbor_satellite_image._badPixelRatio))
-                    # Increase the offset to look further
-                    offset += 1
-                # If limit reached, add the image with the lowest bad pixel ratio that is not in timeseries already
-                if not found_good_image:
-                    alternatives.sort(key=lambda x: x[1])  # Sort by bad pixel ratio (best first)
-                    for alternative in alternatives:
-                        si = alternative[0]
-                        if si not in timeseries:
-                            timeseries.append(si)
-                            break
-                        else:
-                            continue
+                acceptable_neighbor = _find_acceptable_neighbor(target_idx)
+                if acceptable_neighbor:
+                    timeseries.append(acceptable_neighbor)
+                else:
+                    alternatives = [(img, img._badPixelRatio) for idx, img in self.satellite_images.items() if img not in timeseries]
+                    best_alternative = _get_best_alternative(alternatives)
+                    if best_alternative:
+                        timeseries.append(best_alternative)
+
         timeseries = sorted(timeseries, key=lambda image: image.date)
         tsIdx = [idx for idx, si in self.satellite_images.items() if si in timeseries]
-        tsDate = [int(si.date.strftime("%Y%m%d")) for si in self.satellite_images.values() if si in timeseries]
-        self.selected_timeseries[f"ts-{self.timeseries_length}"] = np.array([tsIdx, tsDate])
+        tsDate = [int(si.date.strftime("%Y%m%d")) for si in timeseries]
+        self.selected_timeseries[f"ts-{self.timeseries_length}"] = [list(item) for item in zip(tsIdx, tsDate)]
+        if save:
+            self.save_selected_timeseries()
         return self.selected_timeseries
-         
+
+    def save_selected_timeseries(self):
+        all_timeseries = self.load_timeseries()
+        if not any(key in all_timeseries for key in self.selected_timeseries):
+            all_timeseries.update(self.selected_timeseries)
+            with open(os.path.join(self.base_folder,"selected_timeseries.json"), 'w') as file:
+                json.dump(all_timeseries, file, indent=4)
+        return 
+
     def create_patches(self, source, indices=False):
         if not self.selected_timeseries:
             self.load_or_built_timeseries()
@@ -440,34 +371,6 @@ class SatelliteDataCube:
         self.save_patches()
         return self.patches
            	
-    def process_patches(self, patch_size, patch_folder):
-        """
-        Preprocess the satellite data to prepare it for further analysis or modeling.
-
-        The preprocessing steps include:
-        1. Building or loading global data: This ensures that the necessary global datasets, 
-        which might include various datasets representing different aspects or metadata 
-        of the satellite images, are available. If required data for the desired timeseries 
-        length isn't already present, it is built using the `create_global_data` method. 
-        Otherwise, it's loaded using the `load_global_data` method.
-        
-        2. Creating or loading patches: This step divides satellite images into patches for 
-        both image and mask data. If patches meeting the desired size aren't already loaded, 
-        they are processed using the `process_patches` method. If they are present, they are 
-        loaded using the `load_patches_as_tchw` method.
-
-        Attributes Updated:
-        - global_data: Contains the global datasets after the preprocessing.
-        - patches: Contains the processed patches after the preprocessing.
-        
-        Returns:
-        None
-        """
-        self.load_or_built_global_mask()
-        self.load_or_built_timeseries()
-        
-        return patches
-
     def sanity_check(self, patches):
         return
 
