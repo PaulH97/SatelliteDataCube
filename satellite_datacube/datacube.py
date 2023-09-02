@@ -36,7 +36,7 @@ class SatelliteDataCube:
         if load_data:
             self.satellite_images = self.load_satellite_images()
             self.global_mask = self.load_global_mask()
-            self.selected_timeseries = self.load_timeseries(single=True)
+            self.selected_timeseries = self.load_single_timeseries()
             self.patches = self.load_patches()
             
     def _print_initialization_info(self) -> None:
@@ -79,20 +79,21 @@ class SatelliteDataCube:
             print(f"Could not find global_mask file in: {self.base_folder}", "If you want to create a global mask for the timeseries please use create_global_mask().")
             return None 
 
-    def load_timeseries(self, single=True):
+    def load_single_timeseries(self):
         selected_ts_path = os.path.join(self.base_folder, "selected_timeseries.json")
         if os.path.exists(selected_ts_path):
             with open(selected_ts_path, 'r') as file:
                 timeseries = json.load(file)
-            if single:
+            if f"ts-{self.timeseries_length}" in timeseries.keys():
+                timeseries = timeseries[f"ts-{self.timeseries_length}"]
                 print(f"Loaded single timeseries with {self.timeseries_length} satellite images")
-                return timeseries[f"ts-{self.timeseries_length}"]
-            else:
-                print(f"Loaded all timeseries of file: {selected_ts_path}")
                 return timeseries
+            else:
+                print(f"Could not find a timeseries of length {self.timeseries_length} inside {selected_ts_path}. When you want to create it use create_timeseries().")
+                return 
         else:
             print(f"Could not find selected_timeseries file: {selected_ts_path}. Please use create_timeseries() to create such a file.")
-            return {}
+            return None
 
     def load_patches(self, patches_folder=""):
         """
@@ -115,14 +116,14 @@ class SatelliteDataCube:
         """
         patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
         patches = {}
-        for patchName in ["img", "msk", "msk_gb"]:
-            patchPath = os.path.join(patches_folder, f"{patchName}_patches_ts-{self.timeseries_length}.npy")
+        for source in ["img", "msk", "msk_gb"]:
+            patchPath = os.path.join(patches_folder, f"{source}_patches{self.patch_size}_ts{self.timeseries_length}.npy")
             if os.path.exists(patchPath):
-                patches[patchName] = np.load(patchPath)
+                patches[source] = np.load(patchPath)
         if patches:
             print(f"Loaded patches as dictonary with keys [img, msk, msk_gb] from {patches_folder}")
         else:
-            print(f"Could not find patches in: {patches_folder}", "If you want to select a timeseries please use create_patches().")
+            print(f"Could not find patches in: {patches_folder}", "Please use create_patches() to create the necessary patches.")
         return patches
 
     def load_satellite_images(self):
@@ -184,10 +185,10 @@ class SatelliteDataCube:
     
     def load_or_built_timeseries(self):
 
-        if self.timeseries_length not in [key.split("-")[-1] for key in self.selected_timeseries.keys()]:
+        if not self.selected_timeseries:
             self.selected_timeseries = self.create_timeseries()
         else:
-            self.selected_timeseries = self.load_timeseries()
+            self.selected_timeseries = self.load_single_timeseries()
         return 
 
     def load_or_built_patches(self, patches_folder=""):
@@ -315,7 +316,7 @@ class SatelliteDataCube:
         timeseries = sorted(timeseries, key=lambda image: image.date)
         tsIdx = [idx for idx, si in self.satellite_images.items() if si in timeseries]
         tsDate = [int(si.date.strftime("%Y%m%d")) for si in timeseries]
-        self.selected_timeseries[f"ts-{self.timeseries_length}"] = [list(item) for item in zip(tsIdx, tsDate)]
+        self.selected_timeseries = [list(item) for item in zip(tsIdx, tsDate)]
         if save:
             self.save_selected_timeseries()
         return self.selected_timeseries
@@ -327,7 +328,6 @@ class SatelliteDataCube:
         with open(selected_ts_path, 'w') as file:
             json.dump(all_timeseries, file, indent=4)
         print(f"Saved timeseries with length {self.timeseries_length} inside: {selected_ts_path}")
-        self.selected_timeseries = self.load_timeseries()
         return 
 
     def create_patches(self, source, indices=False):
@@ -366,14 +366,15 @@ class SatelliteDataCube:
             os.makedirs(patches_folder)
         for source, patchArray in self.patches.items():
             print(f"Saving patches of source {source} as array with shape {patchArray.shape}")  
-            np.save(os.path.join(patches_folder, f"{source}_patches_ts-{self.timeseries_length}.npy"), patchArray)
+            np.save(os.path.join(patches_folder, f"{source}_patches{self.patch_size}_ts{self.timeseries_length}.npy"), patchArray)
         return
     
     def process_patches(self, sources, class_values, seed, indices=False, patches_folder=""):
+        self.load_or_built_timeseries()
         patches_idx = self.select_patches(class_values=class_values, seed=seed)
         for source in sources:
             if source in ["img", "msk"]:
-                self.create_patches(source=source, indices=indices)
+                self.create_patches(source=source, indices=indices) # need to get better performance -> takes some RAM...
             else:
                 global_mask_patches = patchify(self.global_mask, self.patch_size)         
                 self.patches[source] = np.array(global_mask_patches)
@@ -381,7 +382,50 @@ class SatelliteDataCube:
         self.save_patches()
         return self.patches
            	
-    def sanity_check(self, patches):
+    def sanity_check(self):
+        
+        def contrastStreching(image):
+            
+            image = image.astype(np.float32)
+            imgCS = np.empty_like(image, dtype=np.float32)
+
+            # Perform contrast stretching on each channel
+            for band in range(image.shape[-1]):
+                imgMin = image[...,band].min().astype(np.float32)
+                imgMax = image[...,band].max().astype(np.float32)
+                imgCS[...,band] = (image[...,band] - imgMin) / (imgMax - imgMin)
+            
+            return imgCS
+
+        # Pick random sample
+        idx = random.randint(0, next(iter(self.patches.values())).shape[0]-1)
+        # idx = random.randint(0, self.patches["img"].shape[0]-1)
+        img = np.moveaxis(self.patches["img"][idx,...],1,-1)
+        msk = np.moveaxis(self.patches["msk"][idx,...],1,-1)
+        msk_gb = np.moveaxis(self.patches["msk_gb"][idx,...],0,-1)
+
+        timesteps = img.shape[0]
+        nrows, nclos = 2, timesteps+1
+        fig, axs = plt.subplots(nrows=nrows, ncols=nclos, figsize=(28, 2), sharey=True)     
+        for i in range(nrows):
+            if i == 0: 
+                for j in range(timesteps):
+                    img_data = contrastStreching(img[j,:,:,:3])
+                    axs[i][j].imshow(img_data)  
+                    axs[i][j].axis('off')
+                
+                axs[i][timesteps].imshow(msk_gb, cmap='gray')
+                axs[i][timesteps].axis('off')  
+        
+            else:
+                for j in range(timesteps):
+                    axs[i][j].imshow(msk[j,...], cmap='gray')  
+                    axs[i][j].axis('off')
+                
+                axs[i][timesteps].imshow(msk_gb, cmap='gray')
+                axs[i][timesteps].axis('off')  
+        
+        plt.show()
         return
 
     def create_spectral_signature(self, shapefile, save_csv=True):
