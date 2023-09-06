@@ -11,24 +11,25 @@ import random
 
 # - change to recalculate the timeseries whenever it is called - remove loading from json file
 # -> if someone wants to save the calculation of TS they can provide the idx values of satellite images and give it to the function
+# -> that means if they want to save calculation time they can do the json stuff by themself outside the datacube! - show in tutorial
 
 # - change parameters...do not use timeseries length/patch_size because it is not a specific value of the data-cube 
 # - use these parameters when the functions are called!!
 
 # - build temp_folder when init?
 
-
 class SatelliteDataCube:
-    def __init__(self, base_folder):
+    def __init__(self, base_folder, load_data=True):
 
         self.base_folder = base_folder 
         self.satellite_images = self.load_satellite_images()
         self.masks = self.load_masks()
-        self.global_mask = self.load_or_built_global_mask()
+        self.global_mask = self.load_global_mask()
+        self.global_mask = self.global_mask if self.global_mask is not None else self.create_global_mask()
         self.seed = 42
-        
+    
         self._print_initialization_info()
-            
+      
     def _print_initialization_info(self) -> None:
         """
         Display detailed initialization information about the data-cube.
@@ -46,55 +47,38 @@ class SatelliteDataCube:
         Example Output:
         ------------------- base_folder_name -------------------
         Initializing data-cube with following parameter:
-        - base folder: /path/to/base_folder
-        - Start-End: 
-        - Length of data-cub: 90
+        - base folder: .../SatelliteDataCube/Chimanimani
+        - Start-End: 2018-09-06 00:00:00 -> 2019-09-16 00:00:00
+        - Length of data-cube: 90
         """
         divider = "-" * 20
         #print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
         print(f"{2*divider}")
-        print("Initializing data-cube with following parameter:")
+        print("Initialized data-cube with following parameter:")
         print(f"- base folder: {self.base_folder}")
-        print(f"- Start-End: {next(iter(self.satellite_images)).date} -> {next(reversed(self.satellite_images)).date}")
+        print(f"- Start-End: {next(iter(self.satellite_images.values())).date} -> {next(reversed(self.satellite_images.values())).date}")
         print(f"- Length of data-cube: {len(self.satellite_images)}")
         print(f"{2*divider}")
 
     def load_global_mask(self):
         global_mask_path = os.path.join(self.base_folder, "global_mask.npy")
         if os.path.exists(global_mask_path):
-            print(f"Loaded global_mask from: {global_mask_path}")
-            return np.load(global_mask_path)
+            return np.load(global_mask_path, allow_pickle=True)
         else:
             print(f"Could not find global_mask file in: {self.base_folder}", "If you want to create a global mask for the timeseries please use create_global_mask().")
             return None 
 
-    def load_patches_as_dict(self, patch_size, timeseries_length, patches_folder=""):
-        """
-        Load patches from the saved .npy files and format them as TCHW (Time, Channel, Height, Width).
+    def load_patches(self, patch_size, timeseries_length, patches_folder=""):
 
-        This function searches for saved patches in the base folder with names corresponding to 'img', 'msk', and 'msk_gb' and containing 
-        information about the length of the timeseries. If found, it loads the patches into a dictionary, where the keys are the patch names 
-        and the values are the loaded patches. If no patches are found, it returns an empty dictionary.
-
-        Returns:
-        - dict: A dictionary containing loaded patches. The potential keys are 'img', 'msk', and 'msk_gb', 
-                and the values are the corresponding patches formatted as NTCHW.
-
-        Example:
-        If 'img_patches_ts-6.npy' exists in the patches folder and contains image patches, the returned dictionary might look like:
-        {
-            'img': np.ndarray of shape (num_patches, num_timesteps, num_channels, patch_height, patch_width),
-            ...
-        }
-        """
         patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
         patches = {}
         for source in ["img", "msk", "msk_gb"]:
-            patchPath = os.path.join(patches_folder, f"{source}_patch{patch_size}_ts{timeseries_length}.npy")
+            patchPath = os.path.join(patches_folder, f"{source}_patches{patch_size}_ts{timeseries_length}.npy")
             if os.path.exists(patchPath):
                 patches[source] = np.load(patchPath)
         if patches:
             print(f"Loaded patches as dictonary with keys [img, msk, msk_gb] from {patches_folder}")
+            [print(source, patch.shape) for source, patch in patches.items()]
         else:
             print(f"Could not find patches in: {patches_folder}", "Please use create_patches() to create the necessary patches.")
         return patches
@@ -103,7 +87,9 @@ class SatelliteDataCube:
         ts_folder = os.path.join(self.base_folder, "selected_timeseries") if not ts_folder else ts_folder
         selected_timeseries = os.path.join(ts_folder, f"ts_{timeseries_length}.json")
         if os.path.exists(selected_timeseries):
-            return selected_timeseries
+            idx_timeseries = [timestep[0] for timestep in selected_timeseries]
+            si_timeseries = [self.satellite_images[idx] for idx in idx_timeseries] 
+            return si_timeseries
         else:
             print(f"Could not find timeseries in: {ts_folder}", "Please use create_timeseries() to create the necessary timeseries.")
             return []
@@ -133,7 +119,6 @@ class SatelliteDataCube:
         Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
         with their corresponding `Sentinel2` instances.
         """
-        print("Initializing satellite images")
         return {
             i: Sentinel2(si_folder)
             for i, si_folder in enumerate(
@@ -144,107 +129,36 @@ class SatelliteDataCube:
         }
 
     def load_masks(self):
-        return
-
-    def load_or_built_global_mask(self):
-        """
-        Ensure that the global dataset is either loaded from existing storage or constructed afresh.
-
-        This method checks if the global dataset is already present in the instance. If not, or if the dataset 
-        doesn't contain information for the desired timeseries length specified in the instance's parameters, 
-        it constructs the global data anew using the `create_global_data` method. If the global dataset is 
-        present and meets the criteria, it simply loads it using the `load_global_data` method.
-
-        Returns:
-        - dict: A dictionary containing the global data. For detailed information see create_global_data()
-
-        Example:
-        If the global data for a specified timeseries length isn't loaded or doesn't meet the desired criteria, 
-        the method might process and return global data containing elements like 'global_mask' and 'timeseries'.
-        """
-        if not self.global_mask:
-            self.global_mask = self.create_global_mask()
+        masks = {}
+        if self.satellite_images:
+            for idx, si in self.satellite_images.items():
+                masks[idx] = si.initiate_mask()
+            return masks
         else:
-            self.global_mask = self.load_global_mask()
-        return 
-    
-    def load_or_built_patches(self, patch_size, timeseries_length, patches_folder=""):
-        """
-        Ensure that the satellite image patches are either loaded from existing storage or processed anew.
+            print("Satellite images of datacube are not initialized. Please use load_satellite_images() before running this function.")
+            return None   
 
-        This method first checks if patches are already loaded in the instance. If they aren't, or if their size 
-        doesn't match the desired patch size specified in the instance's parameters, it processes the patches 
-        using the `process_patches` method. If patches are already loaded and meet the size criteria, it attempts 
-        to load them using the `load_patches_as_tchw` method.
-
-        Returns:
-        - dict: A dictionary containing the patches. The dictionary keys include 'img' for multi-spectral image patches,
-                'msk' for binary mask patches corresponding to each timestep, and 'msk_gb' for a binary mask that 
-                represents the entire timeseries without individual timesteps.
-
-        Example:
-        If previously processed patches aren't loaded or if they don't meet the desired size, the method might 
-        process and return patches in a format like:
-        {
-            'img': np.ndarray of shape (num_patches, num_timesteps, num_channels, patch_height, patch_width),
-            'msk': np.ndarray of shape (num_patches, num_timesteps, num_channels, patch_height, patch_width),
-            'msk_gb': np.ndarray of shape (num_patches, num_channels, patch_height, patch_width)
-        }
-        """
-        patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
-        if os.path.exists(patches_folder):
-            patches = self.load_patches_as_dict(patch_size=patch_size, timeseries_length=timeseries_length, patches_folder=patches_folder)
-            if patches[next(iter(patches))].shape[-1] == patch_size:
-                return patches
-            else:
-                patches = self.create_patches(patch_size=patch_size, timeseries_length=timeseries_length, output_folder=patches_folder)
-        else:
-            patches = self.create_patches(patch_size=patch_size, timeseries_length=timeseries_length, output_folder=patches_folder)
-        return patches
-
-    def load_or_built_timeseries(self, timeseries_length, ts_folder=""):
-
-        if not self.load_single_timeseries(timeseries_length=timeseries_length, ts_folder=ts_folder):
-            selected_timeseries = self.create_timeseries(timeseries_length=timeseries_length, save=True)
-        else:
-            selected_timeseries = self.load_single_timeseries(timeseries_length=timeseries_length)
-        return selected_timeseries
-
-    def create_global_mask(self, save=True):
-        """
-        Generate a global mask for the data cube by aggregating masks from individual satellite images.
-
-        This function iterates over all satellite images in the instance's 'satellite_images' attribute.
-        For each image, the mask is initiated and checked. If any part of the mask has a value greater than or 
-        equal to 1 (target class), it's considered a boolean mask (True for values >= 1). All such masks are aggregated to form 
-        a global mask, which is stored in the instance's 'global_data' attribute under the key 'global_mask'.
-
-        Note:
-        The global mask is a logical OR aggregation of individual image masks, i.e., if a pixel is True in any 
-        image mask, it will be True in the global mask.
-
-        Example:
-        If the satellite images have masks that highlight certain features or anomalies, 
-        the global mask will highlight all these features across all images.
-        """
-        print("Building global mask of datacube")
+    def create_global_mask(self, save=True, output_folder=""):
         global_masks = []
-        for satellite_image in self.satellite_images.values():
-            satellite_image.initiate_mask()
-            si_mask = satellite_image._mask
-            if np.any(si_mask >= 1): 
-                mask_bool = si_mask >= 1
-                global_masks.append(mask_bool)
-            satellite_image.unload_mask()
-        self.global_mask = np.logical_or.reduce(global_masks).astype(int)
-        if save: 
-            self.save_global_mask()
-        return self.global_mask
+        if self.masks:
+            for mask in self.masks.values():
+                if np.any(mask >= 1): 
+                    mask_bool = mask >= 1
+                    global_masks.append(mask_bool)
+            global_mask = np.logical_or.reduce(global_masks).astype(int)
+            if save: 
+                self.save_global_mask(global_mask=global_mask, output_folder=output_folder)
+            return global_mask
+        else:
+            print("Masks of satellite images are not initialized. Please use load_masks() before calling this function.")
+            return None
 
-    def save_global_mask(self, output_folder=""):
+    def save_global_mask(self, global_mask, output_folder=""):
         if not output_folder:
-            output_folder = os.path.join(self.base_folder, "global_mask.npy")
-        np.save(file=output_folder,arr=self.global_mask)
+            output_folder = self.base_folder
+        output_file = os.path.join(output_folder, "global_mask.npy")
+        with open(output_file, 'wb') as f:
+            np.save(file=f,arr=global_mask)
         return
 
     def create_timeseries(self, timeseries_length, save=True, ts_folder=""):
@@ -256,33 +170,30 @@ class SatelliteDataCube:
             image.calculate_bad_pixels()
             return image._badPixelRatio <= bad_pixel_limit and image not in timeseries
 
-        def _find_acceptable_neighbor(target_idx, max_search_limit=5):
-            """Search for the nearest good quality image before and after the current index"""
+        def _find_acceptable_neighbor(target_idx, search_limit=5):
+            """Search for the nearest good quality image before and after the current index. 
+            If none is found, return the one with the least bad pixels from the search range."""
             max_index = len(self.satellite_images.values()) - 1
-            offset = 1
-            while offset <= max_search_limit:
+            potential_alternatives = []
+
+            # Search within the range for acceptable images
+            for offset in range(1, search_limit + 1):
                 for direction in [-1, 1]:
                     new_idx = target_idx + (direction * offset)
                     if 0 <= new_idx <= max_index:
                         neighbor = _get_image_by_index(new_idx)
+                        bad_pixel_ratio = neighbor.calculate_bad_pixels()
                         if _is_image_quality_acceptable(neighbor):
                             return neighbor
-                offset += 1
-            return None
+                        potential_alternatives.append((neighbor, bad_pixel_ratio))
 
-        def _get_best_alternative(alternatives):
-            alternatives.sort(key=lambda x: x[1])  # Sort by bad pixel ratio (best first)
-            for alternative in alternatives:
-                si = alternative[0]
-                if _is_image_quality_acceptable(si):
-                    return si
-            return None
+            potential_alternatives.sort(key=lambda x: x[1])  # Sorting by bad pixel ratio
+            return potential_alternatives[0][0] if potential_alternatives else None
 
         print(f"Selecting timeseries with {timeseries_length} satellite images of data-cube")
         timeseries = []
         max_index = len(self.satellite_images.values()) - 1
         selected_indices = np.linspace(0, max_index, timeseries_length, dtype=int)
-
         for target_idx in selected_indices:
             print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
             satellite_image = _get_image_by_index(target_idx)
@@ -292,36 +203,29 @@ class SatelliteDataCube:
                 acceptable_neighbor = _find_acceptable_neighbor(target_idx)
                 if acceptable_neighbor:
                     timeseries.append(acceptable_neighbor)
-                else:
-                    alternatives = [(img, img._badPixelRatio) for idx, img in self.satellite_images.items() if img not in timeseries]
-                    best_alternative = _get_best_alternative(alternatives)
-                    if best_alternative:
-                        timeseries.append(best_alternative)
-
         timeseries = sorted(timeseries, key=lambda image: image.date)
+        if save:
+            self.save_timeseries(timeseries=timeseries, ts_folder=ts_folder)
+        return timeseries
+
+    def save_timeseries(self, timeseries, ts_folder=""):
         tsIdx = [idx for idx, si in self.satellite_images.items() if si in timeseries]
         tsDate = [int(si.date.strftime("%Y%m%d")) for si in timeseries]
-        selected_timeseries = [list(item) for item in zip(tsIdx, tsDate)]
-        if save:
-            if not ts_folder:
-                ts_folder = os.path.join(self.base_folder, "selected_timeseries")
-                os.makedirs(ts_folder)
-            ts_js_file = os.path.join(ts_folder, f"ts_{timeseries_length}.json")
-            with open(ts_js_file, 'w') as file:
-                json.dump(selected_timeseries, file)
-        return selected_timeseries
+        timeseries = [list(item) for item in zip(tsIdx, tsDate)]
+        if not ts_folder:
+            ts_folder = os.path.join(self.base_folder, "selected_timeseries")
+            os.makedirs(ts_folder)
+        ts_js_file = os.path.join(ts_folder, f"ts_{len(timeseries)}.json")
+        with open(ts_js_file, 'w') as file:
+            json.dump(timeseries, file)
 
     def create_patches(self, source, patch_size, selected_timeseries=[], indices=False):
         print(f"Generating patches from source {source}. Each patch has a size of {patch_size}x{patch_size}px.")
-        if selected_timeseries:
-            print(f"Using a selected timeseries of satellite images of data-cube.")
-            idx_timeseries = [timestep[0] for timestep in selected_timeseries]
-            si_timeseries = [self.satellite_images[idx] for idx in idx_timeseries] 
-        else:
-            print(f"Using all satellite images of data-cube.")
-            si_timeseries = [si for si in self.satellite_images.values()]
+        if not selected_timeseries:
+            print(f"No timeseries was selected. Patches of all satellite images of data-cube are created.")
+            selected_timeseries = [si for si in self.satellite_images.values()]
         src_patches = [] 
-        for image in si_timeseries:
+        for image in selected_timeseries:
             print(f"Start with {source} on date {image.date}.")
             patches = image.process_patches(patch_size, source=source, indices=indices) # returns list of patches
             src_patches.append(patches)
@@ -330,22 +234,21 @@ class SatelliteDataCube:
         # convert it to an array of pattern NxTxCxHxW where N is the number of satellite images in timeseries
         patches[source] = np.swapaxes(np.array(src_patches),0,1) 
         return patches
-
-    def select_patches(self, global_mask, patch_size, class_values, seed, class_ratio=(100,0)):
-        random.seed(seed)
+    
+    def filter_patches(self, patches, class_values, class_ratio=(100,0)):
+        random.seed(self.seed)
+        patch_size = next(iter(patches.values())).shape[-1]
         class_ratio= [i / 100 for i in class_ratio]
-        global_mask_patches = patchify(global_mask, patch_size)
+        global_mask_patches = patchify(self.global_mask, patch_size)
         class_indices = [idx for idx, patch in enumerate(global_mask_patches) if np.any(np.isin(patch, class_values))]
         no_class_indices = [idx for idx, patch in enumerate(global_mask_patches) if not np.any(np.isin(patch, class_values))]
         num_noclass_patches = int((len(class_indices) / class_ratio[0]) * class_ratio[1])
         no_class_indices = random.sample(no_class_indices, num_noclass_patches)
-        return class_indices + no_class_indices
-            
-    def filter_patches(self, patches_idx):
+        selected_patchIDs = class_indices + no_class_indices
         for source, patchArray in patches.items():
-            self.patches[source] = patchArray[patches_idx]  
-        return self.patches
-        
+            patches[source] = patchArray[selected_patchIDs]  
+        return patches
+    
     def save_patches(self, patches_folder=""):
         patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
         if not os.path.exists(patches_folder):

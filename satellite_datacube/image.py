@@ -76,7 +76,7 @@ class SatelliteImage:
             src_metadata = rasterio.open(bands_path[0]).meta
             mask = np.zeros((1, src_metadata['height'], src_metadata['width']), dtype=src_metadata['dtype'])
         self._mask = mask
-        return
+        return mask
     
     def unload_bands(self):
         self._bands = {}
@@ -101,6 +101,7 @@ class SatelliteImage:
         scene_class = self._bands["SCL"].bandArray
         bad_pixel = np.isin(scene_class, [0,1,2,3,8,9,10,11])
         self._badPixelRatio = np.mean(bad_pixel) * 100
+        self.unload_bands()
         return self._badPixelRatio
     
     def stack_bands(self, indices=False):
