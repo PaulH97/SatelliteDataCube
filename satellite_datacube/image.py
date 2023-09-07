@@ -112,12 +112,12 @@ class SatelliteImage:
         return self._stackedBands
         
     def process_patches(self, patch_size, source, indices=False, save=False, output_folder=None):
-        if source == "img":
+        if source == "images":
             self.stack_bands(indices=indices)
             stackedBands = np.delete(self._stackedBands, -1, axis=0)
             patches = patchify(stackedBands, patch_size)
-        elif source == "msk":
-            if not self._mask:
+        elif source == "masks":
+            if self._mask is None:
                 self.initiate_mask()
             patches = patchify(self._mask, patch_size)
             patches = [np.where(patch >= 1, 1, patch) for patch in patches]
@@ -186,7 +186,7 @@ class Sentinel2(SatelliteImage):
         self.location = os.path.basename(os.path.dirname(self.folder))
         self.date = datetime.strptime(os.path.basename(self.folder), "%Y%m%d")
 
-    def calculate_indices(self, save_file=True):
+    def calculate_indices(self, save_file=False):
         
         exampleRaster = self.get_band("B02")
         red = self.get_band("B04").bandArray
@@ -220,11 +220,11 @@ class Sentinel2(SatelliteImage):
 
             self.add_band("NDVI", ndvi_path)
             self.add_band("NDWI", ndwi_path)
-            keys_order = ['B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL']
-            self._bands = {key: self._bands[key] for key in keys_order}
-            return self._bands
-        else:
-            return ndvi, ndwi
+        
+        keys_order = ['B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL']
+        self._bands = {key: self._bands[key] for key in keys_order}
+        return self._bands
+
 
     def plot_rgb(self):
         
