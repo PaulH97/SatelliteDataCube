@@ -6,6 +6,7 @@ import json
 from .utils import patchify
 from .image import Sentinel1, Sentinel2, Sentinel12
 import random
+import pandas as pd
 
 # TODO:
 
@@ -76,7 +77,7 @@ class SatelliteDataCube:
         else:
             print(f"Could not find global_mask file in: {self.base_folder}", "If you want to create a global mask for the timeseries please use create_global_mask().")
             return None 
-    
+
     def _load_satellite_images(self):
         """
         Initialize satellite images by scanning the base folder and processing valid satellite image directories.
@@ -145,7 +146,7 @@ class SatelliteDataCube:
         else:
             print(f"Could not find timeseries in: {ts_folder}", "Please use create_timeseries() to create the necessary timeseries.")
             return []
-        
+
     def create_global_mask(self, save=True, output_folder=""):
         global_masks = []
         if self.masks:
@@ -246,7 +247,7 @@ class SatelliteDataCube:
                 src_patches = np.array(patchify(source_array=self.global_mask, patch_size=patch_size)) # NxCxHxW
             all_src_patches[source] = src_patches 
         return all_src_patches
-    
+
     def filter_patches(self, patches, class_values, class_ratio=(100,0)):
         random.seed(self.seed)
         class_ratio= [i / 100 for i in class_ratio]
@@ -273,31 +274,43 @@ class SatelliteDataCube:
             print(f"Saved patches from source {source} as array with shape: {patchArray.shape}") 
         return 
 
-    def process_patches(self, sources, class_values, seed, indices=False, patches_folder=""):
-        self.load_or_built_timeseries()
-        patches_idx = self.select_patches(class_values=class_values, seed=seed)
-        for source in sources:
-            if source in ["images", "masks"]:
-                self.create_patches(source=source, indices=indices) # need to get better performance -> takes some RAM...
-            else:
-                global_mask_patches = patchify(self.global_mask, self.patch_size)         
-                self.patches[source] = np.array(global_mask_patches)
-        self.filter_patches(patches_idx=patches_idx)
-        self.save_patches()
-        return self.patches
+    def process_patches(self, patch_size, class_values, selected_timeseries=[], indices=False, patches_folder=""):
+                
+        patches = self.create_patches(patch_size=patch_size, selected_timeseries=selected_timeseries, indices=indices)
+        [print(f"Created patches of {source.upper()} with shape: {array.shape}") for source, array in patches.items()]
+        filtered_patches = self.filter_patches(patches=patches, class_values=class_values)
+        [print(f"Filtered patches of {source.upper()} so that the shape chnaged to: {array.shape}") for source, array in patches.items()]
+        self.save_patches(patches=filtered_patches, patches_folder=patches_folder)
+        return filtered_patches
 
-    def create_spectral_signature(self, selected_timeseries=[]):
-        return
+    def create_spectral_signature(self, shapefile, selected_timeseries=[], output_folder=""):
+        if not selected_timeseries:
+            selected_timeseries = [si for si in self.satellite_images.values()]
+        spectral_sig = {}
+        for image in selected_timeseries:
+            image_spectral_sig = image.calculate_spectral_signature(shapefile=shapefile)
+            spectral_sig[str(image.date)] = image_spectral_sig
+        if output_folder:
+            spectral_sig_df = pd.DataFrame(spectral_sig)
+            spectral_sig_df.to_csv(os.path.join(output_folder,f"{self.satellite}_spectralSig_ts{len(selected_timeseries)}.csv"))
+        return spectral_sig
     
-    def plot_band_signature(self, spectral_signature):
-        # spectral_signature["NDVI"] = (spectral_signature["B08"] - spectral_signature["B04"])/(spectral_signature["B08"] + spectral_signature["B04"])
-        # plt.plot(spectral_signature['Timestamp'], spectral_signature["NDVI"], label="NDVI", marker='o')
-        plt.figure(figsize=(10, 8))
-        for column in spectral_signature.columns[1:]:  # Assuming first column is 'Timestamp'"B02_DWN_log_[10, 90]_histo.png"
-            plt.plot(spectral_signature['Timestamp'], spectral_signature[column], label=column)
-        plt.xlabel('Year')
-        plt.ylabel('Change')
-        plt.title('Annual Change of Different Bands')
-        plt.legend()
+    def plot_spectral_signature(self, spectral_signature, output_folder=""):
+        bands = list(spectral_signature[list(spectral_signature.keys())[0]].keys())
+        fig, ax = plt.subplots(figsize=(10,6))
+        for band in bands:
+            time_steps = list(spectral_signature.keys())
+            band_values = [spectral_signature[time_step][band] for time_step in time_steps]
+            ax.plot(time_steps, band_values, label=band)
+
+        ax.set_title("Spectral Signature over Time")
+        ax.set_xlabel("Time Step")
+        ax.set_ylabel("Band Value")
+        ax.legend()
+        ax.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
         plt.show()
+        if output_folder:
+            plt.savefig(os.path.join(output_folder, f"{self.satellite}_spectralSig_ts{len(time_steps)}.png"))
         return

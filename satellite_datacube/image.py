@@ -138,28 +138,22 @@ class SatelliteImage:
             patches[source] = [os.path.join(sourceFolder, patch) for patch in os.listdir(sourceFolder)]
         return patches
  
-    def calculate_spectral_signature(self, shapefile, csv_file=False):
+    def calculate_spectral_signature(self, shapefile, output_folder=""):
 
-        if not self._stackedBands:
+        if self._stackedBands is None:
             self.stack_bands()
-
         with fiona.open(shapefile, "r") as file:
             geometries = [feature["geometry"] for feature in file]
-
         spectral_sig = {}
         for band_id, band in self._bands.items():
             if band_id != "SCL":
                 band = band.band # open rasterio dataset
                 mean_values = [np.mean(mask(band, [polygon], crop=True)[0]) for polygon in geometries]
-                print(mean_values)
                 spectral_sig[band_id] = np.mean(mean_values)
-
-        if csv_file:
+        if output_folder:
             spectral_sig_df = pd.DataFrame(spectral_sig)
             spectral_sig_df.to_csv("spectral_signature.csv")
-            return spectral_sig_df
-        else:
-            return spectral_sig
+        return spectral_sig
        
     def plot_spectral_signature(self, shapefile):
         """
