@@ -4,7 +4,7 @@ import rasterio
 from matplotlib import pyplot as plt
 import json
 from .utils import patchify
-from .image import Sentinel2
+from .image import Sentinel1, Sentinel2, Sentinel12
 import random
 
 # TODO:
@@ -27,8 +27,8 @@ import random
 # right now only one timestep contains the mask
 
 class SatelliteDataCube:
-    def __init__(self, base_folder):
-
+    def __init__(self, base_folder, satellite):
+        self.satellite = satellite    
         self.base_folder = base_folder 
         self.satellite_images = self._load_satellite_images()
         self.masks = self._load_masks()
@@ -63,7 +63,8 @@ class SatelliteDataCube:
         #print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
         print(f"\n{2*divider}")
         print("Initialized data-cube with following parameter:")
-        print(f"- base folder: {self.base_folder}")
+        print(f"- Images from satellite mission: {self.satellite}")
+        print(f"- Base folder: {self.base_folder}")
         print(f"- Start-End: {next(iter(self.satellite_images.values())).date} -> {next(reversed(self.satellite_images.values())).date}")
         print(f"- Length of data-cube: {len(self.satellite_images)}")
         print(f"{2*divider}")
@@ -101,14 +102,12 @@ class SatelliteDataCube:
         Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
         with their corresponding `Sentinel2` instances.
         """
-        return {
-            i: Sentinel2(si_folder)
-            for i, si_folder in enumerate(
-                si_folder.path 
-                for si_folder in os.scandir(self.base_folder) 
-                if os.path.isdir(si_folder.path) and si_folder.name.isdigit()
-            )
-        }
+        if self.satellite == "S1":
+            return {i: Sentinel1(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(self.base_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+        elif self.satellite == "S2":
+            return {i: Sentinel2(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(self.base_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+        else:
+            return {i: Sentinel12(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(self.base_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
 
     def _load_masks(self):
         masks = {}
