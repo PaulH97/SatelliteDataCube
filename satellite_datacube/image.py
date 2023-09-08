@@ -184,7 +184,7 @@ class Sentinel2(SatelliteImage):
         super().__init__()
         self.folder = si_folder #
         self.location = os.path.basename(os.path.dirname(self.folder))
-        self.date = datetime.strptime(os.path.basename(self.folder), "%Y%m%d")
+        self.date = datetime.strptime(os.path.basename(self.folder), "%Y%m%d").date()
 
     def calculate_indices(self, save_file=False):
         

@@ -225,11 +225,11 @@ class SatelliteDataCube:
         with open(ts_js_file, 'w') as file:
             json.dump(timeseries, file)
 
-    def create_patches(self, patch_size, selected_timeseries=[], indices=False):
-        print(f"Generating patches for satellite images, masks and the global mask with a size of {patch_size}x{patch_size}px:")       
+    def create_patches(self, patch_size, selected_timeseries=[], indices=False):      
         if not selected_timeseries:
             print(f"No timeseries was selected. Patches of all satellite images of data-cube are created.")
             selected_timeseries = [si for si in self.satellite_images.values()]
+        print(f"Generating patches of size {patch_size}x{patch_size}px for {len(selected_timeseries)} satellite images with corresponding masks and for one global mask:") 
         all_src_patches = {}
         for source in ["images", "masks", "global_mask"]:
             if source in ["images", "masks"]:
@@ -260,19 +260,19 @@ class SatelliteDataCube:
         for source, patchArray in patches.items():
             filtered_patches[source] = patchArray[class_indices + no_class_indices] # for masks it can happen that no of the selected masks of si contains GT 
         return filtered_patches
-    
+
     def save_patches(self, patches, patches_folder=""):
-        patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
+        patches_folder = os.path.join(self.base_folder,"patches") if not patches_folder else patches_folder
         patch_array = next(iter(patches.values()))
         patch_size, ts_length = patch_array.shape[-1], patch_array.shape[1]
-        print(patch_size, ts_length)
         if not os.path.exists(patches_folder):
             os.makedirs(patches_folder)
+        print(f"Saving patches in folder: {patches_folder}")
         for source, patchArray in patches.items(): 
             np.save(os.path.join(patches_folder, f"{source}_patches{patch_size}_ts{ts_length}.npy"), patchArray)
             print(f"Saved patches from source {source} as array with shape: {patchArray.shape}") 
-        return
-    
+        return 
+
     def process_patches(self, sources, class_values, seed, indices=False, patches_folder=""):
         self.load_or_built_timeseries()
         patches_idx = self.select_patches(class_values=class_values, seed=seed)
@@ -285,103 +285,9 @@ class SatelliteDataCube:
         self.filter_patches(patches_idx=patches_idx)
         self.save_patches()
         return self.patches
-           	
-    def sanity_check(self):
-        
-        def contrastStreching(image):
-            
-            image = image.astype(np.float32)
-            imgCS = np.empty_like(image, dtype=np.float32)
 
-            # Perform contrast stretching on each channel
-            for band in range(image.shape[-1]):
-                imgMin = image[...,band].min().astype(np.float32)
-                imgMax = image[...,band].max().astype(np.float32)
-                imgCS[...,band] = (image[...,band] - imgMin) / (imgMax - imgMin)
-            
-            return imgCS
-
-        # Pick random sample
-        idx = random.randint(0, next(iter(self.patches.values())).shape[0]-1)
-        # idx = random.randint(0, self.patches["img"].shape[0]-1)
-        img = np.moveaxis(self.patches["img"][idx,...],1,-1)
-        msk = np.moveaxis(self.patches["msk"][idx,...],1,-1)
-        msk_gb = np.moveaxis(self.patches["msk_gb"][idx,...],0,-1)
-
-        timesteps = img.shape[0]
-        nrows, nclos = 2, timesteps+1
-        fig, axs = plt.subplots(nrows=nrows, ncols=nclos, figsize=(28, 2), sharey=True)     
-        for i in range(nrows):
-            if i == 0: 
-                for j in range(timesteps):
-                    img_data = contrastStreching(img[j,:,:,:3])
-                    axs[i][j].imshow(img_data)  
-                    axs[i][j].axis('off')
-                
-                axs[i][timesteps].imshow(msk_gb, cmap='gray')
-                axs[i][timesteps].axis('off')  
-        
-            else:
-                for j in range(timesteps):
-                    axs[i][j].imshow(msk[j,...], cmap='gray')  
-                    axs[i][j].axis('off')
-                
-                axs[i][timesteps].imshow(msk_gb, cmap='gray')
-                axs[i][timesteps].axis('off')  
-        
-        plt.show()
+    def create_spectral_signature(self, selected_timeseries=[]):
         return
-
-    def create_spectral_signature(self, shapefile, save_csv=True):
-        
-        from rasterio.mask import mask
-        import pandas as pd 
-
-        geometries = []
-        # Open your shapefile
-        #file = ogr.Open(shapefile)
-        layer = file.GetLayer(0)
-        for i in range(layer.GetFeatureCount()):
-            feature = layer.GetFeature(i)
-            geometry = json.loads(feature.GetGeometryRef().ExportToJson())
-            geometries.append(geometry)
-        
-        file = None
-        spectral_sig = {}
-        
-        for satellite_image in self.satellite_images.values():
-           
-            satellite_image.initiate_bands()
-        
-            for b_name, band in satellite_image._bands.items():
-                                
-                band_value = 0
-                
-                with rasterio.open(band.path) as src:
-                    
-                    # Loop over polygons and extract raster values
-                    for polygon in geometries:
-                        
-                        out_image, out_transform = mask(src, [polygon], crop=True)                         
-                        band_value += np.mean(out_image)
-
-                mean_value = band_value/len(geometries)
-                
-                if b_name not in spectral_sig:
-
-                    spectral_sig[b_name] = [mean_value] # {B02:[1,2,3,4,5...90], B03:[1,2,3,4,5...90],...}
-                else:
-                    spectral_sig[b_name].append(mean_value)
-
-            satellite_image.unload_bands()
-
-        spectral_sig["Timestamp"] = [satellite_image.date for satellite_image in self.satellite_images.values()]
-        spectral_sig_df = pd.DataFrame(spectral_sig)
-        spectral_sig_df = spectral_sig_df.set_index('Timestamp').reset_index()
-
-        spectral_sig_df.to_csv("spectral_signature.csv")
-
-        return spectral_sig_df  
     
     def plot_band_signature(self, spectral_signature):
         # spectral_signature["NDVI"] = (spectral_signature["B08"] - spectral_signature["B04"])/(spectral_signature["B08"] + spectral_signature["B04"])
