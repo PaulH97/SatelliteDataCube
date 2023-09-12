@@ -138,10 +138,10 @@ class SatelliteImage:
             patches[source] = [os.path.join(sourceFolder, patch) for patch in os.listdir(sourceFolder)]
         return patches
  
-    def calculate_spectral_signature(self, shapefile, output_folder=""):
+    def calculate_spectral_signature(self, shapefile, indices=False, output_folder=""):
 
         if self._stackedBands is None:
-            self.stack_bands()
+            self.stack_bands(indices=indices)
         with fiona.open(shapefile, "r") as file:
             geometries = [feature["geometry"] for feature in file]
         spectral_sig = {}
@@ -155,12 +155,8 @@ class SatelliteImage:
             spectral_sig_df.to_csv("spectral_signature.csv")
         return spectral_sig
        
-    def plot_spectral_signature(self, shapefile):
-        """
-        Plot the spectral signature for a given region.
-        """
-        spectral_signature = self.calculate_spectral_signature(shapefile)
-        print(spectral_signature)
+    def plot_spectral_signature(self, spectral_signature, band_list):
+        spectral_signature = {k: spectral_signature[k] for k in band_list if k in spectral_signature}
         band_ids = list(spectral_signature.keys())
         reflectances = list(spectral_signature.values())
 
@@ -218,7 +214,6 @@ class Sentinel2(SatelliteImage):
         keys_order = ['B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL']
         self._bands = {key: self._bands[key] for key in keys_order}
         return self._bands
-
 
     def plot_rgb(self):
         

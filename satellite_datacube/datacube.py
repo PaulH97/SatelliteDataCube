@@ -27,6 +27,9 @@ import pandas as pd
 # VERY IMPORTANT: We need to add the GT for all of the following si after the event 
 # right now only one timestep contains the mask
 
+# TODO: Update the function with storing the shapefile in a varibale -> creating mask with that and not using the annotation.tif?
+
+
 class SatelliteDataCube:
     def __init__(self, base_folder, satellite):
         self.satellite = satellite    
@@ -35,6 +38,7 @@ class SatelliteDataCube:
         self.masks = self._load_masks()
         self.global_mask = self._load_global_mask()
         self.global_mask = self.global_mask if self.global_mask is not None else self.create_global_mask()
+        self.labels = None # loading shapefile with fiona 
         self.seed = 42
     
         self._print_initialization_info()
@@ -62,7 +66,7 @@ class SatelliteDataCube:
         """
         divider = "-" * 20
         #print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
-        print(f"\n{2*divider}")
+        print(f"{2*divider}")
         print("Initialized data-cube with following parameter:")
         print(f"- Images from satellite mission: {self.satellite}")
         print(f"- Base folder: {self.base_folder}")
@@ -115,6 +119,7 @@ class SatelliteDataCube:
         if self.satellite_images:
             for idx, si in self.satellite_images.items():
                 masks[idx] = si.initiate_mask()
+                si.unload_mask()
             return masks
         else:
             print("Satellite images of datacube are not initialized. Please use load_satellite_images() before running this function.")
@@ -283,12 +288,12 @@ class SatelliteDataCube:
         self.save_patches(patches=filtered_patches, patches_folder=patches_folder)
         return filtered_patches
 
-    def create_spectral_signature(self, shapefile, selected_timeseries=[], output_folder=""):
+    def create_spectral_signature(self, shapefile, selected_timeseries=[], indices=False, output_folder=""):
         if not selected_timeseries:
             selected_timeseries = [si for si in self.satellite_images.values()]
         spectral_sig = {}
         for image in selected_timeseries:
-            image_spectral_sig = image.calculate_spectral_signature(shapefile=shapefile)
+            image_spectral_sig = image.calculate_spectral_signature(shapefile=shapefile,indices=indices)
             spectral_sig[str(image.date)] = image_spectral_sig
         if output_folder:
             spectral_sig_df = pd.DataFrame(spectral_sig)
@@ -314,3 +319,4 @@ class SatelliteDataCube:
         if output_folder:
             plt.savefig(os.path.join(output_folder, f"{self.satellite}_spectralSig_ts{len(time_steps)}.png"))
         return
+
