@@ -121,9 +121,9 @@ class SatelliteBand:
         plt.xlabel('DN', fontsize = 16)
         plt.show()
     
-    def plot_band(self):
+    def plot(self):
         
         plt.figure(figsize=(10,10))
-        plt.imshow(np.moveaxis(self.array, 0,-1), cmap="viridis")
+        plt.imshow(np.moveaxis(self.bandArray, 0,-1), cmap="viridis")
         plt.colorbar()
         plt.show()

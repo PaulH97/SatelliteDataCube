@@ -5,7 +5,7 @@ from matplotlib import pyplot as plt
 import re
 from rasterio.mask import mask
 import pandas as pd 
-import fiona
+import geopandas as gpd
 from datetime import datetime
 from .utils import patchify, save_patch
 from .band import SatelliteBand
@@ -52,7 +52,6 @@ class SatelliteImage:
         return
     
     def initiate_bands(self, indices=False):
-        bands = {}
         bands_path = [entry.path for entry in os.scandir(self.folder) if entry.is_file() and entry.name.endswith('.tif')]
         for band_path in bands_path:
             band_id = self._extract_band_info(band_path)
@@ -142,14 +141,15 @@ class SatelliteImage:
 
         if self._stackedBands is None:
             self.stack_bands(indices=indices)
-        with fiona.open(shapefile, "r") as file:
-            geometries = [feature["geometry"] for feature in file]
+        gdf = gpd.read_file(shapefile)
+        geometries = gdf.geometry.tolist()
         spectral_sig = {}
         for band_id, band in self._bands.items():
             if band_id != "SCL":
                 band = band.band # open rasterio dataset
                 mean_values = [np.mean(mask(band, [polygon], crop=True)[0]) for polygon in geometries]
                 spectral_sig[band_id] = np.mean(mean_values)
+        self.unload_bands()
         if output_folder:
             spectral_sig_df = pd.DataFrame(spectral_sig)
             spectral_sig_df.to_csv("spectral_signature.csv")
@@ -176,7 +176,10 @@ class Sentinel2(SatelliteImage):
         self.location = os.path.basename(os.path.dirname(self.folder))
         self.date = datetime.strptime(os.path.basename(self.folder), "%Y%m%d").date()
 
-    def calculate_indices(self, save_file=False):
+    def calculate_indices(self, save_file=True):
+
+        if self._bands is None:
+            self.initiate_bands()
         
         exampleRaster = self.get_band("B02")
         red = self.get_band("B04").bandArray
@@ -185,7 +188,7 @@ class Sentinel2(SatelliteImage):
         np.seterr(divide='ignore', invalid='ignore')
         ndvi = (nir.astype(float) - red.astype(float)) / (nir + red)
         ndwi = (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
-        
+          
         if save_file:
             profile = {
                 'driver': 'GTiff',
@@ -210,7 +213,6 @@ class Sentinel2(SatelliteImage):
 
             self.add_band("NDVI", ndvi_path)
             self.add_band("NDWI", ndwi_path)
-        
         keys_order = ['B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL']
         self._bands = {key: self._bands[key] for key in keys_order}
         return self._bands

@@ -3,6 +3,7 @@ import rasterio
 import random
 import numpy as np
 from matplotlib import pyplot as plt
+from rasterio.mask import mask
 
 def patchify(source_array, patch_size):
     """Utility function to create patches from a source array."""
@@ -87,6 +88,7 @@ def save_patches(patches, patches_folder=""):
     return
 
 def save_patch(output_folder, i, j, patch, template_meta, patch_size, source):
+
     """Utility function to save a patch to a file."""
     patches_folder = os.path.join(output_folder, "patches", source)
     os.makedirs(patches_folder, exist_ok=True)
@@ -101,3 +103,50 @@ def save_patch(output_folder, i, j, patch, template_meta, patch_size, source):
     with rasterio.open(output_path, 'w', **meta) as dst:
         dst.write(patch)
     return
+
+def generate_bbox(labels_df, buffer_amount):
+    from shapely.geometry import shape, box
+    
+    def buffered_bbox(polygon, buffer):
+        poly_shape = shape(polygon)
+        minx, miny, maxx, maxy = poly_shape.bounds
+        bbox = box(minx - buffer, 
+                   miny - buffer, 
+                   maxx + buffer, 
+                   maxy + buffer)
+        return bbox
+    
+    labels_df["bbox"] = labels_df["geometry"].apply(lambda polygon: buffered_bbox(polygon, buffer_amount))
+    return labels_df
+
+def mask_image(labels_df, satellite_image, output_folder=""):
+    src_meta = next(iter(satellite_image._bands.values())).get_metadata()
+    masked_landslides = {}
+    satellite_image.initiate_bands()
+    
+    for idx, bbox in enumerate(labels_df["bbox"]):
+        bbox = bbox.__geo_interface__
+        out_images = []
+        for satellite_band in satellite_image._bands.values(): 
+            src_band = satellite_band.band 
+            out_image, out_transform = mask(src_band, [bbox], crop=True)
+            out_images.append(out_image)
+        
+        stacked_image = np.stack(out_images, axis=0)
+        masked_landslides[idx] = stacked_image
+
+        out_meta = src_meta.copy()
+        out_meta.update({
+            "driver": "GTiff",
+            "height": stacked_image.shape[1],
+            "width": stacked_image.shape[2],
+            "transform": out_transform,
+            "count": stacked_image.shape[0]  # number of bands
+        })
+
+        if output_folder:
+            with rasterio.open(os.path.join(output_folder, f"S2_ls{idx}.tif"), 'w', **out_meta) as dest:
+                dest.write(stacked_image)
+
+    satellite_image.unload_bands()    
+    return masked_landslides   

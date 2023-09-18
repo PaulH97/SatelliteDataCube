@@ -1,26 +1,18 @@
 import os
 import numpy as np
-import rasterio
+import geopandas as gpd
 from matplotlib import pyplot as plt
 import json
 from .utils import patchify
 from .image import Sentinel1, Sentinel2, Sentinel12
 import random
 import pandas as pd
+from datetime import datetime
+import rasterio
 
 # TODO:
 
-# - change to recalculate the timeseries whenever it is called - remove loading from json file
-# -> if someone wants to save the calculation of TS they can provide the idx values of satellite images and give it to the function
-# -> that means if they want to save calculation time they can do the json stuff by themself outside the datacube! - show in tutorial
-
-# - change parameters...do not use timeseries length/patch_size because it is not a specific value of the data-cube 
-# - use these parameters when the functions are called!!
-
 # - build temp_folder when init?
-
-# - create pre post timeseries function - create_timeseries_bitemporal() 
-# -> two images which are clud free and show the area before the landslide event and after 
 
 # fix the indices parameter -> find a nice solution 
 
@@ -36,9 +28,9 @@ class SatelliteDataCube:
         self.base_folder = base_folder 
         self.satellite_images = self._load_satellite_images()
         self.masks = self._load_masks()
-        self.global_mask = self._load_global_mask()
-        self.global_mask = self.global_mask if self.global_mask is not None else self.create_global_mask()
-        self.labels = None # loading shapefile with fiona 
+        self.global_mask = self._load_or_create_global_mask()
+        self.labels_shp = os.path.join(self.base_folder, "shp")
+        self.labels = self._load_labels_as_df()
         self.seed = 42
     
         self._print_initialization_info()
@@ -74,13 +66,37 @@ class SatelliteDataCube:
         print(f"- Length of data-cube: {len(self.satellite_images)}")
         print(f"{2*divider}")
 
-    def _load_global_mask(self):
+    def _load_or_create_global_mask(self):
         global_mask_path = os.path.join(self.base_folder, "global_mask.npy")
         if os.path.exists(global_mask_path):
-            return np.load(global_mask_path, allow_pickle=True)
+            global_mask = np.load(global_mask_path, allow_pickle=True)
         else:
-            print(f"Could not find global_mask file in: {self.base_folder}", "If you want to create a global mask for the timeseries please use create_global_mask().")
-            return None 
+            print(f"Could not find global_mask file in: {self.base_folder}. Creating the global mask for the data-cube.")
+            global_mask = self._create_global_mask()
+        return global_mask
+
+    def _create_global_mask(self, save=True, output_folder=""):
+        global_masks = []
+        if self.masks:
+            for mask in self.masks.values():
+                mask_bool = mask >= 1
+                if mask_bool.any():  # Checks if any value is True
+                    global_masks.append(mask_bool)
+            global_mask = np.logical_or.reduce(global_masks).astype(int)
+            if save: 
+                self._save_global_mask(global_mask=global_mask, output_folder=output_folder)
+            return global_mask
+        else:
+            print("Masks of satellite images are not initialized. Please use load_masks() before calling this function.")
+            return None
+
+    def _save_global_mask(self, global_mask, output_folder=""):
+        if not output_folder:
+            output_folder = self.base_folder
+        output_file = os.path.join(output_folder, "global_mask.npy")
+        with open(output_file, 'wb') as f:
+            np.save(file=f,arr=global_mask)
+        return
 
     def _load_satellite_images(self):
         """
@@ -107,12 +123,13 @@ class SatelliteDataCube:
         Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
         with their corresponding `Sentinel2` instances.
         """
+        satellite_folder = os.path.join(self.base_folder, self.satellite)
         if self.satellite == "S1":
-            return {i: Sentinel1(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(self.base_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+            return {i: Sentinel1(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
         elif self.satellite == "S2":
-            return {i: Sentinel2(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(self.base_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+            return {i: Sentinel2(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
         else:
-            return {i: Sentinel12(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(self.base_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+            return {i: Sentinel12(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
 
     def _load_masks(self):
         masks = {}
@@ -124,6 +141,28 @@ class SatelliteDataCube:
         else:
             print("Satellite images of datacube are not initialized. Please use load_satellite_images() before running this function.")
             return None   
+
+    def _load_labels_as_df(self):
+        labels = gpd.read_file(self.labels_shp)
+        labels = pd.DataFrame(labels)
+        return labels
+
+    def get_bitemporal_images(self):
+        labels_df = self._load_labels_as_df()
+        pre_dates = labels_df["pre_date"].value_counts()
+        post_dates = labels_df["post_s2cf"].value_counts()
+        pre_date_mf = pre_dates[pre_dates == pre_dates.max()].index.tolist()[0]
+        post_date_mf = post_dates[post_dates == post_dates.max()].index.tolist()[0]
+        pre_date_mf = datetime.strptime(pre_date_mf, "%Y-%m-%d").date()
+        post_date_mf = datetime.strptime(post_date_mf, "%Y-%m-%d").date()
+        
+        satellite_images_dates = {idx: satellite_image.date for idx,satellite_image in self.satellite_images.items()}
+        pre_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(pre_date_mf - satellite_images_dates[key]))
+        post_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(post_date_mf - satellite_images_dates[key]))
+        pre_image = self.satellite_images[pre_closest_key]
+        post_image = self.satellite_images[post_closest_key]
+        
+        return pre_image, post_image
 
     def load_patches(self, patch_size, timeseries_length, patches_folder=""):
         patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
@@ -151,29 +190,6 @@ class SatelliteDataCube:
         else:
             print(f"Could not find timeseries in: {ts_folder}", "Please use create_timeseries() to create the necessary timeseries.")
             return []
-
-    def create_global_mask(self, save=True, output_folder=""):
-        global_masks = []
-        if self.masks:
-            for mask in self.masks.values():
-                mask_bool = mask >= 1
-                if mask_bool.any():  # Checks if any value is True
-                    global_masks.append(mask_bool)
-            global_mask = np.logical_or.reduce(global_masks).astype(int)
-            if save: 
-                self.save_global_mask(global_mask=global_mask, output_folder=output_folder)
-            return global_mask
-        else:
-            print("Masks of satellite images are not initialized. Please use load_masks() before calling this function.")
-            return None
-
-    def save_global_mask(self, global_mask, output_folder=""):
-        if not output_folder:
-            output_folder = self.base_folder
-        output_file = os.path.join(output_folder, "global_mask.npy")
-        with open(output_file, 'wb') as f:
-            np.save(file=f,arr=global_mask)
-        return
 
     def create_timeseries(self, timeseries_length):
 
@@ -210,6 +226,7 @@ class SatelliteDataCube:
         selected_indices = np.linspace(0, max_index, timeseries_length, dtype=int)
         for target_idx in selected_indices:
             print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
+            print("")
             satellite_image = _get_image_by_index(target_idx)
             if _is_image_quality_acceptable(satellite_image):
                 timeseries.append(satellite_image)
@@ -288,12 +305,12 @@ class SatelliteDataCube:
         self.save_patches(patches=filtered_patches, patches_folder=patches_folder)
         return filtered_patches
 
-    def create_spectral_signature(self, shapefile, selected_timeseries=[], indices=False, output_folder=""):
+    def create_spectral_signature(self, selected_timeseries=[], indices=False, output_folder=""):
         if not selected_timeseries:
             selected_timeseries = [si for si in self.satellite_images.values()]
         spectral_sig = {}
         for image in selected_timeseries:
-            image_spectral_sig = image.calculate_spectral_signature(shapefile=shapefile,indices=indices)
+            image_spectral_sig = image.calculate_spectral_signature(shapefile=self.labels_shp,indices=indices)
             spectral_sig[str(image.date)] = image_spectral_sig
         if output_folder:
             spectral_sig_df = pd.DataFrame(spectral_sig)
