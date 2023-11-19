@@ -8,7 +8,7 @@ from .image import Sentinel1, Sentinel2, Sentinel12
 import random
 import pandas as pd
 from datetime import datetime
-import rasterio
+from glob import glob
 
 # TODO:
 
@@ -29,7 +29,7 @@ class SatelliteDataCube:
         self.satellite_images = self._load_satellite_images()
         self.masks = self._load_masks()
         self.global_mask = self._load_or_create_global_mask()
-        self.labels_shp = os.path.join(self.base_folder, "shp")
+        self.labels_shp = glob(os.path.join(self.base_folder, "shp", "*.shp"))[0]
         self.labels = self._load_labels_as_df()
         self.seed = 42
     
@@ -67,7 +67,7 @@ class SatelliteDataCube:
         print(f"{2*divider}")
 
     def _load_or_create_global_mask(self):
-        global_mask_path = os.path.join(self.base_folder, "global_mask.npy")
+        global_mask_path = os.path.join(self.base_folder, "other", "global_mask.npy")
         if os.path.exists(global_mask_path):
             global_mask = np.load(global_mask_path, allow_pickle=True)
         else:
@@ -92,7 +92,7 @@ class SatelliteDataCube:
 
     def _save_global_mask(self, global_mask, output_folder=""):
         if not output_folder:
-            output_folder = self.base_folder
+            output_folder = os.path.join(self.base_folder, "other")
         output_file = os.path.join(output_folder, "global_mask.npy")
         with open(output_file, 'wb') as f:
             np.save(file=f,arr=global_mask)
@@ -124,13 +124,26 @@ class SatelliteDataCube:
         with their corresponding `Sentinel2` instances.
         """
         satellite_folder = os.path.join(self.base_folder, self.satellite)
+        satellite_images = {}
         if self.satellite == "S1":
-            return {i: Sentinel1(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+            for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
+                    si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
+                    si_location = os.path.basename(self.base_folder)
+                    satellite_images[i] = Sentinel1(si_folder=si_folder.path, location=si_location, date=si_date)
+            return satellite_images
         elif self.satellite == "S2":
-            return {i: Sentinel2(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
+            for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
+                    si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
+                    si_location = os.path.basename(self.base_folder)
+                    satellite_images[i] = Sentinel2(si_folder=si_folder, location=si_location, date=si_date)
+            return satellite_images
         else:
-            return {i: Sentinel12(si_folder) for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit())}
-
+            for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
+                    si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
+                    si_location = os.path.basename(self.base_folder)
+                    satellite_images[i] = Sentinel12(si_folder=si_folder.path, location=si_location, date=si_date)
+            return satellite_images
+    
     def _load_masks(self):
         masks = {}
         if self.satellite_images:
@@ -147,21 +160,16 @@ class SatelliteDataCube:
         labels = pd.DataFrame(labels)
         return labels
 
-    def get_bitemporal_images(self):
-        labels_df = self._load_labels_as_df()
-        pre_dates = labels_df["pre_date"].value_counts()
-        post_dates = labels_df["post_s2cf"].value_counts()
-        pre_date_mf = pre_dates[pre_dates == pre_dates.max()].index.tolist()[0]
-        post_date_mf = post_dates[post_dates == post_dates.max()].index.tolist()[0]
-        pre_date_mf = datetime.strptime(pre_date_mf, "%Y-%m-%d").date()
-        post_date_mf = datetime.strptime(post_date_mf, "%Y-%m-%d").date()
-        
+    def get_bitemporal_images(self, labels_idx):
+        pre_date = self.labels_df.iloc[labels_idx]["pre_date"]
+        post_date = self.labels_df.iloc[labels_idx]["post_s2cf"]
+        pre_date = datetime.strptime(pre_date, "%Y-%m-%d").date()
+        post_date = datetime.strptime(post_date, "%Y-%m-%d").date()
         satellite_images_dates = {idx: satellite_image.date for idx,satellite_image in self.satellite_images.items()}
-        pre_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(pre_date_mf - satellite_images_dates[key]))
-        post_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(post_date_mf - satellite_images_dates[key]))
+        pre_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(pre_date - satellite_images_dates[key]))
+        post_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(post_date - satellite_images_dates[key]))
         pre_image = self.satellite_images[pre_closest_key]
         post_image = self.satellite_images[post_closest_key]
-        
         return pre_image, post_image
 
     def load_patches(self, patch_size, timeseries_length, patches_folder=""):

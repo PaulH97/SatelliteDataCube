@@ -78,15 +78,19 @@ class SatelliteBand:
                 output_path = os.path.join(os.path.dirname(self.path), os.path.basename(self.path) + "_resampled.tif") 
                 with rasterio.open(output_path, 'w', **meta) as dst:
                     reproject_band(self.band, rasterio.band(self.band, 1), rasterio.band(dst, 1), ref_transform)
-                self.path = output_path       
+                self.path = output_path 
+                self.band = rasterio.open(self.path)
+                self.bandArray = self.band.read()       
                 return self
 
-            resampled_array = np.empty((1, ref_height, ref_width))
-            reproject_band(self.band, rasterio.band(self.band, 1), resampled_array[0,...], ref_transform)
-            return resampled_array.astype(self.bandArray.dtype)
+            else:
+                resampled_array = np.empty((1, ref_height, ref_width))
+                reproject_band(self.band, rasterio.band(self.band, 1), resampled_array[0,...], ref_transform)
+                self.bandArray = resampled_array.astype(self.bandArray.dtype)
+                return self
 
         else: 
-            return self.bandArray
+            return self
 
     def normalize(self, method="z-score"):
                 

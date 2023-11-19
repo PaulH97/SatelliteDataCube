@@ -92,6 +92,7 @@ def save_patch(output_folder, i, j, patch, template_meta, patch_size, source):
     """Utility function to save a patch to a file."""
     patches_folder = os.path.join(output_folder, "patches", source)
     os.makedirs(patches_folder, exist_ok=True)
+    idx = len(os.listdir(patches_folder))
 
     meta = template_meta.copy()
     meta.update(width=patch_size, height=patch_size, count=patch.shape[0])
@@ -99,10 +100,12 @@ def save_patch(output_folder, i, j, patch, template_meta, patch_size, source):
     transform = template_meta["transform"] * rasterio.Affine.translation(j, i)
     meta.update(transform=transform)
 
-    output_path = os.path.join(patches_folder, f'{i}_{j}.tif')
+    output_path = os.path.join(patches_folder, f"{idx:05}.tif")
+    if os.path.exists(output_path):
+        os.remove(output_path)
     with rasterio.open(output_path, 'w', **meta) as dst:
         dst.write(patch)
-    return
+    return patches_folder
 
 def generate_bbox(labels_df, buffer_amount):
     from shapely.geometry import shape, box
@@ -120,33 +123,41 @@ def generate_bbox(labels_df, buffer_amount):
     return labels_df
 
 def mask_image(labels_df, satellite_image, output_folder=""):
-    src_meta = next(iter(satellite_image._bands.values())).get_metadata()
-    masked_landslides = {}
     satellite_image.initiate_bands()
-    
-    for idx, bbox in enumerate(labels_df["bbox"]):
-        bbox = bbox.__geo_interface__
+    for idx, row in labels_df.iterrows():
+        bbox = row['bbox']
         out_images = []
-        for satellite_band in satellite_image._bands.values(): 
-            src_band = satellite_band.band 
-            out_image, out_transform = mask(src_band, [bbox], crop=True)
-            out_images.append(out_image)
+        for satellite_band in satellite_image._bands.values():
+            if satellite_band.name != "SCL":
+                satellite_band = satellite_band.resample(resolution=10, reference_band_path=satellite_image._bands["B02"].path, save_file=True)
+                src_band = satellite_band.band
+                out_image, out_transform = mask(src_band, [bbox], crop=True)
+                out_images.append(out_image)
         
-        stacked_image = np.stack(out_images, axis=0)
-        masked_landslides[idx] = stacked_image
+                src_meta = src_band.meta.copy()
+                src_meta.update({
+                    "driver": "GTiff",
+                    "height": out_image.shape[1],  
+                    "width": out_image.shape[2],   
+                    "transform": out_transform, 
+                    "dtype": out_image.dtype,      
+                    "count": out_image.shape[0]
+                })
 
-        out_meta = src_meta.copy()
-        out_meta.update({
-            "driver": "GTiff",
-            "height": stacked_image.shape[1],
-            "width": stacked_image.shape[2],
-            "transform": out_transform,
-            "count": stacked_image.shape[0]  # number of bands
-        })
+                if output_folder:
+                    label_folder = os.path.join(output_folder, str(idx))
+                    os.makedirs(label_folder, exist_ok=True)
+                    with rasterio.open(os.path.join(label_folder, f"S2_{satellite_band.name}.tif"), 'w', **src_meta) as dest:
+                        dest.write(out_image)      
+    satellite_image.unload_bands()
+    return
 
-        if output_folder:
-            with rasterio.open(os.path.join(output_folder, f"S2_ls{idx}.tif"), 'w', **out_meta) as dest:
-                dest.write(stacked_image)
 
-    satellite_image.unload_bands()    
-    return masked_landslides   
+# from rasterio.plot import show
+# raster = rasterio.open(os.path.join(label_folder, f"S2_B02.tif"))
+# x, y = geometry.exterior.xy
+# fig, ax = plt.subplots()
+# ax.plot(x, y)
+# show(raster, ax=ax, transform=raster.transform)
+# plt.show()
+ 
