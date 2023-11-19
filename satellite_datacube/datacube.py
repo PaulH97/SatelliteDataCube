@@ -125,13 +125,13 @@ class SatelliteDataCube:
         """
         satellite_folder = os.path.join(self.base_folder, self.satellite)
         satellite_images = {}
-        if self.satellite == "S1":
+        if self.satellite == "sentinel-1":
             for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
                     si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
                     si_location = os.path.basename(self.base_folder)
                     satellite_images[i] = Sentinel1(si_folder=si_folder.path, location=si_location, date=si_date)
             return satellite_images
-        elif self.satellite == "S2":
+        elif self.satellite == "sentinel-2":
             for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
                     si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
                     si_location = os.path.basename(self.base_folder)
