@@ -5,31 +5,54 @@ import numpy as np
 from matplotlib import pyplot as plt
 from rasterio.mask import mask
 
-def patchify(source_array, patch_size):
+def patchify(source_array, patch_size, padding=True):
     """Utility function to create patches from a source array."""
     num_bands, size_x, size_y = source_array.shape
     patches = []
+
     for i in range(0, size_x, patch_size):
         for j in range(0, size_y, patch_size):
             patch = source_array[:, i:i+patch_size, j:j+patch_size]
-            if patch.shape == (num_bands, patch_size, patch_size):
-                patches.append(patch)
+
+            # Check if patch needs padding
+            if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
+                patch = pad_patch(patch, patch_size)
+            elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
+                continue  # Skip patches that are smaller than patch_size when padding is False
+
+            patches.append(patch)
+
     return patches
 
+def pad_patch(patch, patch_size):
+    # Determine how much padding is needed
+    pad_x = patch_size - patch.shape[1]
+    pad_y = patch_size - patch.shape[2]
+    # Here, we're padding with zeros - you can adjust the 'constant_values' parameter as needed for your application
+    padded_patch = np.pad(patch, ((0, 0), (0, pad_x), (0, pad_y)), mode='constant', constant_values=0)
+    return padded_patch
+
+def contrast_stretching_minmax(image):
+    img = image.astype(np.float32)
+    img_cs = np.empty_like(img, dtype=np.float32)
+    # Perform contrast stretching on each channel
+    for band in range(image.shape[-1]):
+        img_min = image[...,band].min().astype(np.float32)
+        img_max = image[...,band].max().astype(np.float32)
+        img_cs[...,band] = (image[...,band] - img_min) / (img_max - img_min)
+    return img_cs
+
+def contrast_stretching_precentile(image, percentiles=(2,98)):
+    img = image.astype(np.float32)
+    img_cs = np.empty_like(img, dtype=np.float32)
+    # Perform contrast stretching on each channel
+    for band in range(image.shape[-1]):
+        img_min = np.percentile(image[...,band], percentiles[0]).astype(np.float32)
+        img_max = np.percentile(image[...,band], percentiles[1]).astype(np.float32)
+        img_cs[...,band] = (image[...,band] - img_min) / (img_max - img_min)
+    return img_cs
+
 def sanity_check(patches):
-
-    def contrastStreching(image):
-        
-        image = image.astype(np.float32)
-        imgCS = np.empty_like(image, dtype=np.float32)
-
-        # Perform contrast stretching on each channel
-        for band in range(image.shape[-1]):
-            imgMin = image[...,band].min().astype(np.float32)
-            imgMax = image[...,band].max().astype(np.float32)
-            imgCS[...,band] = (image[...,band] - imgMin) / (imgMax - imgMin)
-        
-        return imgCS
 
     # Pick random sample
     idx = random.randint(0, next(iter(patches.values())).shape[0]-1)
@@ -161,3 +184,20 @@ def mask_image(labels_df, satellite_image, output_folder=""):
 # show(raster, ax=ax, transform=raster.transform)
 # plt.show()
  
+    # def process_filtered_patches(self, patch_size, indices=False, output_folder=None):
+    #     self.stack_bands(indices=indices)
+    #     self.initiate_mask()     
+    #     stackedBands = np.delete(self._stackedBands, -1, axis=0)
+    #     img_patches = patchify(stackedBands, patch_size)
+    #     msk_patches = patchify(self._mask, patch_size)
+    #     band = next(iter(self.bands.values()))
+    #     with rasterio.open(band.path) as src:
+    #         template_meta = src.meta
+    #     for i, patches in enumerate(zip(img_patches,msk_patches)):
+    #         x, y = (i // (self._stackedBands.shape[1] // patch_size)) * patch_size, (i % (self._stackedBands.shape[1] // patch_size)) * patch_size
+    #         if np.any(np.isin(patches[1], 1)):
+    #             img_patch_folder = save_patch(output_folder, x, y, patches[0], template_meta, patch_size, source="images")
+    #             msk_patch_folder = save_patch(output_folder, x, y, patches[1], template_meta, patch_size, source="masks")
+    #     self.unload_bands()
+    #     self.unload_mask()
+    #     return img_patch_folder, msk_patch_folder

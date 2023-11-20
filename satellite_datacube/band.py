@@ -155,7 +155,7 @@ class SatelliteBand:
         band_streched = (self.array - band_min) / (band_max - band_min)
         return band_streched
 
-    def plot_histo(self):
+    def plot_histogram(self):
         """
         Plot histogram of the satellite band.
         """
@@ -180,5 +180,6 @@ class SatelliteBand:
         band_stretched = self.stretch_contrast()
         plt.figure(figsize=(10,10))
         plt.imshow(np.moveaxis(band_stretched, 0,-1), cmap="viridis")
+        plt.title(f"{self.name}")
         plt.colorbar()
         plt.show()

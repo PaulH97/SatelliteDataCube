@@ -7,201 +7,143 @@ from rasterio.mask import mask
 import pandas as pd 
 import geopandas as gpd
 from datetime import datetime
-from .utils import patchify, save_patch
+from .utils import patchify, contrast_stretching
 from .band import SatelliteBand
 from rasterio.features import geometry_mask
+from pathlib import Path
 
 # TODO: reprojecting of patches is not working...they do not align with the original raster
+# - do i need to unload bands in every function?
+
+class Annotation:
+    def __init__(self, shapefile_path):
+        self.path = shapefile_path
+        self.df = self._load_dataframe()
+        self.band = None
+    	
+    def _load_dataframe(self):
+        return gpd.read_file(self.path) 
+
+    def _repair_geometries(self):
+        
+        geometries = self.df["geometry"].to_list()
+
+        repaired_geometries = []
+        for geom in geometries:
+            if geom:
+                if geom.is_valid:
+                    repaired_geometries.append(geom)
+                else:
+                    repaired_geometries.append(geom.buffer(0))
+
+        self.df["geometry"] = repaired_geometries
+        return  
+    
+    def get_geometries_as_list(self):
+        self._repair_geometries()
+        return self.df["geometry"].to_list()
+
+    def rasterize_annotation(self, raster_metadata):
+                
+        geometries = self.get_geometries_as_list()
+        raster_metadata['dtype'] = 'uint8'
+        
+        output_path = self.path.parent / (self.path.stem + ".tif")
+        with rasterio.open(output_path, 'w', **raster_metadata) as dst:
+            mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
+            dst.write(mask.astype(rasterio.uint8), 1)
+
+        self.band = SatelliteBand(band_name="annotation", band_path=output_path)
+        return self.band
+
+    def plot(self):
+        return self.band.plot()
+
 
 class SatelliteImage:
-    def __init__(self):
-        self._bands = {} # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL'
-        self._mask = None
-        self._stackedBands = None
-        self._badPixelRatio = None
-        self._seed = 42
+    def __init__(self, band_paths):
+        """
+        Initialize the SatelliteImage with paths to the satellite band data.
+
+        Args:
+            band_paths (dict): A dictionary mapping band names to their file paths.
+            loaded_bands (dict): 
+            array (numpy.darray):
+            seed (int):
+        """
+        self.band_paths = band_paths 
+        self.loaded_bands = {}
+        self.seed = 42
 
     def __getattr__(self, attr_name):
         try:
-            return self.get_band(attr_name.upper())
+            return self.load_band(attr_name.upper())
         except AttributeError:
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{attr_name}'")
-        
-    def _extract_band_info(self, file_path): 
-        pattern = r"(B\d+[A-Z]?|SCL)\.tif"
-        match = re.search(pattern, file_path)
-        return match.group(1) if match else None
-            
-    def _extract_band_number(self, key):
-        match = re.match(r"B(\d+)", key)
-        return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
-    
-    def get_band(self, band_id):
-        if not self._bands:
-            self.initiate_bands
-        band = self._bands.get(band_id)
-        if band is None:
-            raise AttributeError(f"No band with id '{band_id}' found")
-        return band
-    
+
     def add_band(self, band_id, file_path):
-        self._bands[band_id] = SatelliteBand(band_id, file_path)
+        """
+        Add a new SatelliteBand object to the bands dictionary.
+        """
+        self.band_paths[band_id] = file_path
 
-    def initiate_attributes(self, indices=False):
-        self.initiate_bands(indices) 
-        self.initiate_mask()
-        self.stack_bands()
-        self.calculate_bad_pixels()
-        return
-    
-    def initiate_bands(self, indices=False):
-        bands_path = [entry.path for entry in os.scandir(self.folder) if entry.is_file() and entry.name.endswith('.tif')]
-        for band_path in bands_path:
-            band_id = self._extract_band_info(band_path)
-            if band_id:       
-                self.add_band(band_id, band_path)
-        
-        sorted_keys = sorted(self._bands, key=self._extract_band_number)
-        self._bands = {k: self._bands[k] for k in sorted_keys}
-        if indices:
-            self.calculate_indices()
-        return
-
-    def initiate_mask(self):
-        bands_path = [entry.path for entry in os.scandir(self.folder) if entry.is_file() and entry.name.endswith('.tif')]
-        available_mask = False
-        for band_path in bands_path:
-            if "annotation_10m_new" in os.path.basename(band_path):
-                available_mask = True
-                mask = rasterio.open(band_path).read()  
-        if not available_mask: 
-            src_metadata = rasterio.open(bands_path[0]).meta
-            mask = np.zeros((1, src_metadata['height'], src_metadata['width']), dtype=src_metadata['dtype'])
-        self._mask = mask
-        return mask
-    
-    def rasterize_labels(self, labels):
-        self.initiate_bands()
-        band_meta = self._bands["B02"].band.meta.copy()
-        output_path = os.path.join(self.folder, "annotation_10m_new.tif")
-        geometries = labels["geometry"].to_list()
-
-        valid_geometries = [geom for geom in geometries if geom and geom.is_valid]
-        invalid_geometries = [geom for geom in geometries if geom and not geom.is_valid]
-        repaired_geometry = [geom.buffer(0) for geom in invalid_geometries]
-        geometries = valid_geometries + repaired_geometry
-
-        # Ensure the datatype is appropriate for binary data
-        band_meta['dtype'] = 'uint8'
-
-        with rasterio.open(output_path, 'w', **band_meta) as dst:
-            mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
-            dst.write(mask.astype(rasterio.uint8), 1)
-        self.unload_bands()
-        return output_path
-
-    def unload_bands(self):
-        self._bands = {}
-
-    def unload_mask(self):
-        self._mask = None
-            
-    def check_dir_content(self, dir_path):
-        if os.path.isdir(dir_path):
-            # List all files and subdirectories in the given directory           
-            dir_content = os.listdir(dir_path)
-            if not dir_content:
-                return None
+    def load_band(self, band_name):
+        """
+        Load and return a SatelliteBand object for the specified band.
+        Args:
+            band_name (str): The name of the band in uppercase letter to load.
+        Returns:
+            SatelliteBand: The loaded SatelliteBand object.
+        """
+        if band_name not in self.loaded_bands:
+            band_path = self.band_paths.get(band_name)
+            if band_path:
+                self.loaded_bands[band_name] = SatelliteBand(band_name, band_path)
             else:
-                return dir_path
-        else:
-            return None
-        
-    def calculate_bad_pixels(self):
-        if not self._bands:
-            self.initiate_bands()
-        scene_class = self._bands["SCL"].bandArray
-        bad_pixel = np.isin(scene_class, [0,1,2,3,8,9,10,11])
-        self._badPixelRatio = np.mean(bad_pixel) * 100
-        self.unload_bands()
-        return self._badPixelRatio
+                raise ValueError(f"Band path for '{band_name}' not found.")
+        return self.loaded_bands[band_name]
+
+    def load_all_bands(self):
+        """
+        Load all bands specified in the band_paths.
+        This method iterates through all the band paths and loads each band.
+        """
+        for band_name in self.band_paths:
+            self.load_band(band_name)
+        return
     
-    def stack_bands(self, indices=False):
-        if not self._bands:
-            self.initiate_bands(indices=indices)
-        resampled_bands = [band.resample(resolution=10, reference_band_path=self._bands["B02"].path) for band in self._bands.values()]
-        resampled_bands = [resampled_band.bandArray for resampled_band in resampled_bands]
-        self._stackedBands = np.vstack(resampled_bands) # ['B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', ('NDVI', 'NDWI'), 'SCL'] 
-        return self._stackedBands
+    def unload_all_bands(self):
+        self.loaded_bands = {}
+
+    def stack_resampled_bands(self):
+        if not self.loaded_bands:
+            self.load_all_bands()
         
-    def process_patches(self, patch_size, source, indices=False, save=False, output_folder=None):
-        if source == "images":
-            self.stack_bands(indices=indices)
-            stackedBands = np.delete(self._stackedBands, -1, axis=0)
-            patches = patchify(stackedBands, patch_size)
-        elif source == "masks":
-            if self._mask is None:
-                self.initiate_mask()
-            patches = patchify(self._mask, patch_size)
-            patches = [np.where(patch >= 1, 1, patch) for patch in patches]
-        if save and patches and output_folder:
-            band = next(iter(self._bands.values()))
-            with rasterio.open(band.path) as src:
-                template_meta = src.meta
-            for i, patch in enumerate(patches):
-                x, y = (i // (self._stackedBands.shape[1] // patch_size)) * patch_size, (i % (self._stackedBands.shape[1] // patch_size)) * patch_size
-                patch_folder = save_patch(output_folder, x, y, patch, template_meta, patch_size, source)
-            return patches, patch_folder
-        self.unload_bands()
-        self.unload_mask()
-        return patches
+        band_arrays = []
+        for band_name, band in self.loaded_bands.items():
+            band = band.resample(10)
+            band_arrays.append(band.array)
 
-    def process_filtered_patches(self, patch_size, indices=False, output_folder=None):
-        self.stack_bands(indices=indices)
-        self.initiate_mask()     
-        stackedBands = np.delete(self._stackedBands, -1, axis=0)
-        img_patches = patchify(stackedBands, patch_size)
-        msk_patches = patchify(self._mask, patch_size)
-        band = next(iter(self._bands.values()))
-        with rasterio.open(band.path) as src:
-            template_meta = src.meta
-        for i, patches in enumerate(zip(img_patches,msk_patches)):
-            x, y = (i // (self._stackedBands.shape[1] // patch_size)) * patch_size, (i % (self._stackedBands.shape[1] // patch_size)) * patch_size
-            if np.any(np.isin(patches[1], 1)):
-                img_patch_folder = save_patch(output_folder, x, y, patches[0], template_meta, patch_size, source="images")
-                msk_patch_folder = save_patch(output_folder, x, y, patches[1], template_meta, patch_size, source="masks")
-        self.unload_bands()
-        self.unload_mask()
-        return img_patch_folder, msk_patch_folder
+        bands_stacked = np.vstack(band_arrays)  
+        self.unload_all_bands()
+        return bands_stacked 
 
-    def load_patches_asPath(self, patches_folder):
-        patches_folder = [os.path.join(patches_folder, file) for file in os.listdir(patches_folder) if file == "patches"][0]
-        patches = {}
-        for source in os.listdir(patches_folder):
-            sourceFolder = os.path.join(patches_folder, source)
-            patches[source] = [os.path.join(sourceFolder, patch) for patch in os.listdir(sourceFolder)]
-        return patches
+    def create_patches(self, patch_size):
+        stacked_bands = self.stack_resampled_bands()
+        return patchify(stacked_bands, patch_size)  
  
-    def calculate_spectral_signature(self, shapefile, indices=False, output_folder=""):
-
-        if self._stackedBands is None:
-            self.stack_bands(indices=indices)
-        gdf = gpd.read_file(shapefile)
-        geometries = gdf.geometry.tolist()
+    def calculate_spectral_signature(self, annotation):
+        self.load_all_bands()
+        geometries = annotation.get_geometries_as_list()
         spectral_sig = {}
-        for band_id, band in self._bands.items():
+        for band_id, band in self.loaded_bands.items():
             if band_id != "SCL":
-                band = band.band # open rasterio dataset
-                mean_values = [np.mean(mask(band, [polygon], crop=True)[0]) for polygon in geometries]
-                spectral_sig[band_id] = np.mean(mean_values)
-        self.unload_bands()
-        if output_folder:
-            spectral_sig_df = pd.DataFrame(spectral_sig)
-            spectral_sig_df.to_csv("spectral_signature.csv")
+                with rasterio.open(band.path, "r") as src:
+                    mean_values = [np.mean(mask(src, [polygon], crop=True)[0]) for polygon in geometries]
+                    spectral_sig[band_id] = np.mean(mean_values)
         return spectral_sig
        
-    def plot_spectral_signature(self, spectral_signature, band_list):
-        spectral_signature = {k: spectral_signature[k] for k in band_list if k in spectral_signature}
+    def plot_spectral_signature(self, spectral_signature):
         band_ids = list(spectral_signature.keys())
         reflectances = list(spectral_signature.values())
 
@@ -216,101 +158,85 @@ class SatelliteImage:
 class Sentinel2(SatelliteImage):
     
     def __init__(self, si_folder, location, date):
-        super().__init__()
-        self.folder = si_folder 
+        self.folder = si_folder
         self.location = location
         self.date = date
+        bands_path = self._construct_bands_path()
+        super().__init__(bands_path)
 
-    def calculate_indices(self, save_file=True):
+    def _construct_bands_path(self):
+        band_paths = {}
+        file_paths = [entry for entry in self.folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
+        for band_path in file_paths:
+            band_id = self._extract_band_info(band_path)
+            if band_id:       
+                band_paths[band_id] = band_path
+        return self._sort_band_paths(band_paths)
 
-        self.initiate_bands()
-        exampleRaster = self.get_band("B02")
-        red = self.get_band("B04").bandArray
-        nir = self.get_band("B08").bandArray
-        swir1 = self.get_band("B11").resample(resolution=10, reference_band_path=exampleRaster.path).bandArray
-        np.seterr(divide='ignore', invalid='ignore')
-        ndvi = (nir.astype(float) - red.astype(float)) / (nir + red)
-        ndwi = (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
-          
-        if save_file:
-            profile = {
-                'driver': 'GTiff',
-                'height': ndvi.shape[1],
-                'width': ndvi.shape[2],
-                'count': 1,
-                'dtype': ndvi.dtype,
-                'crs': exampleRaster.band.crs,
-                'transform': exampleRaster.band.transform,
-                'compress': 'lzw',
-                'nodata': None
-            }
+    def _sort_band_paths(self, band_paths):
+        sorted_keys = sorted(band_paths.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
+        sorted_bands_paths = {k: self.bands[k] for k in sorted_keys}
+        return sorted_bands_paths
 
-            ndvi_path = os.path.join(self.folder, f"NDVI_{self.date.strftime('%Y%m%d')}.tif")
-            ndwi_path = os.path.join(self.folder, f"NDWI_{self.date.strftime('%Y%m%d')}.tif")
-
-            with rasterio.open(ndvi_path, 'w', **profile) as dst:
-                dst.write(ndvi)
-
-            with rasterio.open(ndwi_path, 'w', **profile) as dst:
-                dst.write(ndwi)
-
-            self.add_band("NDVI", ndvi_path)
-            self.add_band("NDWI", ndwi_path)
-
-            return ndvi_path, ndwi_path
-
-        keys_order = ['B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL']
-        self._bands = {key: self._bands[key] for key in keys_order}
-        return self._bands
-
-    def create_rgb(self, output_folder=""):
-
-        if not self._bands:
-            self.initiate_bands()
-
-        red = self.get_band("B04").normalize()
-        green = self.get_band("B03").normalize()
-        blue = self.get_band("B02").normalize()
-        rgb = np.moveaxis(np.vstack((red, green, blue)), 0, -1)
-        
-        # src_meta = self.get_band("B04").band.meta.copy()
-        # src_meta['count'] = 3 
-        # src_meta['dtype'] = 'float32'  
-
-        # output_file = os.path.join(output_folder, "temp_rgb.tif")
-        # with rasterio.open(output_file, 'w', **src_meta) as dst:
-        #     dst.write(rgb)
-
-        return rgb
+    def _extract_band_info(self, file_path): 
+        pattern = r"(B\d+[A-Z]?|SCL)\.tif"
+        match = re.search(pattern, file_path)
+        return match.group(1) if match else None
             
-    def contrastStreching(image, lower_percentile=2, upper_percentile=98):
-        image = image.astype(np.float32)
-        csImg = np.empty_like(image, dtype=np.float32)
-        for band in range(image.shape[-1]):
-            imgMin = np.percentile(image[...,band], lower_percentile).astype(np.float32)
-            imgMax = np.percentile(image[...,band], upper_percentile).astype(np.float32)
-            csImg[...,band] = (image[...,band] - imgMin) / (imgMax - imgMin)
-        return csImg
+    def _extract_band_number(self, key):
+        match = re.match(r"B(\d+)", key)
+        return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
     
-    def plot_rgb(self, mask=False):
-        rgb = self.create_rgb()
-        if mask: 
-            mask = np.moveaxis(self.initiate_mask(),0,-1)
-            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-            axes[0].imshow(rgb)
-            axes[0].set_title("RGB Image")
-            axes[0].axis("off")
-            axes[1].imshow(mask, cmap='gray')
-            axes[1].set_title("Binary Mask")
-            axes[1].axis("off")
-            plt.tight_layout()
-            plt.show()
-        
-        else:
-            plt.imshow(rgb)
-            plt.title(f"RGB of {self.location} on date: {self.date}")
-            plt.show()
-            return
+    def calculate_bad_pixels(self):
+        scene_class = self.load_band("SCL")
+        bad_pixel_count = np.isin(scene_class.array, [0,1,2,3,8,9,10,11])
+        self.unload_all_bands()
+        return np.mean(bad_pixel_count) * 100
+
+    def calculate_ndvi(self):
+        red = self.load_band("B04").array
+        nir = self.load_band("B08").array
+        np.seterr(divide='ignore', invalid='ignore')
+        self.unload_all_bands()
+        return (nir.astype(float) - red.astype(float)) / (nir + red)
+    
+    def calculate_ndvi(self):
+        nir = self.load_band("B08").array
+        swir1 = self.load_band("B11").resample(10).array
+        np.seterr(divide='ignore', invalid='ignore')
+        self.unload_all_bands()
+        return (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
+
+    def save_index(self, index_name, index):
+        b02 = self.load_band("B02")
+        profile = {
+            'driver': 'GTiff',
+            'height': index.shape[1],
+            'width': index.shape[2],
+            'count': 1,
+            'dtype': index.dtype,
+            'crs': b02.meta["crs"],
+            'transform': b02.meta["transform"],
+            'compress': 'lzw',
+            'nodata': None
+        }
+        index_path = self.folder / f"S2_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
+        with rasterio.open(index_path, 'w', **profile) as dst:
+            dst.write(index)
+        self.add_band(index_name, index_path)
+        self.unload_all_bands()
+        return 
+
+    def plot_rgb(self):
+        red = self.load_band("B04").stretch_contrast()
+        green = self.load_band("B03").stretch_contrast()
+        blue = self.load_band("B02").stretch_contrast()
+        rgb = np.moveaxis(np.vstack((red, green, blue)), 0, -1)
+        plt.imshow(rgb)
+        plt.title(f"RGB of {self.location} on date: {self.date}")
+        plt.show()
+        plt.savefig("rgb.png")
+        return        
         
 class Sentinel1(SatelliteImage):
     
@@ -372,7 +298,7 @@ class Sentinel1(SatelliteImage):
             
             return csImg
 
-        if self._bands:
+        if self.bands:
             
             red = self.get_band("B04").normalize()
             green = self.get_band("B03").normalize()
@@ -438,7 +364,7 @@ class Sentinel12(Sentinel1, Sentinel2):
             
             return csImg
 
-        if self._bands:
+        if self.bands:
             
             red = self.get_band("B04").normalize()
             green = self.get_band("B03").normalize()

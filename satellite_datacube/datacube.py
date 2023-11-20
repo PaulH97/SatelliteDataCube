@@ -27,12 +27,11 @@ class SatelliteDataCube:
         self.satellite = satellite    
         self.base_folder = base_folder 
         self.satellite_images = self._load_satellite_images()
+        self.labels_shp = glob(os.path.join(self.base_folder, "annotations", "*.shp"))[0]
+        self.labels = self._load_labels_as_df()
         self.masks = self._load_masks()
         self.global_mask = self._load_or_create_global_mask()
-        self.labels_shp = glob(os.path.join(self.base_folder, "shp", "*.shp"))[0]
-        self.labels = self._load_labels_as_df()
         self.seed = 42
-    
         self._print_initialization_info()
       
     def _print_initialization_info(self) -> None:
@@ -234,7 +233,6 @@ class SatelliteDataCube:
         selected_indices = np.linspace(0, max_index, timeseries_length, dtype=int)
         for target_idx in selected_indices:
             print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
-            print("")
             satellite_image = _get_image_by_index(target_idx)
             if _is_image_quality_acceptable(satellite_image):
                 timeseries.append(satellite_image)
@@ -242,6 +240,7 @@ class SatelliteDataCube:
                 acceptable_neighbor = _find_acceptable_neighbor(target_idx)
                 if acceptable_neighbor:
                     timeseries.append(acceptable_neighbor)
+        print("Selected timeseries")
         timeseries = sorted(timeseries, key=lambda image: image.date)
         return timeseries
 
@@ -309,7 +308,7 @@ class SatelliteDataCube:
         patches = self.create_patches(patch_size=patch_size, selected_timeseries=selected_timeseries, indices=indices)
         [print(f"Created patches of {source.upper()} with shape: {array.shape}") for source, array in patches.items()]
         filtered_patches = self.filter_patches(patches=patches, class_values=class_values)
-        [print(f"Filtered patches of {source.upper()} so that the shape chnaged to: {array.shape}") for source, array in patches.items()]
+        [print(f"Filtered patches of {source.upper()} so that the shape changed to: {array.shape}") for source, array in patches.items()]
         self.save_patches(patches=filtered_patches, patches_folder=patches_folder)
         return filtered_patches
 
