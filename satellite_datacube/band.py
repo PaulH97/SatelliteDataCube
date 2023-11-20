@@ -6,10 +6,11 @@ import json
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from pathlib import Path 
+from .utils import patchify
 
 class SatelliteBand:
     """
-    A class to represent a satellite band. 
+    A class to represent a satellite band or mask. 
 
     Attributes:
         name (str): Name of the satellite band.
@@ -127,7 +128,10 @@ class SatelliteBand:
                 self.meta = src.meta.copy()
         return self
 
-    def z_normalization(self):
+    def create_patches(self, patch_size):
+        return patchify(source_array=self.array, patch_size=patch_size)
+
+    def normalize_with_zscore(self):
         """
         Apply z-score normalization to the raster band array.
         Returns:
@@ -135,7 +139,7 @@ class SatelliteBand:
         """
         return (self.array - self.array.mean()) / self.array.std()
          
-    def min_max_normalization(self):
+    def normalize_with_minmax(self):
         """
         Apply min-max normalization to the raster band array.
         Returns:
@@ -144,7 +148,13 @@ class SatelliteBand:
         min_val, max_val = self.array.min(), self.array.max()
         min_boundary, max_boundary = 0, 1
         return (max_boundary - min_boundary) * ((self.array - min_val) / (max_val - min_val)) + min_boundary
-           
+
+    def stretch_contrast(self, percentiles=(4,92)):
+        band_min = np.percentile(self.array, percentiles[0]).astype(np.float32)
+        band_max = np.percentile(self.array, percentiles[1]).astype(np.float32)
+        band_streched = (self.array - band_min) / (band_max - band_min)
+        return band_streched
+
     def plot_histo(self):
         """
         Plot histogram of the satellite band.
@@ -167,9 +177,8 @@ class SatelliteBand:
         """
         Plot satellite band data.
         """
+        band_stretched = self.stretch_contrast()
         plt.figure(figsize=(10,10))
-        plt.imshow(np.moveaxis(self.array, 0,-1), cmap="viridis")
+        plt.imshow(np.moveaxis(band_stretched, 0,-1), cmap="viridis")
         plt.colorbar()
         plt.show()
-
-
