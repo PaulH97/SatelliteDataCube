@@ -15,51 +15,6 @@ from pathlib import Path
 # TODO: reprojecting of patches is not working...they do not align with the original raster
 # - do i need to unload bands in every function?
 
-class Annotation:
-    def __init__(self, shapefile_path):
-        self.path = shapefile_path
-        self.df = self._load_dataframe()
-        self.band = None
-    	
-    def _load_dataframe(self):
-        return gpd.read_file(self.path) 
-
-    def _repair_geometries(self):
-        
-        geometries = self.df["geometry"].to_list()
-
-        repaired_geometries = []
-        for geom in geometries:
-            if geom:
-                if geom.is_valid:
-                    repaired_geometries.append(geom)
-                else:
-                    repaired_geometries.append(geom.buffer(0))
-
-        self.df["geometry"] = repaired_geometries
-        return  
-    
-    def get_geometries_as_list(self):
-        self._repair_geometries()
-        return self.df["geometry"].to_list()
-
-    def rasterize_annotation(self, raster_metadata):
-                
-        geometries = self.get_geometries_as_list()
-        raster_metadata['dtype'] = 'uint8'
-        
-        output_path = self.path.parent / (self.path.stem + ".tif")
-        with rasterio.open(output_path, 'w', **raster_metadata) as dst:
-            mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
-            dst.write(mask.astype(rasterio.uint8), 1)
-
-        self.band = SatelliteBand(band_name="annotation", band_path=output_path)
-        return self.band
-
-    def plot(self):
-        return self.band.plot()
-
-
 class SatelliteImage:
     def __init__(self, band_paths):
         """
@@ -241,83 +196,63 @@ class Sentinel2(SatelliteImage):
 class Sentinel1(SatelliteImage):
     
     def __init__(self, si_folder, location, date):
-        super().__init__()
-        self.folder = si_folder 
+        self.folder = si_folder
         self.location = location
         self.date = date
+        bands_path = self._construct_bands_path()
+        super().__init__(bands_path)
 
-    def calculate_indices(self, out_dir, path=True):
-        vv = self.read_band_3D("VV")
-        vh = self.read_band_3D("VH")
-        cr = np.nan_to_num(vh-vv)
+    def _construct_bands_path(self):
+        band_paths = {}
+        file_paths = [entry for entry in self.folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
+        for band_path in file_paths:
+            band_id = self._extract_band_info(band_path)
+            if band_id:       
+                band_paths[band_id] = band_path
+        return band_paths
 
-        # Get affine transformation and CRS from the original raster (e.g., "B4")
-        with rasterio.open(self.get_band_path("VV")) as src:
-            transform = src.transform
-            crs = src.crs
+    def _extract_band_info(self, file_path): 
+        pattern = r"(VV|VH)"
+        match = re.search(pattern, file_path)
+        return match.group(1) if match else None
 
-        # Define rasterio profile for the output files
+    def calculate_cross_ratio(self):
+        vv = self.load_band("VV")
+        vh = self.load_band("VH")
+        return vh / vv
+    
+    def calculate_polarization_difference(self):
+        vv = self.load_band("VV")
+        vh = self.load_band("VH")
+        return np.nan_to_num(vv-vh)
+    
+    def save_index(self, index_name, index):
+        vv = self.load_band("VV")
         profile = {
             'driver': 'GTiff',
-            'height': cr.shape[0],
-            'width': cr.shape[1],
+            'height': index.shape[1],
+            'width': index.shape[2],
             'count': 1,
-            'dtype': cr.dtype,
-            'crs': crs,
-            'transform': transform,
+            'dtype': index.dtype,
+            'crs': vv.meta["crs"],
+            'transform': vv.meta["transform"],
             'compress': 'lzw',
             'nodata': None
         }
-
-        # Save NDVI and NDWI files with the affine transformation and CRS
-        cr_path = os.path.join(out_dir, f"{self.tile_id}_CR.tif")
-       
-        with rasterio.open(cr_path, 'w', **profile) as dst:
-            dst.write(cr[:,:,0], 1)
-
-        self.indizes_path = [cr_path]
-        print("Calculated Sentinel-1 indizes")
+        index_path = self.folder / f"S1_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
+        with rasterio.open(index_path, 'w', **profile) as dst:
+            dst.write(index)
+        self.add_band(index_name, index_path)
+        self.unload_all_bands()
+        return 
     
-        if path:
-            return cr_path
-        else: 
-            return 
+    def plot_cross_ratio(self):
+        if "CR" not in self.loaded_bands:
+            cr = self.calculate_cross_ratio()
+            self.save_index("CR", cr)
+        cr = self.load_band("CR") # as SatelliteBand
+        return cr.plot()
 
-    def plot_rgb(self):
-
-        def contrastStreching(image):
-            
-            image = image.astype(np.float32)
-            csImg = np.empty_like(image, dtype=np.float32)
-
-            # Perform contrast stretching on each channel
-            for band in range(image.shape[-1]):
-                imgMin = image[...,band].min().astype(np.float32)
-                imgMax = image[...,band].max().astype(np.float32)
-                csImg[...,band] = (image[...,band] - imgMin) / (imgMax - imgMin)
-            
-            return csImg
-
-        if self.bands:
-            
-            red = self.get_band("B04").normalize()
-            green = self.get_band("B03").normalize()
-            blue = self.get_band("B02").normalize()
-            
-            rgb = np.moveaxis(np.vstack((red, green, blue)), 0, -1)
-            rgb = contrastStreching(rgb)
-            plt.figure(figsize=(10,10))
-            plt.imshow(rgb)
-            plt.show()
-
-        else: 
-            raise AttributeError(f"No rgb image is initiated. Please initiate the corresponding rgb image using the initiate_bands() method and try again.")
-
-        return
-
-    def plot_backscatter():
-        return
-    
 class Sentinel12(Sentinel1, Sentinel2):
     def __init__(self, si_folder, location, date):
         super().__init__()
