@@ -8,26 +8,69 @@ from rasterio.warp import reproject
 from pathlib import Path 
 
 class SatelliteBand:
+    """
+    A class to represent a satellite band. 
+
+    Attributes:
+        name (str): Name of the satellite band.
+        path (Path): Path to the raster file of the satellite image.
+        array (numpy.ndarray): Array representation of the band (shape: CxHxW).
+        meta (dict): Metadata of raster file.
+    """
     def __init__(self, band_name, band_path):
+        """
+        Constructs all the necessary attributes for the SatelliteBand object.
+        Args:
+            band_name (str): Name of the satellite band.
+            band_path (str): File path to the raster data of the band.
+        
+        """
         self.name = band_name 
-        self.path = Path(band_path)
+        self.path = band_path
         with rasterio.open(self.path, "r") as src:
             self.array = src.read() # shape(CxHxW)
             self.meta = src.meta.copy()
 
     def _calculate_scale_factor(self, new_resolution):
+        """
+        Calculate the scale factor for resampling based on new resolution.
+        Args:
+            new_resolution (int): The desired resolution in (m).
+        Returns:
+            float: The scale factor.
+        """
         old_resolution = self.meta["transform"].a  # Assuming square pixels
         return old_resolution / new_resolution
 
     def _calculate_new_transform(self, scale_factor):
+        """
+        Calculate a new affine transform based on the scale factor.
+        Args:
+            scale_factor (float): The scale factor for resampling.
+        Returns:
+            Affine: The new affine transform.
+        """
         old_transform = self.meta["transform"]
         return old_transform * old_transform.scale(1/scale_factor,1/scale_factor)
 
     def _calculate_new_dimensions(self, scale_factor):
+        """
+        Calculate new dimensions (width and height) of the raster based on the scale factor.
+        Args:
+            scale_factor (float): The scale factor for resampling.
+        Returns:
+            tuple: New dimensions (width, height) of the raster.
+        """
         return int(self.meta["width"]*scale_factor), int(self.meta["height"]*scale_factor)
     
     def _update_metadata_to_new_resolution(self, new_resolution):
-        # Calculate new transform and dimensions
+        """
+        Update the metadata of the raster to reflect a new resolution.
+        Args:
+            new_resolution (float): The desired resolution.
+        Returns:
+            dict: Updated metadata.
+        """
         scale_factor = self._calculate_scale_factor(new_resolution)
         new_transform = self._calculate_new_transform(scale_factor)
         new_width, new_height = self._calculate_new_dimensions(scale_factor)
@@ -42,8 +85,15 @@ class SatelliteBand:
         return new_meta
 
     def _reproject_band(self, metadata):
+        """
+        Reproject the raster band based on new metadata.
+        Args:
+            metadata (dict): Metadata containing new projection information.
+        Returns:
+            Path: Path to the resampled raster file.
+        """
         resampled_raster_path = self.path.parent / (self.path.stem + "_resampled.tif")
-        
+
         with rasterio.open(self.path) as src:
             with rasterio.open(resampled_raster_path, 'w', **metadata) as dst:
                 reproject(
@@ -60,7 +110,11 @@ class SatelliteBand:
     
     def resample(self, new_resolution):
         """
-        Resample a raster to a new resolution.
+        Resample the raster band to a new resolution.
+        Args:
+            new_resolution (float): The desired resolution.
+        Returns:
+            SatelliteBand: The current instance after resampling.
         """
         band_res = self.meta["transform"].a
         if band_res != new_resolution:
@@ -74,15 +128,27 @@ class SatelliteBand:
         return self
 
     def z_normalization(self):
+        """
+        Apply z-score normalization to the raster band array.
+        Returns:
+            numpy.ndarray: Normalized array.
+        """
         return (self.array - self.array.mean()) / self.array.std()
          
     def min_max_normalization(self):
+        """
+        Apply min-max normalization to the raster band array.
+        Returns:
+            numpy.ndarray: Normalized array.
+        """
         min_val, max_val = self.array.min(), self.array.max()
         min_boundary, max_boundary = 0, 1
         return (max_boundary - min_boundary) * ((self.array - min_val) / (max_val - min_val)) + min_boundary
            
     def plot_histo(self):
-        
+        """
+        Plot histogram of the satellite band.
+        """
         band_array = np.moveaxis(self.array, 0, -1) # HxWxC
 
         q25, q75 = np.percentile(band_array, [25, 75])
@@ -96,58 +162,14 @@ class SatelliteBand:
         plt.ylabel('Number of Pixels', fontsize = 16)
         plt.xlabel('DN', fontsize = 16)
         plt.show()
-        plt.savefig("test_histo.png")
     
     def plot(self):
-        
+        """
+        Plot satellite band data.
+        """
         plt.figure(figsize=(10,10))
         plt.imshow(np.moveaxis(self.array, 0,-1), cmap="viridis")
         plt.colorbar()
         plt.show()
-        plt.savefig("test_img.png")
 
 
-    # def resample(self, resolution, reference_band_path, save_file=False):
-
-    #     def reproject_band(source_dataset, source_band, destination, ref_transform):
-    #         reproject(
-    #             source=source_band,
-    #             destination=destination,
-    #             src_transform=source_dataset.transform,  # Use the transform from the dataset
-    #             src_crs=source_dataset.crs,  # Use the CRS from the dataset
-    #             dst_transform=ref_transform,
-    #             dst_crs=source_dataset.crs,
-    #             resampling=Resampling.bilinear
-    #         )
-
-    #     if self.band.res != (float(resolution), float(resolution)):
-    #         with rasterio.open(reference_band_path) as ref_band:
-    #             ref_transform = ref_band.transform
-    #             ref_width = ref_band.width
-    #             ref_height = ref_band.height
-
-    #         meta = self.band.meta.copy()
-    #         meta.update({
-    #             'crs': self.band.crs,
-    #             'transform': ref_transform,
-    #             'width': ref_width,
-    #             'height': ref_height
-    #         })
-
-    #         if save_file:
-    #             output_path = os.path.join(os.path.dirname(self.path), os.path.basename(self.path) + "_resampled.tif") 
-    #             with rasterio.open(output_path, 'w', **meta) as dst:
-    #                 reproject_band(self.band, rasterio.band(self.band, 1), rasterio.band(dst, 1), ref_transform)
-    #             self.path = output_path 
-    #             self.band = rasterio.open(self.path)
-    #             self.band_arr = self.band.read()       
-    #             return self
-
-    #         else:
-    #             resampled_array = np.empty((1, ref_height, ref_width))
-    #             reproject_band(self.band, rasterio.band(self.band, 1), resampled_array[0,...], ref_transform)
-    #             self.band_arr = resampled_array.astype(self.band_arr.dtype)
-    #             return self
-
-    #     else: 
-    #         return self
