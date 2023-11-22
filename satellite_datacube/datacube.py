@@ -2,14 +2,14 @@ import os
 import numpy as np
 import geopandas as gpd
 from matplotlib import pyplot as plt
-import json
-from .utils import patchify
-from .image import Sentinel1, Sentinel2, Sentinel12
+from .utils import patchify, select_equally_spaced_items
+from .image import Sentinel1, Sentinel2
+from .annotation import Sentinel2Annotation, Sentinel1Annotation
 import random
 import pandas as pd
 from datetime import datetime
 from glob import glob
-
+from pathlib import Path
 # TODO:
 
 # - build temp_folder when init?
@@ -23,18 +23,13 @@ from glob import glob
 
 
 class SatelliteDataCube:
-    def __init__(self, base_folder, satellite):
-        self.satellite = satellite    
-        self.base_folder = base_folder 
-        self.satellite_images = self._load_satellite_images()
-        self.labels_shp = glob(os.path.join(self.base_folder, "annotations", "*.shp"))[0]
-        self.labels = self._load_labels_as_df()
-        self.masks = self._load_masks()
-        self.global_mask = self._load_or_create_global_mask()
-        self.seed = 42
-        self._print_initialization_info()
-      
-    def _print_initialization_info(self) -> None:
+    def __init__(self):
+        self.base_folder = None
+        self.satellite = None
+        self.satellite_images_by_date = {}
+        self.annotation = {}
+
+    def _print_initialization_info(self):
         """
         Display detailed initialization information about the data-cube.
 
@@ -59,223 +54,47 @@ class SatelliteDataCube:
         #print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
         print(f"{2*divider}")
         print("Initialized data-cube with following parameter:")
-        print(f"- Images from satellite mission: {self.satellite}")
         print(f"- Base folder: {self.base_folder}")
-        print(f"- Start-End: {next(iter(self.satellite_images.values())).date} -> {next(reversed(self.satellite_images.values())).date}")
-        print(f"- Length of data-cube: {len(self.satellite_images)}")
+        print(f"- Satellite mission: {self.satellite}")
+        print(f"- Start-End: {next(iter(self.satellite_images_by_date.values())).date} -> {next(reversed(self.satellite_images_by_date.values())).date}")
+        print(f"- Length of data-cube: {len(self.satellite_images_by_date)}")
         print(f"{2*divider}")
 
-    def _load_or_create_global_mask(self):
-        global_mask_path = os.path.join(self.base_folder, "other", "global_mask.npy")
-        if os.path.exists(global_mask_path):
-            global_mask = np.load(global_mask_path, allow_pickle=True)
-        else:
-            print(f"Could not find global_mask file in: {self.base_folder}. Creating the global mask for the data-cube.")
-            global_mask = self._create_global_mask()
-        return global_mask
+    def select_equal_distributed_satellite_images(self, number_of_images):
+        satellite_image_dates = [satellite_image.date for satellite_image in self.satellite_images_by_date.keys()]
+        satellite_image_dates_equally_distributed = select_equally_spaced_items(satellite_image_dates, number_of_images)
+        selected_satellite_images = [self.satellite_images_by_date.get(satellite_image_date) for satellite_image_date in satellite_image_dates_equally_distributed]
+        return selected_satellite_images
 
-    def _create_global_mask(self, save=True, output_folder=""):
-        global_masks = []
-        if self.masks:
-            for mask in self.masks.values():
-                mask_bool = mask >= 1
-                if mask_bool.any():  # Checks if any value is True
-                    global_masks.append(mask_bool)
-            global_mask = np.logical_or.reduce(global_masks).astype(int)
-            if save: 
-                self._save_global_mask(global_mask=global_mask, output_folder=output_folder)
-            return global_mask
-        else:
-            print("Masks of satellite images are not initialized. Please use load_masks() before calling this function.")
-            return None
+    def create_and_patches(self, patch_size):      
+        satellite_images_patches = [] # list of np.arrays for each image one array
+        for date, satellite_image in self.satellite_images_by_date.items():
+            print(f"-> Start with satellite image of date {date}")
+            patches = satellite_image.create_patches(patch_size) # returns list of patches
+            satellite_images_patches.append(np.array(patches)) # NxCxhxW
+        satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
+        return satellite_images_patches
 
-    def _save_global_mask(self, global_mask, output_folder=""):
-        if not output_folder:
-            output_folder = os.path.join(self.base_folder, "other")
-        output_file = os.path.join(output_folder, "global_mask.npy")
-        with open(output_file, 'wb') as f:
-            np.save(file=f,arr=global_mask)
-        return
-
-    def _load_satellite_images(self):
-        """
-        Initialize satellite images by scanning the base folder and processing valid satellite image directories.
-
-        This function scans the base folder for directories with numeric names, assuming each such directory 
-        corresponds to a satellite image. For every valid directory found, an instance of the `Sentinel2` class 
-        is created to represent the satellite image, and the resulting instances are stored in a dictionary 
-        where the keys are the indices and the values are the `Sentinel2` instances.
-
-        Note:
-        The function assumes that valid satellite image directories in the base folder have numeric names.
-
-        Returns:
-        - dict: A dictionary where keys are indices of the satellite images and values are corresponding 
-                `Sentinel2` instances representing the images.
-
-        Example:
-        Given a base folder structure like:
-        base_folder/
-        ├── 20180830/
-        ├── 20180911/
-        ├── temp/
-        Calling `load_satellite_images()` will only process the '20180830' and '20180911' directories and return a dictionary 
-        with their corresponding `Sentinel2` instances.
-        """
-        satellite_folder = os.path.join(self.base_folder, self.satellite)
-        satellite_images = {}
-        if self.satellite == "sentinel-1":
-            for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
-                    si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
-                    si_location = os.path.basename(self.base_folder)
-                    satellite_images[i] = Sentinel1(si_folder=si_folder.path, location=si_location, date=si_date)
-            return satellite_images
-        elif self.satellite == "sentinel-2":
-            for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
-                    si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
-                    si_location = os.path.basename(self.base_folder)
-                    satellite_images[i] = Sentinel2(si_folder=si_folder, location=si_location, date=si_date)
-            return satellite_images
-        else:
-            for i, si_folder in enumerate(si_folder.path for si_folder in os.scandir(satellite_folder) if os.path.isdir(si_folder.path) and si_folder.name.isdigit()):
-                    si_date = datetime.strptime(os.path.basename(si_folder), "%Y%m%d").date()
-                    si_location = os.path.basename(self.base_folder)
-                    satellite_images[i] = Sentinel12(si_folder=si_folder.path, location=si_location, date=si_date)
-            return satellite_images
+    def create_and_keep_patches_with_annotation(self, patch_size):      
+        satellite_images_patches = [] # list of np.arrays for each image one array
+        for date, satellite_image in self.satellite_images_by_date.items():
+            print(f"-> Start with satellite image of date {date}")
+            patches = satellite_image.create_patches(patch_size) # returns list of patches
+            self.annotation.
+            satellite_images_patches.append(np.array(patches)) # NxCxhxW
+        satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
+        return satellite_images_patches
     
-    def _load_masks(self):
-        masks = {}
-        if self.satellite_images:
-            for idx, si in self.satellite_images.items():
-                masks[idx] = si.initiate_mask()
-                si.unload_mask()
-            return masks
-        else:
-            print("Satellite images of datacube are not initialized. Please use load_satellite_images() before running this function.")
-            return None   
+    def filter_patches(self, satellite_images_patches):      
+        satellite_images_patches = [] # list of np.arrays for each image one array
 
-    def _load_labels_as_df(self):
-        labels = gpd.read_file(self.labels_shp)
-        labels = pd.DataFrame(labels)
-        return labels
-
-    def get_bitemporal_images(self, labels_idx):
-        pre_date = self.labels_df.iloc[labels_idx]["pre_date"]
-        post_date = self.labels_df.iloc[labels_idx]["post_s2cf"]
-        pre_date = datetime.strptime(pre_date, "%Y-%m-%d").date()
-        post_date = datetime.strptime(post_date, "%Y-%m-%d").date()
-        satellite_images_dates = {idx: satellite_image.date for idx,satellite_image in self.satellite_images.items()}
-        pre_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(pre_date - satellite_images_dates[key]))
-        post_closest_key = min(satellite_images_dates.keys(), key=lambda key: abs(post_date - satellite_images_dates[key]))
-        pre_image = self.satellite_images[pre_closest_key]
-        post_image = self.satellite_images[post_closest_key]
-        return pre_image, post_image
-
-    def load_patches(self, patch_size, timeseries_length, patches_folder=""):
-        patches_folder = os.path.join(self.base_folder, "patches") if not patches_folder else patches_folder
-        patches = {}
-        for source in ["images", "masks", "global_mask"]:
-            patchPath = os.path.join(patches_folder, f"{source}_patches{patch_size}_ts{timeseries_length}.npy")
-            if os.path.exists(patchPath):
-                patches[source] = np.load(patchPath)
-        if patches:
-            print(f"Loaded patches as dictonary with keys [images, masks, global_mask] from {patches_folder}")
-            [print(source, patch.shape) for source, patch in patches.items()]
-        else:
-            print(f"Could not find patches in: {patches_folder}", "Please use create_patches() to create the necessary patches.")
-        return patches
-
-    def load_single_timeseries(self, timeseries_length, ts_folder=""):
-        ts_folder = os.path.join(self.base_folder, "selected_timeseries") if not ts_folder else ts_folder
-        ts_path = os.path.join(ts_folder, f"ts_{timeseries_length}.json")
-        if os.path.exists(ts_path):
-            selected_timeseries = json.load(open(ts_path))
-            idx_timeseries = [timestep[0] for timestep in selected_timeseries]
-            si_timeseries = [self.satellite_images[idx] for idx in idx_timeseries] 
-            print(f"Found ts {selected_timeseries} in {ts_path}")
-            return si_timeseries
-        else:
-            print(f"Could not find timeseries in: {ts_folder}", "Please use create_timeseries() to create the necessary timeseries.")
-            return []
-
-    def create_timeseries(self, timeseries_length):
-
-        def _get_image_by_index(idx):
-            return list(self.satellite_images.values())[idx]
-
-        def _is_image_quality_acceptable(image, bad_pixel_limit=15):
-            image.calculate_bad_pixels()
-            return image._badPixelRatio <= bad_pixel_limit and image not in timeseries
-
-        def _find_acceptable_neighbor(target_idx, search_limit=5):
-            """Search for the nearest good quality image before and after the current index. 
-            If none is found, return the one with the least bad pixels from the search range."""
-            max_index = len(self.satellite_images.values()) - 1
-            potential_alternatives = []
-
-            # Search within the range for acceptable images
-            for offset in range(1, search_limit + 1):
-                for direction in [-1, 1]:
-                    new_idx = target_idx + (direction * offset)
-                    if 0 <= new_idx <= max_index:
-                        neighbor = _get_image_by_index(new_idx)
-                        bad_pixel_ratio = neighbor.calculate_bad_pixels()
-                        if _is_image_quality_acceptable(neighbor):
-                            return neighbor
-                        potential_alternatives.append((neighbor, bad_pixel_ratio))
-
-            potential_alternatives.sort(key=lambda x: x[1])  # Sorting by bad pixel ratio
-            return potential_alternatives[0][0] if potential_alternatives else None
-
-        print(f"Selecting timeseries with {timeseries_length} satellite images of data-cube")
-        timeseries = []
-        max_index = len(self.satellite_images.values()) - 1
-        selected_indices = np.linspace(0, max_index, timeseries_length, dtype=int)
-        for target_idx in selected_indices:
-            print("[" + " ".join(str(x) for x in range(len(timeseries) + 1)) + "]", end='\r')
-            satellite_image = _get_image_by_index(target_idx)
-            if _is_image_quality_acceptable(satellite_image):
-                timeseries.append(satellite_image)
-            else:
-                acceptable_neighbor = _find_acceptable_neighbor(target_idx)
-                if acceptable_neighbor:
-                    timeseries.append(acceptable_neighbor)
-        print("Selected timeseries")
-        timeseries = sorted(timeseries, key=lambda image: image.date)
-        return timeseries
-
-    def save_timeseries(self, timeseries, ts_folder=""):
-        tsIdx = [idx for idx, si in self.satellite_images.items() if si in timeseries]
-        tsDate = [int(si.date.strftime("%Y%m%d")) for si in timeseries]
-        timeseries = [list(item) for item in zip(tsIdx, tsDate)]
-        ts_folder = os.path.join(self.base_folder, "selected_timeseries") if not ts_folder else ts_folder
-        if not os.path.exists(ts_folder):
-            os.makedirs(ts_folder)
-        ts_js_file = os.path.join(ts_folder, f"ts_{len(timeseries)}.json")
-        with open(ts_js_file, 'w') as file:
-            json.dump(timeseries, file)
-
-    def create_patches(self, patch_size, selected_timeseries=[], indices=False):      
-        if not selected_timeseries:
-            print(f"No timeseries was selected. Patches of all satellite images of data-cube are created.")
-            selected_timeseries = [si for si in self.satellite_images.values()]
-        print(f"Generating patches of size {patch_size}x{patch_size}px for {len(selected_timeseries)} satellite images with corresponding masks and for one global mask:") 
-        all_src_patches = {}
-        for source in ["images", "masks", "global_mask"]:
-            if source in ["images", "masks"]:
-                src_patches = [] 
-                for image in selected_timeseries:
-                    print(f"-> Start with satellite {source} of date {image.date}")
-                    patches = image.process_patches(patch_size=patch_size, source=source, indices=indices) # returns list of patches
-                    src_patches.append(patches)
-                    image.unload_bands()
-                    image.unload_mask()  
-                src_patches = np.swapaxes(np.array(src_patches),0,1) # convert it to an array of pattern NxTxCxHxW 
-            else:
-                print(f"-> Start with {source}" )
-                src_patches = np.array(patchify(source_array=self.global_mask, patch_size=patch_size)) # NxCxHxW
-            all_src_patches[source] = src_patches 
-        return all_src_patches
+        for date, satellite_image in self.satellite_images_by_date.items():
+            print(f"-> Start with satellite image of date {date}")
+            
+            patches = satellite_image.create_patches(patch_size) # returns list of patches
+            satellite_images_patches.append(np.array(patches)) # NxCxhxW
+        satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
+        return satellite_images_patches
 
     def filter_patches(self, patches, class_values, class_ratio=(100,0)):
         random.seed(self.seed)
@@ -314,7 +133,7 @@ class SatelliteDataCube:
 
     def create_spectral_signature(self, selected_timeseries=[], indices=False, output_folder=""):
         if not selected_timeseries:
-            selected_timeseries = [si for si in self.satellite_images.values()]
+            selected_timeseries = [si for si in self.satellite_images_by_date.values()]
         spectral_sig = {}
         for image in selected_timeseries:
             image_spectral_sig = image.calculate_spectral_signature(shapefile=self.labels_shp,indices=indices)
@@ -343,4 +162,91 @@ class SatelliteDataCube:
         if output_folder:
             plt.savefig(os.path.join(output_folder, f"{self.satellite}_spectralSig_ts{len(time_steps)}.png"))
         return
+    
+class Sentinel2DataCube(SatelliteDataCube):
+    def __init__(self, base_folder):
+        super().__init__()
+        self.base_folder = Path(base_folder)
+        self.satellite = "sentinel-2"
+        self.satellite_images_folder = self.base_folder / self.satellite
+        self.satellite_images_by_date = self._load_satellite_images()
+        self.annotation = self._load_annotation()
+        self._print_initialization_info()
+     
+    def _load_annotation(self):
+        annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
+        s2_satellite_image = next(iter(self.satellite_images_by_date.values()))
+        return Sentinel2Annotation(s2_satellite_image, annotation_shapefile)
+    
+    def _load_satellite_images(self):
+        satellite_images_by_date = {}
+        for satellite_image_folder in self.satellite_images_folder.iterdir():
+            if satellite_image_folder.is_dir():
+                date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
+                satellite_images_by_date[date_satellite_image] = Sentinel2(satellite_image_folder, date_satellite_image)
+                satellite_images_by_date_sorted = dict(sorted(satellite_images_by_date.items()))
+                return satellite_images_by_date_sorted
 
+    def find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
+        """Search for the nearest good quality image before and after the current date. 
+        If none is found, return the one with the least bad pixels from the search range."""
+        satellite_images_dates = sorted(self.satellite_images_by_date.keys())
+        start_date_idx = satellite_images_dates.index(satellite_image.date)
+
+        alternative_satellite_images = []
+        # Search within the range for acceptable images
+        for offset in range(1, search_limit + 1):
+            for direction in [-1, 1]:
+                new_date_idx = start_date_idx + (direction * offset)
+                if 0 <= new_date_idx < len(satellite_images_dates):
+                    new_date = satellite_images_dates[new_date_idx]
+                    neighbor_satellite_image = self.satellite_images_by_date.get(new_date)
+                    if neighbor_satellite_image.is_quality_acceptable():
+                        return neighbor_satellite_image
+                    else:
+                        alternative_satellite_images.append((neighbor_satellite_image, neighbor_satellite_image.calculate_bad_pixels()))
+                else:
+                    continue
+        alternative_satellite_images.sort(key=lambda x: x[1])  # Sorting by bad pixel ratio
+        return alternative_satellite_images[0][0] if alternative_satellite_images else satellite_image
+
+    def update_satellite_images(self, number_of_images):
+        selected_satellite_images = self.select_equal_distributed_satellite_images(number_of_images)
+        updated_satellite_images_by_date = {}
+        for satellite_image in selected_satellite_images:
+            print("[" + " ".join(str(x) for x in range(len(self.selected_satellite_images.keys()) + 1)) + "]", end='\r')
+            if satellite_image.is_quality_acceptable():
+                updated_satellite_images_by_date[satellite_image.date] = satellite_image
+            else:
+                neighbour_satellite_image = self.find_higher_quality_satellite_image(satellite_image)
+                updated_satellite_images_by_date[neighbour_satellite_image.date] = neighbour_satellite_image
+        self.satellite_images_by_date = updated_satellite_images_by_date
+        return self.satellite_images_by_date
+            
+class Sentinel1DataCube(SatelliteDataCube):
+    def __init__(self, base_folder):
+        super().__init__()
+        self.base_folder = Path(base_folder)
+        self.satellite = "sentinel-1"
+        self.satellite_images_folder = self.base_folder / self.satellite
+        self.satellite_images_by_date = self.load_satellite_images()
+        self.annotation = self._load_annotation()
+
+    def _load_annotation(self):
+        annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
+        s2_satellite_image = next(iter(self.satellite_images_by_date.values()))
+        return Sentinel2Annotation(s2_satellite_image, annotation_shapefile)
+    
+    def load_satellite_images(self):
+        satellite_images_by_date = {}
+        for satellite_image_folder in self.satellite_images_folder.iterdir():
+            if satellite_image_folder.is_dir():
+                date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
+                satellite_images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, date_satellite_image)
+                satellite_images_by_date_sorted = dict(sorted(satellite_images_by_date.items()))
+                return satellite_images_by_date_sorted
+            
+
+# # To search for an image by date
+# search_date = date(2021, 1, 1)
+# satellite_image = satellite_images_by_date.get(search_date)

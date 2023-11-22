@@ -1,97 +1,80 @@
-import os
 import numpy as np
 import rasterio
 from matplotlib import pyplot as plt
 import re
 from rasterio.mask import mask
-import pandas as pd 
-import geopandas as gpd
-from datetime import datetime
-from .utils import patchify, contrast_stretching
+from .utils import patchify
 from .band import SatelliteBand
-from rasterio.features import geometry_mask
+from .annotation import SatelliteImageAnnotation
 from pathlib import Path
 
 # TODO: reprojecting of patches is not working...they do not align with the original raster
 # - do i need to unload bands in every function?
 
 class SatelliteImage:
-    def __init__(self, band_paths):
+    def __init__(self):
         """
         Initialize the SatelliteImage with paths to the satellite band data.
 
         Args:
-            band_paths (dict): A dictionary mapping band names to their file paths.
+            bands_path (dict): A dictionary mapping band names to their file paths.
             loaded_bands (dict): 
             array (numpy.darray):
             seed (int):
         """
-        self.band_paths = band_paths 
-        self.loaded_bands = {}
-        self.seed = 42
+        self._band_files_by_id = {}
+        self.bands = {}
+        self.annotation = None
+        self.meta = {}
 
-    def __getattr__(self, attr_name):
-        try:
-            return self.load_band(attr_name.upper())
-        except AttributeError:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{attr_name}'")
+    def __getitem__(self, band_id):
+        if band_id not in self.bands:
+            band_path = self._band_files_by_id.get(band_id)
+            self.bands[band_id] = SatelliteBand(band_path)  # Band class handles the loading of the array
+        return self.bands[band_id]
+
+    def _update_metadata(self):
+        satellite_image_meta = {}
+        for band_id in self._band_files_by_id.keys():
+            satellite_image_meta[band_id] = self[band_id].meta
+        self.meta = satellite_image_meta
+        return      
 
     def add_band(self, band_id, file_path):
         """
         Add a new SatelliteBand object to the bands dictionary.
         """
-        self.band_paths[band_id] = file_path
-
-    def load_band(self, band_name):
-        """
-        Load and return a SatelliteBand object for the specified band.
-        Args:
-            band_name (str): The name of the band in uppercase letter to load.
-        Returns:
-            SatelliteBand: The loaded SatelliteBand object.
-        """
-        if band_name not in self.loaded_bands:
-            band_path = self.band_paths.get(band_name)
-            if band_path:
-                self.loaded_bands[band_name] = SatelliteBand(band_name, band_path)
-            else:
-                raise ValueError(f"Band path for '{band_name}' not found.")
-        return self.loaded_bands[band_name]
-
-    def load_all_bands(self):
-        """
-        Load all bands specified in the band_paths.
-        This method iterates through all the band paths and loads each band.
-        """
-        for band_name in self.band_paths:
-            self.load_band(band_name)
+        self._band_files_by_id[band_id] = file_path
+        self._update_metadata()
         return
     
-    def unload_all_bands(self):
-        self.loaded_bands = {}
+    def clear_bands(self):
+        self.bands = {}
 
-    def stack_resampled_bands(self):
-        if not self.loaded_bands:
+    def load_annotation(self, annotation_shapefile):
+        self.annotation = SatelliteImageAnnotation(annotation_shapefile)
+        return self.annotation
+
+    def stack_and_resample_bands(self):
+        if not self.loaded_bands_by_id:
             self.load_all_bands()
-        
         band_arrays = []
-        for band_name, band in self.loaded_bands.items():
+        for band in self.loaded_bands_by_id.values():
             band = band.resample(10)
             band_arrays.append(band.array)
-
-        bands_stacked = np.vstack(band_arrays)  
+        bands_stacked = np.vstack(band_arrays)
         self.unload_all_bands()
         return bands_stacked 
-
+    
     def create_patches(self, patch_size):
-        stacked_bands = self.stack_resampled_bands()
+        stacked_bands = self.stack_and_resample_bands()
         return patchify(stacked_bands, patch_size)  
  
     def calculate_spectral_signature(self, annotation):
         self.load_all_bands()
         geometries = annotation.get_geometries_as_list()
         spectral_sig = {}
-        for band_id, band in self.loaded_bands.items():
+        for band_id, band in self.loaded_bands_by_id.items():
             if band_id != "SCL":
                 with rasterio.open(band.path, "r") as src:
                     mean_values = [np.mean(mask(src, [polygon], crop=True)[0]) for polygon in geometries]
@@ -109,33 +92,36 @@ class SatelliteImage:
         plt.ylabel("Reflectance")
         plt.grid(True)
         plt.show()
+        plt.savefig("Spectral_sig.png")
 
 class Sentinel2(SatelliteImage):
     
-    def __init__(self, si_folder, location, date):
-        self.folder = si_folder
-        self.location = location
+    def __init__(self, folder_of_satellite_image, date):
+        super().__init__()
+        self.base_folder = Path(folder_of_satellite_image)
+        self._band_files_by_id = self._construct_bands_path()
+        self.meta = self._update_metadata()
         self.date = date
-        bands_path = self._construct_bands_path()
-        super().__init__(bands_path)
-
+        self.bands = {}              
+    
     def _construct_bands_path(self):
-        band_paths = {}
-        file_paths = [entry for entry in self.folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
+        bands_path = {}
+        file_paths = [entry for entry in self.base_folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
         for band_path in file_paths:
             band_id = self._extract_band_info(band_path)
             if band_id:       
-                band_paths[band_id] = band_path
-        return self._sort_band_paths(band_paths)
+                bands_path[band_id] = band_path
+        return self._sort_band_paths(bands_path)
 
-    def _sort_band_paths(self, band_paths):
-        sorted_keys = sorted(band_paths.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
-        sorted_bands_paths = {k: self.bands[k] for k in sorted_keys}
+    def _sort_band_paths(self, bands_path):
+        sorted_keys = sorted(bands_path.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
+        sorted_bands_paths = {k: bands_path[k] for k in sorted_keys}
         return sorted_bands_paths
 
-    def _extract_band_info(self, file_path): 
+    def _extract_band_info(self, file_path):
+        file_name = file_path.name  
         pattern = r"(B\d+[A-Z]?|SCL)\.tif"
-        match = re.search(pattern, file_path)
+        match = re.search(pattern, file_name)
         return match.group(1) if match else None
             
     def _extract_band_number(self, key):
@@ -143,23 +129,23 @@ class Sentinel2(SatelliteImage):
         return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
     
     def calculate_bad_pixels(self):
-        scene_class = self.load_band("SCL")
+        scene_class = self["SCL"]
         bad_pixel_count = np.isin(scene_class.array, [0,1,2,3,8,9,10,11])
-        self.unload_all_bands()
         return np.mean(bad_pixel_count) * 100
-
+    
+    def is_quality_acceptable(self, bad_pixel_ratio=15):
+        return self.calculate_bad_pixels() < bad_pixel_ratio
+         
     def calculate_ndvi(self):
-        red = self.load_band("B04").array
-        nir = self.load_band("B08").array
+        red = self["B04"].array
+        nir = self["B08"].array
         np.seterr(divide='ignore', invalid='ignore')
-        self.unload_all_bands()
         return (nir.astype(float) - red.astype(float)) / (nir + red)
     
-    def calculate_ndvi(self):
+    def calculate_ndwi(self):
         nir = self.load_band("B08").array
         swir1 = self.load_band("B11").resample(10).array
         np.seterr(divide='ignore', invalid='ignore')
-        self.unload_all_bands()
         return (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
 
     def save_index(self, index_name, index):
@@ -175,11 +161,10 @@ class Sentinel2(SatelliteImage):
             'compress': 'lzw',
             'nodata': None
         }
-        index_path = self.folder / f"S2_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
+        index_path = self.base_folder / f"S2_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
         with rasterio.open(index_path, 'w', **profile) as dst:
             dst.write(index)
         self.add_band(index_name, index_path)
-        self.unload_all_bands()
         return 
 
     def plot_rgb(self):
@@ -196,20 +181,20 @@ class Sentinel2(SatelliteImage):
 class Sentinel1(SatelliteImage):
     
     def __init__(self, si_folder, location, date):
-        self.folder = si_folder
+        self.base_folder = si_folder
         self.location = location
         self.date = date
         bands_path = self._construct_bands_path()
         super().__init__(bands_path)
 
     def _construct_bands_path(self):
-        band_paths = {}
-        file_paths = [entry for entry in self.folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
+        bands_path = {}
+        file_paths = [entry for entry in self.base_folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
         for band_path in file_paths:
             band_id = self._extract_band_info(band_path)
             if band_id:       
-                band_paths[band_id] = band_path
-        return band_paths
+                bands_path[band_id] = band_path
+        return bands_path
 
     def _extract_band_info(self, file_path): 
         pattern = r"(VV|VH)"
@@ -239,7 +224,7 @@ class Sentinel1(SatelliteImage):
             'compress': 'lzw',
             'nodata': None
         }
-        index_path = self.folder / f"S1_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
+        index_path = self.base_folder / f"S1_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
         with rasterio.open(index_path, 'w', **profile) as dst:
             dst.write(index)
         self.add_band(index_name, index_path)
@@ -247,74 +232,8 @@ class Sentinel1(SatelliteImage):
         return 
     
     def plot_cross_ratio(self):
-        if "CR" not in self.loaded_bands:
+        if "CR" not in self.loaded_bands_by_id:
             cr = self.calculate_cross_ratio()
             self.save_index("CR", cr)
         cr = self.load_band("CR") # as SatelliteBand
         return cr.plot()
-
-class Sentinel12(Sentinel1, Sentinel2):
-    def __init__(self, si_folder, location, date):
-        super().__init__()
-        self.s1 = Sentinel1(si_folder, location, date)
-        self.s2 = Sentinel2(si_folder, location, date)
-        self.indizes_path = []
-
-    def initiate_bands(self):
-        
-        self.s1.initiate_bands()
-        self.s2.initiate_bands()
-        
-        return 
-        
-    def calculate_indices(self, out_dir, path=True):
-        
-        s1_idx = self.s1.calculate_indizes(out_dir)
-        s2_idx = self.s2.calculate_indizes(out_dir)
-        
-        # Combine the idx as list
-        combined_idx = [s1_idx] + s2_idx
-        combined_idx.sort()
-        self.indizes_path = combined_idx
-        
-        print("Calculated Sentinel-1/-2 indizes")
-    
-        if path:
-            return combined_idx
-        else: 
-            return 
-    
-    def plot_rgb(self):
-
-        def contrastStreching(image):
-            
-            image = image.astype(np.float32)
-            csImg = np.empty_like(image, dtype=np.float32)
-
-            # Perform contrast stretching on each channel
-            for band in range(image.shape[-1]):
-                imgMin = image[...,band].min().astype(np.float32)
-                imgMax = image[...,band].max().astype(np.float32)
-                csImg[...,band] = (image[...,band] - imgMin) / (imgMax - imgMin)
-            
-            return csImg
-
-        if self.bands:
-            
-            red = self.get_band("B04").normalize()
-            green = self.get_band("B03").normalize()
-            blue = self.get_band("B02").normalize()
-            
-            rgb = np.moveaxis(np.vstack((red, green, blue)), 0, -1)
-            rgb = contrastStreching(rgb)
-            plt.figure(figsize=(10,10))
-            plt.imshow(rgb)
-            plt.show()
-
-        else: 
-            raise AttributeError(f"No rgb image is initiated. Please initiate the corresponding rgb image using the initiate_bands() method and try again.")
-
-        return
-    
-    def plot_backscatter():
-        return

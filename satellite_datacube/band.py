@@ -119,7 +119,6 @@ class SatelliteBand:
         """
         band_res = self.meta["transform"].a
         if band_res != new_resolution:
-            print("Resampling")
             new_meta = self._update_metadata_to_new_resolution(new_resolution)
             resampled_band_path = self._reproject_band(new_meta)
             self.path = Path(resampled_band_path)
