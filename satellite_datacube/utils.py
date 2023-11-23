@@ -5,6 +5,44 @@ import numpy as np
 from matplotlib import pyplot as plt
 from rasterio.mask import mask
 
+def plot_spectral_signature(self, spectral_signature):
+    band_ids = list(spectral_signature.keys())
+    reflectances = list(spectral_signature.values())
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(band_ids, reflectances, marker='o', linestyle='-')
+    plt.title("Spectral Signature")
+    plt.xlabel("Band ID")
+    plt.ylabel("Reflectance")
+    plt.grid(True)
+    plt.show()
+    plt.savefig("Spectral_sig.png")
+
+def band_management_decorator(func):
+    """Decorator to manage band loading and unloading."""
+    def wrapper(*args, **kwargs):
+        self = args[0] # Assuming 'self' is the first argument (as in a method of a class)
+        self.load_all_bands()
+        try:
+            result = func(*args, **kwargs) # Execute the original function
+            return result
+        finally:
+            self.unload_all_bands()
+    return wrapper
+
+def select_equally_spaced_items(input_list, num_items):
+    interval = len(input_list) // num_items
+    return [input_list[i * interval] for i in range(num_items)]
+
+# Function to check if the name is a number
+def is_name_a_number(path):
+    try:
+        # Attempt to convert the name to a float
+        float(path.name)
+        return True
+    except ValueError:
+        return False
+
 def patchify(source_array, patch_size, padding=True):
     """Utility function to create patches from a source array."""
     num_bands, size_x, size_y = source_array.shape
@@ -83,6 +121,15 @@ def sanity_check(patches):
 
     plt.show()
     return
+
+def filter_patches(self, patches):      
+    satellite_images_patches = [] # list of np.arrays for each image one array
+    for patch in patches:
+        print(f"-> Start with satellite image of date {date}")
+        patches = satellite_image.create_patches(patch_size) # returns list of patches
+        satellite_images_patches.append(np.array(patches)) # NxCxhxW
+    satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
+    return satellite_images_patches
 
 def filter_patches(global_mask, patches, class_values, class_ratio=(100,0), seed=42):
     random.seed(seed)
