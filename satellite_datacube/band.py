@@ -2,11 +2,10 @@ import os
 import numpy as np
 import rasterio
 from matplotlib import pyplot as plt
-import json
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from pathlib import Path 
-from .utils import patchify
+from .utils import pad_patch, update_patch_transform
 
 class SatelliteBand:
     """
@@ -126,10 +125,7 @@ class SatelliteBand:
                 self.array = src.read() 
                 self.meta = src.meta.copy()
         return self
-
-    def create_patches(self, patch_size):
-        return patchify(source_array=self.array, patch_size=patch_size)
-
+      
     def normalize_with_zscore(self):
         """
         Apply z-score normalization to the raster band array.

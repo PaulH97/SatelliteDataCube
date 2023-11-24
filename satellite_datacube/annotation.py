@@ -28,7 +28,7 @@ class SatelliteImageAnnotation:
     def get_geometries_as_list(self):
         self._repair_geometries()
         return self.df["geometry"].to_list()
-    
+
     def plot(self):
         return self.band.plot()
 
@@ -40,7 +40,7 @@ class Sentinel2Annotation(SatelliteImageAnnotation):
 
     def _rasterize_annotation(self):     
         geometries = self.get_geometries_as_list()
-        s2_b02_meta = self.satellite_image.load_band["B02"].meta
+        s2_b02_meta = self.satellite_image.meta["B02"]
         s2_b02_meta['dtype'] = 'uint8'
         output_path = self.path.parent / (self.path.stem + ".tif")
         with rasterio.open(output_path, 'w', **s2_b02_meta) as dst:
@@ -57,7 +57,7 @@ class Sentinel1Annotation(SatelliteImageAnnotation):
 
     def _rasterize_annotation(self):     
         geometries = self.get_geometries_as_list()
-        s1_vv_meta = self.satellite_image.load_band["VV"].meta
+        s1_vv_meta = self.satellite_image.meta["VV"]
         s1_vv_meta['dtype'] = 'uint8'
         output_path = self.path.parent / (self.path.stem + ".tif")
         with rasterio.open(output_path, 'w', **s1_vv_meta) as dst:

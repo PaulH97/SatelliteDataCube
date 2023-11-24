@@ -4,6 +4,51 @@ import random
 import numpy as np
 from matplotlib import pyplot as plt
 from rasterio.mask import mask
+from rasterio.transform import Affine
+
+    def create_patches(self, patch_size, padding=True):
+        num_bands, size_x, size_y = self.array.shape
+        patches = []
+        for i in range(0, size_x, patch_size):
+            for j in range(0, size_y, patch_size):
+                patch = self.array[:, i:i+patch_size, j:j+patch_size]
+                # Check if patch needs padding
+                if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
+                    patch = pad_patch(patch, patch_size)
+                elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
+                    continue  # Skip patches that are smaller than patch_size when padding is False
+                patches.append(patch)
+        return patches
+    
+    def get_patches_metadata(self, patches):
+        num_bands, size_x, size_y = self.array.shape
+        patch_size = patches[0].shape[-1]
+        patches_metadata = []
+        for i in range(0, size_x, patch_size):
+            for j in range(0, size_y, patch_size):
+                # Save the patch using raster
+                patch_transform = update_patch_transform(self.meta, i, j)
+                patch_metadata = self.meta.copy()
+                patch_metadata["transform"] = patch_transform
+                patch_metadata['height'], patch_metadata['width'] = patch_size, patch_size
+                patches_metadata.append(patch_metadata)
+        return patches_metadata
+
+    def save_patches(self, patches, patches_metadata):
+        patches_folder = self.path.parent / "patches"
+        patches_folder.mkdir(parents=True, exist_ok=True)
+        for idx, patch, patch_meta in enumerate(zip(patches, patches_metadata)):
+            patch_meta['driver'] = 'GTiff'
+            patch_path = patches_folder / (self.name + f"patch{idx}.tif" )
+            with rasterio.open(patch_path, 'w', **patch_meta) as dst:
+                dst.write(patch[0, :, :], 1)
+        return patches_folder
+    
+    def create_and_save_patches(self, patch_size, patches_folder):
+        patches = self.create_patches(patch_size)
+        patches_metadata = self.get_patches_metadata(patches)
+        return self.save_patches(patches, patches_metadata, patches_folder)
+
 
 def plot_spectral_signature(self, spectral_signature):
     band_ids = list(spectral_signature.keys())
@@ -43,24 +88,25 @@ def is_name_a_number(path):
     except ValueError:
         return False
 
-def patchify(source_array, patch_size, padding=True):
+def create_patches_with_metadata(source_array, patch_size, source_array_metadata, padding=True):
     """Utility function to create patches from a source array."""
-    num_bands, size_x, size_y = source_array.shape
-    patches = []
-
+    num_bands, size_x, size_y = source_array
+    patches_with_metadata = []
     for i in range(0, size_x, patch_size):
         for j in range(0, size_y, patch_size):
             patch = source_array[:, i:i+patch_size, j:j+patch_size]
-
             # Check if patch needs padding
             if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
                 patch = pad_patch(patch, patch_size)
             elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
                 continue  # Skip patches that are smaller than patch_size when padding is False
-
-            patches.append(patch)
-
-    return patches
+            # Update metadata for patch
+            patch_transform= update_patch_transform(source_array_metadata, i, j)
+            patch_metadata = source_array_metadata
+            patch_metadata["transform"] = patch_transform
+            patch_metadata['width'], patch_metadata['height'] = patch_size, patch_size
+            patches_with_metadata.append((patch, patch_metadata))
+    return patches_with_metadata
 
 def pad_patch(patch, patch_size):
     # Determine how much padding is needed
@@ -69,6 +115,29 @@ def pad_patch(patch, patch_size):
     # Here, we're padding with zeros - you can adjust the 'constant_values' parameter as needed for your application
     padded_patch = np.pad(patch, ((0, 0), (0, pad_x), (0, pad_y)), mode='constant', constant_values=0)
     return padded_patch
+
+def update_patch_transform(original_metadata, start_x, start_y):
+    original_transform = original_metadata['transform']
+    new_transform = Affine.translation(
+        original_transform.c + start_x * original_transform.a, 
+        original_transform.f + start_y * original_transform.e
+        )
+    return new_transform
+
+def save_patches(patches, patches_metadata, patch_folder):
+
+    patch_folder = patch_folder 
+
+    for idx, patch, patch_meta in enumerate(zip(patches, patches_metadata)):
+        patch_meta['driver'] = 'GTiff'
+        patch_path = self.f"0000{idx}.tif"  # Example file name
+        with rasterio.open(file_name, 'w', **patch_meta) as dst:
+            for k in range(1, patch.shape[0] + 1):
+                dst.write(patch[k - 1, :, :], k)
+    return 
+    
+
+
 
 def contrast_stretching_minmax(image):
     img = image.astype(np.float32)

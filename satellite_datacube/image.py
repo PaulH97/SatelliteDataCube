@@ -5,16 +5,18 @@ import re
 from rasterio.mask import mask
 from .utils import patchify, band_management_decorator
 from .band import SatelliteBand
-from .annotation import SatelliteImageAnnotation
+from .annotation import Sentinel1Annotation, Sentinel2Annotation
 from pathlib import Path
 
 # TODO: reprojecting of patches is not working...they do not align with the original raster
-# - do i need to unload bands in every function?
+
+# evtl add band_management where i resample and stack bands in advance? - but i only use it once so prob not relevant 
 
 class SatelliteImage:
     def __init__(self):
         self._band_files_by_id = {}
         self._loaded_bands = {}
+        self.annotation = None
         self.array = None
         self.date = None
         self.meta = {}
@@ -92,12 +94,44 @@ class SatelliteImage:
             raise ValueError(f"An error occurred while stacking bands: {ValueError}. Please make sure that all loaded bands are resampled to the same resolution.")
         return self.array
     
-    def create_patches(self, patch_size):
+        # patches_array = np.stack(bands_patches, axis=1) # (1972,10,128,128)
+        #     patches_meta = [] # 1972 meta items
+        #     for band_meta in band_patches_meta:
+        #         patches_array_meta = band_meta
+        #         patches_array_meta["count"] = patches_array.shape[1]
+        #         patches_meta.append(patches_array_meta)
+        #     return patches_array, patches_meta # (1972,10,128,128), [meta1, meta2, .... meta1972]
+        # except ValueError:
+        #     raise ValueError(f"An error occurred while generating patches of all bands: {ValueError}. Please make sure that all bands are resampled to the same resolution.")
+
+    @band_management_decorator
+    def create_patches_with_metadata(self, patch_size):
+        # Bedingung ist das stacken von bändern und das resamplen -> change this 
+    
         try:
-            patches = patchify(self.array, patch_size)
+            bands_patches = []
+            for band in self._loaded_bands.values():
+                band_patches = band.create_patches(patch_size)
+                band_patches.append(np.array(band_patches)) # (1972,1,128,128)
+            satellite_image_patches = np.stack(bands_patches, axis=1) # (1972,10,128,128)
+            satellite_image_patches_metadata = []
+            band_patches_metadata = self.load_band("B02").get_patches_metadata(list(bands_patches)[0])
+            for band_meta in band_patches_metadata:
+                band_meta["count"] = satellite_image_patches.shape[1]
+                satellite_image_patches_metadata.append(band_meta)
+            return list(satellite_image_patches), satellite_image_patches_metadata # two list with same length 
         except ValueError:
-            raise ValueError(f"An error occurred while creating patches of SatelliteImage: {ValueError}. Please make sure that bands are resampled and stacked together. Use for this the function resample() and stack_bands().") 
-        return patches
+            raise ValueError(f"An error occurred while creating patches of SatelliteImage: {ValueError}. Please make sure that bands are resampled. Use for this the function resample().") 
+
+    def save_patches(self, patches, patches_metadata):
+        patches_folder = self.path.parent / "patches"
+        patches_folder.mkdir(parents=True, exist_ok=True)
+        for idx, patch, patch_meta in enumerate(zip(patches, patches_metadata)):
+            patch_meta['driver'] = 'GTiff'
+            patch_path = patches_folder / (self.name + f"patch{idx}.tif" )
+            with rasterio.open(patch_path, 'w', **patch_meta) as dst:
+                dst.write(patch[0, :, :], 1)
+        return patches_folder
 
     @band_management_decorator
     def calculate_spectral_signature(self, annotation_shapefile):
@@ -112,9 +146,10 @@ class SatelliteImage:
 
 class Sentinel2(SatelliteImage):
     
-    def __init__(self, folder_of_satellite_image, date):
+    def __init__(self, folder_of_satellite_image, date, annotation_shapefile=None):
         super().__init__()   
         self.base_folder = Path(folder_of_satellite_image)
+        self._annotation_shapefile = annotation_shapefile
         self._band_files_by_id = self._initialize_bands_path()    
         self._scl = self._initialize_scl()
         self.meta = self._update_metadata()
@@ -155,6 +190,11 @@ class Sentinel2(SatelliteImage):
     def _unload_scl(self):
         self._scl = {}
 
+    def _load_annotation(self):
+        if self._annotation_shapefile:
+            self.annotation = Sentinel2Annotation(self, self._annotation_shapefile)
+            return self.annotation
+
     def calculate_bad_pixels(self):
         scl_band = self._load_scl()
         bad_pixel_count = np.isin(scl_band.array, [0,1,2,3,8,9,10,11])
@@ -178,7 +218,7 @@ class Sentinel2(SatelliteImage):
         np.seterr(divide='ignore', invalid='ignore')
         return (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
 
-    def save_index(self, index_name, index):
+    def save_and_add_index(self, index_name, index):
         sample_band_meta = self.meta["B02"]
         profile = {
             'driver': 'GTiff',
@@ -244,7 +284,7 @@ class Sentinel1(SatelliteImage):
         vh = self._loaded_bands["VH"]
         return np.nan_to_num(vv-vh)
     
-    def save_index(self, index_name, index):
+    def save_and_add_index(self, index_name, index):
         sample_band_meta = self.meta["VV"]
         profile = {
             'driver': 'GTiff',
@@ -262,3 +302,15 @@ class Sentinel1(SatelliteImage):
             dst.write(index)
         self.add_band(index_name, index_path)
         return 
+
+    def plot_cross_ratio(self):
+        try:
+            cr = np.moveaxis(self.load_band("CR"),0,-1)
+            plt.imshow(cr)
+            plt.title(f"Cross ratio of sentinel-1 image on date: {self.date}")
+            plt.show()
+            plt.savefig("cr.png")
+        except ValueError:
+            raise ValueError(f"An error occurred while plotting cross ratio: {ValueError}. Please make sure that specific index is calcluated and added to bands.")
+
+

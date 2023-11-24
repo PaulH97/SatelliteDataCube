@@ -10,11 +10,7 @@ import pandas as pd
 from datetime import datetime
 from glob import glob
 from pathlib import Path
-# TODO:
 
-# - build temp_folder when init?
-
-# fix the indices parameter -> find a nice solution 
 
 # VERY IMPORTANT: We need to add the GT for all of the following si after the event 
 # right now only one timestep contains the mask
@@ -59,6 +55,22 @@ class SatelliteDataCube:
         print(f"- Start-End: {next(iter(self.satellite_images_by_date.values())).date} -> {next(reversed(self.satellite_images_by_date.values())).date}")
         print(f"- Length of data-cube: {len(self.satellite_images_by_date)}")
         print(f"{2*divider}")
+    
+    def load_image(self, date):
+        if date in self.satellite_images_by_date:
+            return self.satellite_images_by_date[date]
+        else:
+            raise ValueError(f"Date is not in SatelliteDataCube. Please use the function find_closest_date to use a valid date.")
+
+    def find_closest_date(self, date):
+        satellite_images_dates = sorted(self.satellite_images_by_date.keys()) # list of dates
+        date_idx = satellite_images_dates.index(date)
+        next_date = satellite_images_dates[date_idx+1]
+        previous_date = satellite_images_dates[date_idx-1]
+        if abs(date - next_date) >= abs(date - previous_date):
+            return previous_date
+        else:
+            return next_date
 
     def select_equal_distributed_satellite_images(self, number_of_images):
         satellite_image_dates = [satellite_image.date for satellite_image in self.satellite_images_by_date.keys()]
@@ -66,14 +78,14 @@ class SatelliteDataCube:
         selected_satellite_images = [self.satellite_images_by_date.get(satellite_image_date) for satellite_image_date in satellite_image_dates_equally_distributed]
         return selected_satellite_images
 
-    def create_and_patches(self, patch_size):      
-        satellite_images_patches = [] # list of np.arrays for each image one array
-        for date, satellite_image in self.satellite_images_by_date.items():
-            print(f"-> Start with satellite image of date {date}")
-            patches = satellite_image.create_patches(patch_size) # returns list of patches
-            satellite_images_patches.append(np.array(patches)) # NxCxhxW
-        satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
-        return satellite_images_patches
+    # def create_patches_of_of_satellite_images(self, patch_size):      
+    #     satellite_images_patches = [] # list of np.arrays for each image one array
+    #     for date, satellite_image in self.satellite_images_by_date.items():
+    #         print(f"-> Start with satellite image of date {date}")
+    #         patches = satellite_image.create_patches(patch_size) # returns list of patches
+    #         satellite_images_patches.append(np.array(patches)) # NxCxhxW
+    #     satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
+    #     return satellite_images_patches
 
     def create_and_keep_patches_with_annotation(self, patch_size):      
         satellite_images_patches = [] # list of np.arrays for each image one array
