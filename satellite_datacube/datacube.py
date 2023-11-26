@@ -11,19 +11,16 @@ from datetime import datetime
 from glob import glob
 from pathlib import Path
 
-
-# VERY IMPORTANT: We need to add the GT for all of the following si after the event 
-# right now only one timestep contains the mask
-
 # TODO: Update the function with storing the shapefile in a varibale -> creating mask with that and not using the annotation.tif?
-
-
+# maybe i should select timeseries and store it not as instance variable?
 class SatelliteDataCube:
     def __init__(self):
         self.base_folder = None
         self.satellite = None
-        self.satellite_images_by_date = {}
-        self.annotation = {}
+        self.images_by_date = {}
+        self.selected_images_by_date = {}
+        self.annotation = None
+        self.spectral_signature = None
 
     def _print_initialization_info(self):
         """
@@ -52,18 +49,18 @@ class SatelliteDataCube:
         print("Initialized data-cube with following parameter:")
         print(f"- Base folder: {self.base_folder}")
         print(f"- Satellite mission: {self.satellite}")
-        print(f"- Start-End: {next(iter(self.satellite_images_by_date.values())).date} -> {next(reversed(self.satellite_images_by_date.values())).date}")
-        print(f"- Length of data-cube: {len(self.satellite_images_by_date)}")
+        print(f"- Start-End: {min(self.images_by_date.keys())} -> {max(self.images_by_date.keys())}")
+        print(f"- Length of data-cube: {len(self.images_by_date)}")
         print(f"{2*divider}")
     
     def load_image(self, date):
-        if date in self.satellite_images_by_date:
-            return self.satellite_images_by_date[date]
+        if date in self.images_by_date:
+            return self.images_by_date[date]
         else:
             raise ValueError(f"Date is not in SatelliteDataCube. Please use the function find_closest_date to use a valid date.")
 
     def find_closest_date(self, date):
-        satellite_images_dates = sorted(self.satellite_images_by_date.keys()) # list of dates
+        satellite_images_dates = sorted(self.images_by_date.keys()) # list of dates
         date_idx = satellite_images_dates.index(date)
         next_date = satellite_images_dates[date_idx+1]
         previous_date = satellite_images_dates[date_idx-1]
@@ -72,88 +69,23 @@ class SatelliteDataCube:
         else:
             return next_date
 
-    def select_equal_distributed_satellite_images(self, number_of_images):
-        satellite_image_dates = [satellite_image.date for satellite_image in self.satellite_images_by_date.keys()]
-        satellite_image_dates_equally_distributed = select_equally_spaced_items(satellite_image_dates, number_of_images)
-        selected_satellite_images = [self.satellite_images_by_date.get(satellite_image_date) for satellite_image_date in satellite_image_dates_equally_distributed]
-        return selected_satellite_images
-
-    # def create_patches_of_of_satellite_images(self, patch_size):      
-    #     satellite_images_patches = [] # list of np.arrays for each image one array
-    #     for date, satellite_image in self.satellite_images_by_date.items():
-    #         print(f"-> Start with satellite image of date {date}")
-    #         patches = satellite_image.create_patches(patch_size) # returns list of patches
-    #         satellite_images_patches.append(np.array(patches)) # NxCxhxW
-    #     satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
-    #     return satellite_images_patches
-
-    def create_and_keep_patches_with_annotation(self, patch_size):      
-        satellite_images_patches = [] # list of np.arrays for each image one array
-        for date, satellite_image in self.satellite_images_by_date.items():
-            print(f"-> Start with satellite image of date {date}")
-            patches = satellite_image.create_patches(patch_size) # returns list of patches
-            self.annotation.
-            satellite_images_patches.append(np.array(patches)) # NxCxhxW
-        satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
-        return satellite_images_patches
-    
-    def filter_patches(self, satellite_images_patches):      
-        satellite_images_patches = [] # list of np.arrays for each image one array
-
-        for date, satellite_image in self.satellite_images_by_date.items():
-            print(f"-> Start with satellite image of date {date}")
-            
-            patches = satellite_image.create_patches(patch_size) # returns list of patches
-            satellite_images_patches.append(np.array(patches)) # NxCxhxW
-        satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
-        return satellite_images_patches
-
-    def filter_patches(self, patches, class_values, class_ratio=(100,0)):
-        random.seed(self.seed)
-        class_ratio= [i / 100 for i in class_ratio]
-        patch_size = next(iter(patches.values())).shape[-1]
-        global_mask_patches = patchify(self.global_mask,patch_size)
-        class_indices = [idx for idx, patch in enumerate(global_mask_patches) if np.any(np.isin(patch, class_values))]
-        no_class_indices = [idx for idx, patch in enumerate(global_mask_patches) if not np.any(np.isin(patch, class_values))]
-        num_noclass_patches = int((len(class_indices) / class_ratio[0]) * class_ratio[1])
-        no_class_indices = random.sample(no_class_indices, num_noclass_patches)
-        filtered_patches = {}
-        for source, patchArray in patches.items():
-            filtered_patches[source] = patchArray[class_indices + no_class_indices] # for masks it can happen that no of the selected masks of si contains GT 
-        return filtered_patches
-
-    def save_patches(self, patches, patches_folder=""):
-        patches_folder = os.path.join(self.base_folder,"patches") if not patches_folder else patches_folder
-        patch_array = next(iter(patches.values()))
-        patch_size, ts_length = patch_array.shape[-1], patch_array.shape[1]
-        if not os.path.exists(patches_folder):
-            os.makedirs(patches_folder)
-        print(f"Saving patches in folder: {patches_folder}")
-        for source, patchArray in patches.items(): 
-            np.save(os.path.join(patches_folder, f"{source}_patches{patch_size}_ts{ts_length}.npy"), patchArray)
-            print(f"Saved patches from source {source} as array with shape: {patchArray.shape}") 
+    def select_images_with_number(self, number_of_images):
+        satellite_image_dates = [satellite_image.date for satellite_image in self.images_by_date.keys()]
+        interval = len(satellite_image_dates) // number_of_images
+        selected_dates = [satellite_image_dates[i * interval] for i in range(number_of_images)]
+        self.selected_images_by_date = {date: self.images_by_date[date] for date in selected_dates if date in self.images_by_date}
         return 
+    
+    def select_images_with_dates(self, dates):
+        self.selected_images_by_date = {date: self.images_by_date[date] for date in dates if date in self.images_by_date}
+        return self.selected_images_by_date
 
-    def process_patches(self, patch_size, class_values, selected_timeseries=[], indices=False, patches_folder=""):
-                
-        patches = self.create_patches(patch_size=patch_size, selected_timeseries=selected_timeseries, indices=indices)
-        [print(f"Created patches of {source.upper()} with shape: {array.shape}") for source, array in patches.items()]
-        filtered_patches = self.filter_patches(patches=patches, class_values=class_values)
-        [print(f"Filtered patches of {source.upper()} so that the shape changed to: {array.shape}") for source, array in patches.items()]
-        self.save_patches(patches=filtered_patches, patches_folder=patches_folder)
-        return filtered_patches
-
-    def create_spectral_signature(self, selected_timeseries=[], indices=False, output_folder=""):
-        if not selected_timeseries:
-            selected_timeseries = [si for si in self.satellite_images_by_date.values()]
-        spectral_sig = {}
-        for image in selected_timeseries:
-            image_spectral_sig = image.calculate_spectral_signature(shapefile=self.labels_shp,indices=indices)
-            spectral_sig[str(image.date)] = image_spectral_sig
-        if output_folder:
-            spectral_sig_df = pd.DataFrame(spectral_sig)
-            spectral_sig_df.to_csv(os.path.join(output_folder,f"{self.satellite}_spectralSig_ts{len(selected_timeseries)}.csv"))
-        return spectral_sig
+    def create_spectral_signature(self, annotation_shapefile):
+        datacube_spectral_sig = {}
+        for image_date, image in self.images_by_date.items():
+            image_spectral_sig = image.calculate_spectral_signature(annotation_shapefile)
+            datacube_spectral_sig[image_date] = image_spectral_sig
+        return datacube_spectral_sig
     
     def plot_spectral_signature(self, spectral_signature, output_folder=""):
         bands = list(spectral_signature[list(spectral_signature.keys())[0]].keys())
@@ -181,28 +113,28 @@ class Sentinel2DataCube(SatelliteDataCube):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-2"
         self.satellite_images_folder = self.base_folder / self.satellite
-        self.satellite_images_by_date = self._load_satellite_images()
+        self.images_by_date = self._load_satellite_images()
         self.annotation = self._load_annotation()
         self._print_initialization_info()
      
     def _load_annotation(self):
         annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-        s2_satellite_image = next(iter(self.satellite_images_by_date.values()))
+        s2_satellite_image = next(iter(self.images_by_date.values()))
         return Sentinel2Annotation(s2_satellite_image, annotation_shapefile)
     
     def _load_satellite_images(self):
-        satellite_images_by_date = {}
+        images_by_date = {}
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
                 date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
-                satellite_images_by_date[date_satellite_image] = Sentinel2(satellite_image_folder, date_satellite_image)
-                satellite_images_by_date_sorted = dict(sorted(satellite_images_by_date.items()))
+                images_by_date[date_satellite_image] = Sentinel2(satellite_image_folder, date_satellite_image)
+                satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
                 return satellite_images_by_date_sorted
 
-    def find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
+    def _find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
         """Search for the nearest good quality image before and after the current date. 
         If none is found, return the one with the least bad pixels from the search range."""
-        satellite_images_dates = sorted(self.satellite_images_by_date.keys())
+        satellite_images_dates = sorted(self.images_by_date.keys())
         start_date_idx = satellite_images_dates.index(satellite_image.date)
 
         alternative_satellite_images = []
@@ -212,7 +144,7 @@ class Sentinel2DataCube(SatelliteDataCube):
                 new_date_idx = start_date_idx + (direction * offset)
                 if 0 <= new_date_idx < len(satellite_images_dates):
                     new_date = satellite_images_dates[new_date_idx]
-                    neighbor_satellite_image = self.satellite_images_by_date.get(new_date)
+                    neighbor_satellite_image = self.images_by_date.get(new_date)
                     if neighbor_satellite_image.is_quality_acceptable():
                         return neighbor_satellite_image
                     else:
@@ -222,18 +154,21 @@ class Sentinel2DataCube(SatelliteDataCube):
         alternative_satellite_images.sort(key=lambda x: x[1])  # Sorting by bad pixel ratio
         return alternative_satellite_images[0][0] if alternative_satellite_images else satellite_image
 
-    def update_satellite_images(self, number_of_images):
-        selected_satellite_images = self.select_equal_distributed_satellite_images(number_of_images)
-        updated_satellite_images_by_date = {}
-        for satellite_image in selected_satellite_images:
-            print("[" + " ".join(str(x) for x in range(len(self.selected_satellite_images.keys()) + 1)) + "]", end='\r')
-            if satellite_image.is_quality_acceptable():
-                updated_satellite_images_by_date[satellite_image.date] = satellite_image
-            else:
-                neighbour_satellite_image = self.find_higher_quality_satellite_image(satellite_image)
-                updated_satellite_images_by_date[neighbour_satellite_image.date] = neighbour_satellite_image
-        self.satellite_images_by_date = updated_satellite_images_by_date
-        return self.satellite_images_by_date
+    def find_best_selected_images(self):
+        try: 
+            updated_images_by_date = {}
+            for date, image in self.selected_images_by_date.items():
+                print("[" + " ".join(str(x) for x in range(len(self.images_by_date.keys()) + 1)) + "]", end='\r')
+                if image.is_quality_acceptable():
+                    updated_images_by_date[date] = image
+                else:
+                    neighbour_satellite_image = self._find_higher_quality_satellite_image(image)
+                    updated_images_by_date[neighbour_satellite_image.date] = neighbour_satellite_image
+            self.selected_images_by_date = updated_images_by_date
+        except ValueError:
+            raise ValueError(f"An error occurred while updating the satellite images of data-cube:{ValueError}. 
+                             Please make sure that you first select images with the functions select_images_by date() or select_imgaes_by_date().")
+        return 
             
 class Sentinel1DataCube(SatelliteDataCube):
     def __init__(self, base_folder):
@@ -241,24 +176,27 @@ class Sentinel1DataCube(SatelliteDataCube):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-1"
         self.satellite_images_folder = self.base_folder / self.satellite
-        self.satellite_images_by_date = self.load_satellite_images()
+        self.images_by_date = self._load_satellite_images()
         self.annotation = self._load_annotation()
-
+        self._print_initialization_info()
+     
     def _load_annotation(self):
         annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-        s2_satellite_image = next(iter(self.satellite_images_by_date.values()))
+        s2_satellite_image = next(iter(self.images_by_date.values()))
         return Sentinel2Annotation(s2_satellite_image, annotation_shapefile)
     
-    def load_satellite_images(self):
-        satellite_images_by_date = {}
+    def _load_satellite_images(self):
+        images_by_date = {}
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
                 date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
-                satellite_images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, date_satellite_image)
-                satellite_images_by_date_sorted = dict(sorted(satellite_images_by_date.items()))
+                images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, date_satellite_image)
+                satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
                 return satellite_images_by_date_sorted
-            
 
-# # To search for an image by date
-# search_date = date(2021, 1, 1)
-# satellite_image = satellite_images_by_date.get(search_date)
+    def _find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
+        pass
+
+    def find_best_selected_images(self):
+        pass
+           

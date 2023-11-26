@@ -10,7 +10,7 @@ setup(
         'matplotlib',
         'simplejson', 
         'fiona',
-        'pandas',
+        'geopandas',
     ],
     author="Paul Höhn",
     author_email="paul.hoen@outlook.de",

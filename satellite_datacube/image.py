@@ -3,14 +3,10 @@ import rasterio
 from matplotlib import pyplot as plt
 import re
 from rasterio.mask import mask
-from .utils import patchify, band_management_decorator
+from .utils import patchify, band_management_decorator, save_index
 from .band import SatelliteBand
 from .annotation import Sentinel1Annotation, Sentinel2Annotation
 from pathlib import Path
-
-# TODO: reprojecting of patches is not working...they do not align with the original raster
-
-# evtl add band_management where i resample and stack bands in advance? - but i only use it once so prob not relevant 
 
 class SatelliteImage:
     def __init__(self):
@@ -83,7 +79,7 @@ class SatelliteImage:
             band = band.resample(resolution)
             self._band_files_by_id[band_id] = band.path
         self._update_metadata()
-        return 
+        return self
     
     @band_management_decorator
     def stack_bands(self):
@@ -92,66 +88,16 @@ class SatelliteImage:
             self.array = bands_stacked
         except ValueError:
             raise ValueError(f"An error occurred while stacking bands: {ValueError}. Please make sure that all loaded bands are resampled to the same resolution.")
-        return self.array
+        return self
     
-        # patches_array = np.stack(bands_patches, axis=1) # (1972,10,128,128)
-        #     patches_meta = [] # 1972 meta items
-        #     for band_meta in band_patches_meta:
-        #         patches_array_meta = band_meta
-        #         patches_array_meta["count"] = patches_array.shape[1]
-        #         patches_meta.append(patches_array_meta)
-        #     return patches_array, patches_meta # (1972,10,128,128), [meta1, meta2, .... meta1972]
-        # except ValueError:
-        #     raise ValueError(f"An error occurred while generating patches of all bands: {ValueError}. Please make sure that all bands are resampled to the same resolution.")
-
-    @band_management_decorator
-    def create_patches_with_metadata(self, patch_size):
-        # Bedingung ist das stacken von bändern und das resamplen -> change this 
-    
-        try:
-            bands_patches = []
-            for band in self._loaded_bands.values():
-                band_patches = band.create_patches(patch_size)
-                band_patches.append(np.array(band_patches)) # (1972,1,128,128)
-            satellite_image_patches = np.stack(bands_patches, axis=1) # (1972,10,128,128)
-            satellite_image_patches_metadata = []
-            band_patches_metadata = self.load_band("B02").get_patches_metadata(list(bands_patches)[0])
-            for band_meta in band_patches_metadata:
-                band_meta["count"] = satellite_image_patches.shape[1]
-                satellite_image_patches_metadata.append(band_meta)
-            return list(satellite_image_patches), satellite_image_patches_metadata # two list with same length 
-        except ValueError:
-            raise ValueError(f"An error occurred while creating patches of SatelliteImage: {ValueError}. Please make sure that bands are resampled. Use for this the function resample().") 
-
-    def save_patches(self, patches, patches_metadata):
-        patches_folder = self.path.parent / "patches"
-        patches_folder.mkdir(parents=True, exist_ok=True)
-        for idx, patch, patch_meta in enumerate(zip(patches, patches_metadata)):
-            patch_meta['driver'] = 'GTiff'
-            patch_path = patches_folder / (self.name + f"patch{idx}.tif" )
-            with rasterio.open(patch_path, 'w', **patch_meta) as dst:
-                dst.write(patch[0, :, :], 1)
-        return patches_folder
-
-    @band_management_decorator
-    def calculate_spectral_signature(self, annotation_shapefile):
-        annotation = SatelliteImageAnnotation(annotation_shapefile)
-        geometries = annotation.get_geometries_as_list()
-        spectral_sig = {}
-        for band_id, band in self._loaded_bands.items():
-            with rasterio.open(band.path, "r") as src:
-                mean_values = [np.mean(mask(src, [polygon], crop=True)[0]) for polygon in geometries]
-                spectral_sig[band_id] = np.mean(mean_values)
-        return spectral_sig
-
 class Sentinel2(SatelliteImage):
-    
     def __init__(self, folder_of_satellite_image, date, annotation_shapefile=None):
         super().__init__()   
         self.base_folder = Path(folder_of_satellite_image)
         self._annotation_shapefile = annotation_shapefile
         self._band_files_by_id = self._initialize_bands_path()    
         self._scl = self._initialize_scl()
+        self.bad_pixel_ratio = self.calculate_bad_pixel_ratio()
         self.meta = self._update_metadata()
         self.date = date
     
@@ -195,47 +141,74 @@ class Sentinel2(SatelliteImage):
             self.annotation = Sentinel2Annotation(self, self._annotation_shapefile)
             return self.annotation
 
-    def calculate_bad_pixels(self):
+    def calculate_bad_pixel_ratio(self):
         scl_band = self._load_scl()
         bad_pixel_count = np.isin(scl_band.array, [0,1,2,3,8,9,10,11])
+        self.bad_pixel_ratio = np.mean(bad_pixel_count) * 100
         self._unload_scl()
-        return np.mean(bad_pixel_count) * 100
+        return self.bad_pixel_ratio
     
     def is_quality_acceptable(self, bad_pixel_ratio=15):
-        return self.calculate_bad_pixels() < bad_pixel_ratio
+        return self.bad_pixel_ratio < bad_pixel_ratio
 
     @band_management_decorator     
-    def calculate_ndvi(self):
+    def calculate_ndvi(self, save=True):
+        np.seterr(divide='ignore', invalid='ignore')
         red = self._loaded_bands["B04"].array
         nir = self._loaded_bands["B08"].array
-        np.seterr(divide='ignore', invalid='ignore')
-        return (nir.astype(float) - red.astype(float)) / (nir + red)
+        index = (nir.astype(float) - red.astype(float)) / (nir + red)
+        if save:
+            profile = {
+                'driver': 'GTiff',
+                'height': index.shape[1],
+                'width': index.shape[2],
+                'count': 1,
+                'dtype': index.dtype,
+                'crs': self.meta["B02"]["crs"],
+                'transform': self.meta["B02"]["transform"],
+                'compress': 'lzw',
+                'nodata': None
+            }
+            index_path = self.base_folder / f"S2_{self.date.strftime('%Y%m%d')}_NDVI.tif"
+            with rasterio.open(index_path, 'w', **profile) as dst:
+                dst.write(index)
+            self.add_band("NDVI", index_path)
+        return index
     
     @band_management_decorator
-    def calculate_ndwi(self):
+    def calculate_ndwi(self, save=True):
+        np.seterr(divide='ignore', invalid='ignore')
         nir = self._loaded_bands["B08"].array
         swir1 = self._loaded_bands["B11"].resample(10).array
-        np.seterr(divide='ignore', invalid='ignore')
-        return (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
-
-    def save_and_add_index(self, index_name, index):
-        sample_band_meta = self.meta["B02"]
-        profile = {
-            'driver': 'GTiff',
-            'height': index.shape[1],
-            'width': index.shape[2],
-            'count': 1,
-            'dtype': index.dtype,
-            'crs': sample_band_meta["crs"],
-            'transform': sample_band_meta["transform"],
-            'compress': 'lzw',
-            'nodata': None
-        }
-        index_path = self.base_folder / f"S2_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
-        with rasterio.open(index_path, 'w', **profile) as dst:
-            dst.write(index)
-        self.add_band(index_name, index_path)
-        return 
+        index = (nir.astype(float) -swir1.astype(float)) / (nir + swir1)
+        if save:
+            profile = {
+                'driver': 'GTiff',
+                'height': index.shape[1],
+                'width': index.shape[2],
+                'count': 1,
+                'dtype': index.dtype,
+                'crs': self.meta["B02"]["crs"],
+                'transform': self.meta["B02"]["transform"],
+                'compress': 'lzw',
+                'nodata': None
+            }
+            index_path = self.base_folder / f"S2_{self.date.strftime('%Y%m%d')}_NDWI.tif"
+            with rasterio.open(index_path, 'w', **profile) as dst:
+                dst.write(index)
+            self.add_band("NDWI", index_path)
+        return index
+    
+    @band_management_decorator
+    def calculate_spectral_signature(self, annotation_shapefile):
+        annotation = Sentinel2Annotation(annotation_shapefile)
+        geometries = annotation.get_geometries_as_list()
+        spectral_sig = {}
+        for band_id, band in self._loaded_bands.items():
+            with rasterio.open(band.path, "r") as src:
+                mean_values = [np.mean(mask(src, [polygon], crop=True)[0]) for polygon in geometries]
+                spectral_sig[band_id] = np.mean(mean_values)
+        return spectral_sig
 
     @band_management_decorator
     def plot_rgb(self):
@@ -273,36 +246,51 @@ class Sentinel1(SatelliteImage):
         return match.group(1) if match else None
 
     @band_management_decorator
-    def calculate_cross_ratio(self):
+    def calculate_cross_ratio(self, save=True):
         vv = self._loaded_bands["VV"]
         vh = self._loaded_bands["VH"]
-        return vh / vv
-    
-    @band_management_decorator
-    def calculate_polarization_difference(self):
-        vv = self._loaded_bands["VV"]
-        vh = self._loaded_bands["VH"]
-        return np.nan_to_num(vv-vh)
-    
-    def save_and_add_index(self, index_name, index):
-        sample_band_meta = self.meta["VV"]
-        profile = {
-            'driver': 'GTiff',
-            'height': index.shape[1],
-            'width': index.shape[2],
-            'count': 1,
-            'dtype': index.dtype,
-            'crs': sample_band_meta["crs"],
-            'transform': sample_band_meta["transform"],
-            'compress': 'lzw',
-            'nodata': None
-        }
-        index_path = self.base_folder / f"S1_{self.date.strftime('%Y%m%d')}_{index_name}.tif"
-        with rasterio.open(index_path, 'w', **profile) as dst:
-            dst.write(index)
-        self.add_band(index_name, index_path)
-        return 
+        index = vh/vv
+        if save:
+            profile = {
+                'driver': 'GTiff',
+                'height': index.shape[1],
+                'width': index.shape[2],
+                'count': 1,
+                'dtype': index.dtype,
+                'crs': self.meta["VV"]["crs"],
+                'transform': self.meta["VV"]["transform"],
+                'compress': 'lzw',
+                'nodata': None
+            }
+            index_path = self.base_folder / f"S1_{self.date.strftime('%Y%m%d')}_CR.tif"
+            with rasterio.open(index_path, 'w', **profile) as dst:
+                dst.write(index)
+            self.add_band("PD", index_path)
+        return index
 
+    @band_management_decorator
+    def calculate_polarization_difference(self, save=True):
+        vv = self._loaded_bands["VV"]
+        vh = self._loaded_bands["VH"]
+        index = np.nan_to_num(vv-vh)
+        if index:
+            profile = {
+                'driver': 'GTiff',
+                'height': index.shape[1],
+                'width': index.shape[2],
+                'count': 1,
+                'dtype': index.dtype,
+                'crs': self.meta["VV"]["crs"],
+                'transform': self.meta["VV"]["transform"],
+                'compress': 'lzw',
+                'nodata': None
+            }
+            index_path = self.base_folder / f"S1_{self.date.strftime('%Y%m%d')}_PD.tif"
+            with rasterio.open(index_path, 'w', **profile) as dst:
+                dst.write(index)
+            self.add_band("PD", index_path)
+        return index
+    
     def plot_cross_ratio(self):
         try:
             cr = np.moveaxis(self.load_band("CR"),0,-1)
@@ -312,5 +300,3 @@ class Sentinel1(SatelliteImage):
             plt.savefig("cr.png")
         except ValueError:
             raise ValueError(f"An error occurred while plotting cross ratio: {ValueError}. Please make sure that specific index is calcluated and added to bands.")
-
-
