@@ -1,11 +1,9 @@
-import os
 import numpy as np
 import rasterio
 from matplotlib import pyplot as plt
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from pathlib import Path 
-from .utils import pad_patch, update_patch_transform
 
 class SatelliteBand:
     """

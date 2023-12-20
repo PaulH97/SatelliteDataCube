@@ -1,5 +1,4 @@
 import rasterio
-from .utils import patchify
 import geopandas as gpd
 from .band import SatelliteBand
 from rasterio.features import geometry_mask
@@ -28,7 +27,7 @@ class SatelliteImageAnnotation:
     def get_geometries_as_list(self):
         self._repair_geometries()
         return self.df["geometry"].to_list()
-
+ 
     def plot(self):
         return self.band.plot()
 
@@ -55,7 +54,7 @@ class Sentinel1Annotation(SatelliteImageAnnotation):
         self.satellite_image = satellite_image
         self.band = self._rasterize_annotation()
 
-    def _rasterize_annotation(self):     
+    def _rasterize_annotation(self, resolution):     
         geometries = self.get_geometries_as_list()
         s1_vv_meta = self.satellite_image.meta["VV"]
         s1_vv_meta['dtype'] = 'uint8'

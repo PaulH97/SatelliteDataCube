@@ -5,7 +5,6 @@ import numpy as np
 from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
-from .annotation import SatelliteImageAnnotation
 
 def create_patches_with_metadata(source_array, patch_size, source_array_metadata, padding=True):
     """Utility function to create patches from a source array."""
@@ -96,7 +95,6 @@ def contrast_stretching_precentile(image, percentiles=(2,98)):
         img_cs[...,band] = (image[...,band] - img_min) / (img_max - img_min)
     return img_cs
 
-
 # def create_patches(self, patch_size, padding=True):
 #     num_bands, size_x, size_y = self.array.shape
 #     patches = []
@@ -149,7 +147,7 @@ def sanity_check(patches):
     for i in range(nrows):
         if i == 0: 
             for j in range(timesteps):
-                img_data = contrastStreching(img[j,:,:,:3])
+                img_data = contrast_stretching_minmax(img[j,:,:,:3])
                 axs[i][j].imshow(img_data)  
                 axs[i][j].axis('off')
             
@@ -167,28 +165,28 @@ def sanity_check(patches):
     plt.show()
     return
 
-def filter_patches(self, patches):      
-    satellite_images_patches = [] # list of np.arrays for each image one array
-    for patch in patches:
-        print(f"-> Start with satellite image of date {date}")
-        patches = satellite_image.create_patches(patch_size) # returns list of patches
-        satellite_images_patches.append(np.array(patches)) # NxCxhxW
-    satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
-    return satellite_images_patches
+# def filter_patches(self, patches):      
+#     satellite_images_patches = [] # list of np.arrays for each image one array
+#     for patch in patches:
+#         print(f"-> Start with satellite image of date {date}")
+#         patches = satellite_image.create_patches(patch_size) # returns list of patches
+#         satellite_images_patches.append(np.array(patches)) # NxCxhxW
+#     satellite_images_patches = np.stack(satellite_images_patches, axis=1) # convert it to an array of pattern NxTxCxHxW 
+#     return satellite_images_patches
 
-def filter_patches(global_mask, patches, class_values, class_ratio=(100,0), seed=42):
-    random.seed(seed)
-    class_ratio= [i / 100 for i in class_ratio]
-    patch_size = next(iter(patches.values())).shape[-1]
-    global_mask_patches = patchify(global_mask,patch_size)
-    class_indices = [idx for idx, patch in enumerate(global_mask_patches) if np.any(np.isin(patch, class_values))]
-    no_class_indices = [idx for idx, patch in enumerate(global_mask_patches) if not np.any(np.isin(patch, class_values))]
-    num_noclass_patches = int((len(class_indices) / class_ratio[0]) * class_ratio[1])
-    no_class_indices = random.sample(no_class_indices, num_noclass_patches)
-    filtered_patches = {}
-    for source, patchArray in patches.items():
-        filtered_patches[source] = patchArray[class_indices + no_class_indices] # for masks it can happen that no of the selected masks of si contains GT 
-    return filtered_patches
+# def filter_patches(global_mask, patches, class_values, class_ratio=(100,0), seed=42):
+#     random.seed(seed)
+#     class_ratio= [i / 100 for i in class_ratio]
+#     patch_size = next(iter(patches.values())).shape[-1]
+#     global_mask_patches = patchify(global_mask,patch_size)
+#     class_indices = [idx for idx, patch in enumerate(global_mask_patches) if np.any(np.isin(patch, class_values))]
+#     no_class_indices = [idx for idx, patch in enumerate(global_mask_patches) if not np.any(np.isin(patch, class_values))]
+#     num_noclass_patches = int((len(class_indices) / class_ratio[0]) * class_ratio[1])
+#     no_class_indices = random.sample(no_class_indices, num_noclass_patches)
+#     filtered_patches = {}
+#     for source, patchArray in patches.items():
+#         filtered_patches[source] = patchArray[class_indices + no_class_indices] # for masks it can happen that no of the selected masks of si contains GT 
+#     return filtered_patches
 
 def save_patches(patches, patches_folder=""):
     patches_folder = os.path.join(os.getcwd(),"patches") if not patches_folder else patches_folder

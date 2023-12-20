@@ -3,9 +3,9 @@ import rasterio
 from matplotlib import pyplot as plt
 import re
 from rasterio.mask import mask
-from .utils import patchify, band_management_decorator, save_index
+from .utils import band_management_decorator
 from .band import SatelliteBand
-from .annotation import Sentinel1Annotation, Sentinel2Annotation
+from .annotation import Sentinel2Annotation
 from pathlib import Path
 
 class SatelliteImage:
@@ -233,15 +233,15 @@ class Sentinel1(SatelliteImage):
     
     def _initialize_bands_path(self):
         bands_path = {}
-        file_paths = [entry for entry in self.base_folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
+        file_paths = [entry for entry in self.base_folder.iterdir() if entry.is_file() and entry.suffix == '.tiff']
         for band_path in file_paths:
-            band_id = self._extract_band_info(band_path)
+            band_id = self._extract_band_info(str(band_path))
             if band_id:       
-                bands_path[band_id] = band_path
+                bands_path[band_id.upper()] = band_path
         return bands_path
 
     def _extract_band_info(self, file_path): 
-        pattern = r"(VV|VH)"
+        pattern = r"(vh|vv)"
         match = re.search(pattern, file_path)
         return match.group(1) if match else None
 

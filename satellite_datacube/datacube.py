@@ -1,12 +1,7 @@
 import os
-import numpy as np
-import geopandas as gpd
 from matplotlib import pyplot as plt
-from .utils import patchify, select_equally_spaced_items
 from .image import Sentinel1, Sentinel2
 from .annotation import Sentinel2Annotation, Sentinel1Annotation
-import random
-import pandas as pd
 from datetime import datetime
 from glob import glob
 from pathlib import Path
@@ -182,8 +177,8 @@ class Sentinel1DataCube(SatelliteDataCube):
      
     def _load_annotation(self):
         annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-        s2_satellite_image = next(iter(self.images_by_date.values()))
-        return Sentinel2Annotation(s2_satellite_image, annotation_shapefile)
+        s1_satellite_image = next(iter(self.images_by_date.values()))
+        return Sentinel1Annotation(s1_satellite_image, annotation_shapefile)
     
     def _load_satellite_images(self):
         images_by_date = {}
@@ -191,8 +186,8 @@ class Sentinel1DataCube(SatelliteDataCube):
             if satellite_image_folder.is_dir():
                 date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
                 images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, date_satellite_image)
-                satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
-                return satellite_images_by_date_sorted
+        satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
+        return satellite_images_by_date_sorted
 
     def _find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
         pass
