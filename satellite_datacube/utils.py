@@ -5,6 +5,27 @@ import numpy as np
 from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
+import pandas as pd
+
+def transform_spectal_signature(spectral_signature_by_dates):
+    # Identify all unique bands and landslide_ids
+    bands = set()
+    landslide_ids = set()
+    for date, landslides in spectral_signature_by_dates.items():
+        for landslide in landslides:
+            bands.update(landslide.keys() - {'landslide_id'})
+            landslide_ids.add(landslide['landslide_id'])
+
+    # Initialize a DataFrame for each band
+    dfs = {band: pd.DataFrame(index=sorted(landslide_ids), columns=sorted(spectral_signature_by_dates.keys())) for band in bands}
+    # Populate the DataFrames
+    for date, landslides in spectral_signature_by_dates.items():
+        for landslide in landslides:
+            landslide_id = landslide['landslide_id']
+            for band in bands:
+                if band in landslide:
+                    dfs[band].loc[landslide_id, date] = landslide[band]
+    return pd
 
 def create_patches_with_metadata(source_array, patch_size, source_array_metadata, padding=True):
     """Utility function to create patches from a source array."""

@@ -1,10 +1,14 @@
 import os
 from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
-from .annotation import Sentinel2Annotation, Sentinel1Annotation
+from .annotation import SatelliteImageAnnotation
+from .utils import transform_spectal_signature
 from datetime import datetime
 from glob import glob
 from pathlib import Path
+import rasterio
+from rasterio.mask import mask
+import pandas as pd
 
 # TODO: Update the function with storing the shapefile in a varibale -> creating mask with that and not using the annotation.tif?
 # maybe i should select timeseries and store it not as instance variable?
@@ -75,13 +79,14 @@ class SatelliteDataCube:
         self.selected_images_by_date = {date: self.images_by_date[date] for date in dates if date in self.images_by_date}
         return self.selected_images_by_date
 
-    def create_spectral_signature(self, annotation_shapefile):
+    def create_spectral_signature(self, indizes=False):
         datacube_spectral_sig = {}
-        for image_date, image in self.images_by_date.items():
-            image_spectral_sig = image.calculate_spectral_signature(annotation_shapefile)
-            datacube_spectral_sig[image_date] = image_spectral_sig
-        return datacube_spectral_sig
-    
+        for image_date, image in self.selected_images_by_date.items():
+            annotations_speSignature = image.create_spectral_signature(annotation=self.annotation, indizes=indizes)
+            datacube_spectral_sig[image_date] = annotations_speSignature
+        self.spectral_signature = transform_spectal_signature(datacube_spectral_sig) # self.spectral_signature['B02'])
+        return self.spectral_signature
+   
     def plot_spectral_signature(self, spectral_signature, output_folder=""):
         bands = list(spectral_signature[list(spectral_signature.keys())[0]].keys())
         fig, ax = plt.subplots(figsize=(10,6))
@@ -114,8 +119,7 @@ class Sentinel2DataCube(SatelliteDataCube):
      
     def _load_annotation(self):
         annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-        s2_satellite_image = next(iter(self.images_by_date.values()))
-        return Sentinel2Annotation(s2_satellite_image, annotation_shapefile)
+        return SatelliteImageAnnotation(annotation_shapefile)
     
     def _load_satellite_images(self):
         images_by_date = {}
@@ -123,8 +127,8 @@ class Sentinel2DataCube(SatelliteDataCube):
             if satellite_image_folder.is_dir():
                 date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
                 images_by_date[date_satellite_image] = Sentinel2(satellite_image_folder, date_satellite_image)
-                satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
-                return satellite_images_by_date_sorted
+        satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
+        return satellite_images_by_date_sorted
 
     def _find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
         """Search for the nearest good quality image before and after the current date. 
@@ -161,8 +165,16 @@ class Sentinel2DataCube(SatelliteDataCube):
                     updated_images_by_date[neighbour_satellite_image.date] = neighbour_satellite_image
             self.selected_images_by_date = updated_images_by_date
         except ValueError:
-            raise ValueError(f"An error occurred while updating the satellite images of data-cube:{ValueError}. 
-                             Please make sure that you first select images with the functions select_images_by date() or select_imgaes_by_date().")
+            raise ValueError("An error occurred while updating the satellite images of data-cube.Please make sure that you first select images with the functions select_images_by date() or select_imgaes_by_date().")
+        return 
+    
+    def select_images_with_badPixelRatio(self, bad_pixel_ratio):
+        selected_dates = []
+        for date, image in self.images_by_date.items():
+            image_bad_pixel_ratio = image.calculate_bad_pixel_ratio()
+            if image_bad_pixel_ratio <= bad_pixel_ratio:
+                selected_dates.append(date)
+        self.selected_images_by_date = {date: self.images_by_date[date] for date in selected_dates if date in self.images_by_date}
         return 
             
 class Sentinel1DataCube(SatelliteDataCube):
@@ -177,8 +189,7 @@ class Sentinel1DataCube(SatelliteDataCube):
      
     def _load_annotation(self):
         annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-        s1_satellite_image = next(iter(self.images_by_date.values()))
-        return Sentinel1Annotation(s1_satellite_image, annotation_shapefile)
+        return SatelliteImageAnnotation(annotation_shapefile)
     
     def _load_satellite_images(self):
         images_by_date = {}

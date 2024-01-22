@@ -5,12 +5,12 @@ import re
 from rasterio.mask import mask
 from .utils import band_management_decorator
 from .band import SatelliteBand
-from .annotation import Sentinel2Annotation
+from .annotation import SatelliteImageAnnotation
 from pathlib import Path
 
 class SatelliteImage:
     def __init__(self):
-        self._band_files_by_id = {}
+        self.band_files_by_id = {}
         self._loaded_bands = {}
         self.annotation = None
         self.array = None
@@ -19,7 +19,7 @@ class SatelliteImage:
 
     def __getitem__(self, band_id):
         if band_id not in self._loaded_bands:
-            band_path = self._band_files_by_id.get(band_id)
+            band_path = self.band_files_by_id.get(band_id)
             if band_path:
                 self._loaded_bands[band_id] = SatelliteBand(band_id, band_path)
             else:
@@ -34,11 +34,14 @@ class SatelliteImage:
         self.meta = satellite_image_meta
         return self.meta     
 
+    def get_band(self, band_id):
+        return self.band_files_by_id[band_id]
+        
     def add_band(self, band_id, file_path):
         """
         Add a new SatelliteBand object to the bands dictionary.
         """
-        self._band_files_by_id[band_id] = file_path
+        self.band_files_by_id[band_id] = file_path
         self._update_metadata()
         return
 
@@ -51,7 +54,7 @@ class SatelliteImage:
             SatelliteBand: The loaded SatelliteBand object.
         """
         if band_id not in self._loaded_bands:
-            band_path = self._band_files_by_id.get(band_id)
+            band_path = self.band_files_by_id.get(band_id)
             if band_path:
                 self._loaded_bands[band_id] = SatelliteBand(band_id, band_path)
             else:
@@ -66,18 +69,18 @@ class SatelliteImage:
         Load all bands specified in the band_paths.
         This method iterates through all the band paths and loads each band.
         """
-        for band_id in self._band_files_by_id.keys():
+        for band_id in self.band_files_by_id.keys():
             self.load_band(band_id)
         return self._loaded_bands
     
     def unload_all_bands(self):
         self._loaded_bands = {}
-
+    
     @band_management_decorator
     def resample(self, resolution):
         for band_id, band in self._loaded_bands.items():
             band = band.resample(resolution)
-            self._band_files_by_id[band_id] = band.path
+            self.band_files_by_id[band_id] = band.path
         self._update_metadata()
         return self
     
@@ -91,14 +94,12 @@ class SatelliteImage:
         return self
     
 class Sentinel2(SatelliteImage):
-    def __init__(self, folder_of_satellite_image, date, annotation_shapefile=None):
+    def __init__(self, folder_of_satellite_image, date):
         super().__init__()   
         self.base_folder = Path(folder_of_satellite_image)
-        self._annotation_shapefile = annotation_shapefile
-        self._band_files_by_id = self._initialize_bands_path()    
-        self._scl = self._initialize_scl()
-        self.bad_pixel_ratio = self.calculate_bad_pixel_ratio()
-        self.meta = self._update_metadata()
+        self.band_files_by_id = self._initialize_bands_path()    
+        self.scl_path = self._initialize_scl()
+        self.bad_pixel_ratio = None
         self.date = date
     
     def _initialize_bands_path(self):
@@ -111,9 +112,7 @@ class Sentinel2(SatelliteImage):
         return self._sort_band_paths(bands_path)
     
     def _initialize_scl(self):
-        scl_file = list(self.base_folder.glob('*SCL.tif'))[0]
-        self._scl = {"SCL": scl_file}
-        return self._scl
+        return list(self.base_folder.glob('*SCL.tif'))[0]
 
     def _sort_band_paths(self, bands_path):
         sorted_keys = sorted(bands_path.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
@@ -130,25 +129,17 @@ class Sentinel2(SatelliteImage):
         match = re.match(r"B(\d+)", key)
         return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
     
-    def _load_scl(self):
-        return SatelliteBand("SCL", self._scl["SCL"])
-
-    def _unload_scl(self):
-        self._scl = {}
-
-    def _load_annotation(self):
-        if self._annotation_shapefile:
-            self.annotation = Sentinel2Annotation(self, self._annotation_shapefile)
-            return self.annotation
-
     def calculate_bad_pixel_ratio(self):
-        scl_band = self._load_scl()
-        bad_pixel_count = np.isin(scl_band.array, [0,1,2,3,8,9,10,11])
-        self.bad_pixel_ratio = np.mean(bad_pixel_count) * 100
-        self._unload_scl()
-        return self.bad_pixel_ratio
-    
+        if self.scl_path:
+            with rasterio.open(self.scl_path) as src:
+                slc = src.read()
+            bad_pixel_count = np.isin(slc, [0,1,2,3,8,9,10,11])
+            self.bad_pixel_ratio = np.mean(bad_pixel_count) * 100
+            return self.bad_pixel_ratio
+
     def is_quality_acceptable(self, bad_pixel_ratio=15):
+        if not self.bad_pixel_ratio:
+            self.calculate_bad_pixel_ratio()
         return self.bad_pixel_ratio < bad_pixel_ratio
 
     @band_management_decorator     
@@ -173,6 +164,7 @@ class Sentinel2(SatelliteImage):
             with rasterio.open(index_path, 'w', **profile) as dst:
                 dst.write(index)
             self.add_band("NDVI", index_path)
+            return self.get
         return index
     
     @band_management_decorator
@@ -198,17 +190,22 @@ class Sentinel2(SatelliteImage):
                 dst.write(index)
             self.add_band("NDWI", index_path)
         return index
-    
+     
     @band_management_decorator
-    def calculate_spectral_signature(self, annotation_shapefile):
-        annotation = Sentinel2Annotation(annotation_shapefile)
-        geometries = annotation.get_geometries_as_list()
-        spectral_sig = {}
-        for band_id, band in self._loaded_bands.items():
-            with rasterio.open(band.path, "r") as src:
-                mean_values = [np.mean(mask(src, [polygon], crop=True)[0]) for polygon in geometries]
-                spectral_sig[band_id] = np.mean(mean_values)
-        return spectral_sig
+    def create_spectral_signature(self, annotation, indizes=False):
+        if indizes:
+            self.calculate_ndvi()
+            self.calculate_ndwi()
+        annotations_speSignature = []
+        for index, row in annotation.df.iterrows():
+            landslide_row_data = {"landslide_id": row["id"]}
+            for band_id, band in self._loaded_bands.items():
+                if band_id in use_bands:
+                    with rasterio.open(band.path) as src:
+                        out_image, out_transform = mask(src, [row["geometry"]], crop=True)
+                        landslide_row_data[band_id] = out_image.mean()
+            annotations_speSignature.append(landslide_row_data)
+        return annotations_speSignature
 
     @band_management_decorator
     def plot_rgb(self):
@@ -227,8 +224,7 @@ class Sentinel1(SatelliteImage):
     def __init__(self, folder_of_satellite_image, date):
         super().__init__()   
         self.base_folder = Path(folder_of_satellite_image)
-        self._band_files_by_id = self._initialize_bands_path()    
-        self.meta = self._update_metadata()
+        self.band_files_by_id = self._initialize_bands_path()    
         self.date = date
     
     def _initialize_bands_path(self):
