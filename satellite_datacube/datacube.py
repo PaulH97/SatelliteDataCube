@@ -75,11 +75,32 @@ class SatelliteDataCube:
         self.selected_images_by_date = {date: self.images_by_date[date] for date in selected_dates if date in self.images_by_date}
         return 
     
+    def select_images_per_month(self, number_of_images_per_month):
+        # Extract start and end year
+        min_year = min(self.images_by_date.keys()).year
+        max_year = max(self.images_by_date.keys()).year
+        
+        selected_images_per_month = {}
+        for year in range(min_year, max_year, 1):
+            for month in range(1,12):
+                images_month = {date:image for date, image in self.images_by_date.items() if date.year == year and date.month == month}
+                images_month_badPixeRatio = {date: image.calculate_bad_pixel_ratio() for date, image in images_month.items()}
+                selected_images_pre_month = {date: self.images_by_date[date] for date, badPixelRatio in sorted(images_month_badPixeRatio.items(), key=lambda item: item[1])[:number_of_images_per_month]}
+        self.selected_images_by_date = selected_images_per_month
+        return self.selected_images_by_date
+    
     def select_images_with_dates(self, dates):
         self.selected_images_by_date = {date: self.images_by_date[date] for date in dates if date in self.images_by_date}
         return self.selected_images_by_date
 
-    def create_spectral_signature(self, indizes=False):
+    def create_spectral_signature_of_single_annotation(self, annotation_id, indizes=False):
+        ann_dc_spectral_sig = {}
+        for image_date, image in self.selected_images_by_date.items():
+            ann_spetral_signature = image.create_spectral_signature_of_single_annotation(annotation_id, indizes=indizes)
+            ann_dc_spectral_sig[image_date] = ann_spetral_signature
+        return ann_dc_spectral_sig
+
+    def create_spectral_signature_of_all_annotations(self, indizes=False):
         datacube_spectral_sig = {}
         for image_date, image in self.selected_images_by_date.items():
             annotations_speSignature = image.create_spectral_signature(annotation=self.annotation, indizes=indizes)
@@ -114,19 +135,15 @@ class Sentinel2DataCube(SatelliteDataCube):
         self.satellite = "sentinel-2"
         self.satellite_images_folder = self.base_folder / self.satellite
         self.images_by_date = self._load_satellite_images()
-        self.annotation = self._load_annotation()
         self._print_initialization_info()
      
-    def _load_annotation(self):
-        annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-        return SatelliteImageAnnotation(annotation_shapefile)
-    
     def _load_satellite_images(self):
         images_by_date = {}
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
                 date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
-                images_by_date[date_satellite_image] = Sentinel2(satellite_image_folder, date_satellite_image)
+                annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
+                images_by_date[date_satellite_image] = Sentinel2(satellite_image_folder, annotation_shapefile, date_satellite_image)
         satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
         return satellite_images_by_date_sorted
 
@@ -167,7 +184,7 @@ class Sentinel2DataCube(SatelliteDataCube):
         except ValueError:
             raise ValueError("An error occurred while updating the satellite images of data-cube.Please make sure that you first select images with the functions select_images_by date() or select_imgaes_by_date().")
         return 
-    
+        
     def select_images_with_badPixelRatio(self, bad_pixel_ratio):
         selected_dates = []
         for date, image in self.images_by_date.items():
@@ -176,7 +193,7 @@ class Sentinel2DataCube(SatelliteDataCube):
                 selected_dates.append(date)
         self.selected_images_by_date = {date: self.images_by_date[date] for date in selected_dates if date in self.images_by_date}
         return 
-            
+
 class Sentinel1DataCube(SatelliteDataCube):
     def __init__(self, base_folder):
         super().__init__()

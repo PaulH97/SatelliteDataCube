@@ -7,15 +7,12 @@ from rasterio.features import geometry_mask
 class SatelliteImageAnnotation:
     def __init__(self, shapefile_path):
         self.path = shapefile_path
-        self.df = self._load_dataframe()
+        self.df = None
         self.band = None
-        self._repair_geometries()
     	
-    def _load_dataframe(self):
-        return gpd.read_file(self.path) 
-
-    def _repair_geometries(self):
-        geometries = self.df["geometry"].to_list()
+    def load_dataframe(self):
+        df = gpd.read_file(self.path) 
+        geometries = df["geometry"].to_list()
         repaired_geometries = []
         for geom in geometries:
             if geom:
@@ -23,10 +20,16 @@ class SatelliteImageAnnotation:
                     repaired_geometries.append(geom)
                 else:
                     repaired_geometries.append(geom.buffer(0))
+        self.df = df
         self.df["geometry"] = repaired_geometries
-        return  
+        return self.df
     
+    def unload_dataframe(self):
+        self.df = None
+        return
+   
     def get_geometries_as_list(self):
+        self.load_dataframe()
         return self.df["geometry"].to_list()
  
     def rasterize(self, muster_meta):     

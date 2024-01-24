@@ -6,6 +6,34 @@ from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
 import pandas as pd
+import re
+
+def find_buffer_with_specific_scl_data(polygon, opened_scl_raster, scl_keys):
+    buffer_distance = 10
+    while buffer_distance <= 100:
+        polygon_buffered = polygon.buffer(buffer_distance)
+        polygon_around_annotation = polygon_buffered.difference(polygon)
+        around_ann_scl_data, _ = mask(opened_scl_raster, [polygon_around_annotation], crop=True)
+        around_ann_vegetation_data = np.isin(around_ann_scl_data, scl_keys) 
+        if np.any(around_ann_vegetation_data): 
+            break
+        buffer_distance += 10
+    return polygon_around_annotation, around_ann_vegetation_data
+
+def sort_band_paths(bands_path):
+    sorted_keys = sorted(bands_path.keys(), key=extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
+    sorted_bands_paths = {k: bands_path[k] for k in sorted_keys}
+    return sorted_bands_paths
+
+def extract_band_info(file_path):
+    file_name = file_path.name  
+    pattern = r"(B\d+[A-Z]?)\.tif"
+    match = re.search(pattern, file_name)
+    return match.group(1) if match else None
+        
+def extract_band_number(key):
+    match = re.match(r"B(\d+)", key)
+    return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
 
 def transform_spectal_signature(spectral_signature_by_dates):
     # Identify all unique bands and landslide_ids
