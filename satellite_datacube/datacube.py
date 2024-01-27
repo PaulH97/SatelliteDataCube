@@ -198,10 +198,9 @@ class Sentinel1DataCube(SatelliteDataCube):
     def __init__(self, base_folder):
         super().__init__()
         self.base_folder = Path(base_folder)
-        self.satellite = "sentinel-1"
+        self.satellite = "sentinel-1-nrb"
         self.satellite_images_folder = self.base_folder / self.satellite
         self.images_by_date = self._load_satellite_images()
-        self.annotation = self._load_annotation()
         self._print_initialization_info()
      
     def _load_annotation(self):
@@ -213,7 +212,8 @@ class Sentinel1DataCube(SatelliteDataCube):
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
                 date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
-                images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, date_satellite_image)
+                annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
+                images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, annotation_shapefile, date_satellite_image)
         satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
         return satellite_images_by_date_sorted
 

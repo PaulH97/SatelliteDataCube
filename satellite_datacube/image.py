@@ -3,10 +3,11 @@ import rasterio
 from matplotlib import pyplot as plt
 import re
 from rasterio.mask import mask
-from .utils import band_management_decorator, extract_band_info, sort_band_paths, find_buffer_with_specific_scl_data
+from .utils import band_management_decorator, find_buffer_with_specific_scl_data
 from .band import SatelliteBand
 from .annotation import SatelliteImageAnnotation
 from pathlib import Path
+import json
 
 class SatelliteImage:
     def __init__(self):
@@ -96,13 +97,30 @@ class Sentinel2(SatelliteImage):
         bands_path = {}
         file_paths = [entry for entry in self.band_folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
         for band_path in file_paths:
-            band_id = extract_band_info(band_path)
+            band_id = self._extract_band_info(band_path)
             if band_id:       
                 bands_path[band_id] = band_path
-        return sort_band_paths(bands_path)
+        return self._sort_band_paths(bands_path)
     
     def _initialize_scl(self):
         return list(self.band_folder.glob('*SCL.tif'))[0]
+
+    def _sort_band_paths(self, bands_path):
+        sorted_keys = sorted(bands_path.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
+        sorted_bands_paths = {k: bands_path[k] for k in sorted_keys}
+        return sorted_bands_paths
+    
+    @staticmethod
+    def _extract_band_info(file_path):
+        file_name = file_path.name  
+        pattern = r"(B\d+[A-Z]?)\.tif"
+        match = re.search(pattern, file_name)
+        return match.group(1) if match else None
+    
+    @staticmethod        
+    def _extract_band_number(key):
+        match = re.match(r"B(\d+)", key)
+        return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
 
     def calculate_bad_pixel_ratio(self):
         if self.scl_path:
@@ -263,15 +281,23 @@ class Sentinel2(SatelliteImage):
     
 class Sentinel1(SatelliteImage):
      
-    def __init__(self, folder_of_satellite_image, date):
+    def __init__(self, folder_of_satellite_image, annotation_shp, date):
         super().__init__()   
         self.band_folder = Path(folder_of_satellite_image)
-        self.band_files_by_id = self._initialize_bands_path()    
+        self.band_files_by_id = self._initialize_bands_path()   
+        self.annotation = SatelliteImageAnnotation(annotation_shp) 
+        self.meta = self._load_meta()
         self.date = date
+
+    def _load_meta(self):
+        meta_json_path = [entry for entry in self.band_folder.iterdir() if entry.is_file() and entry.suffix == '.json'][0]
+        with open(meta_json_path, "r") as file:
+            meta = json.load(file)
+        return meta
     
     def _initialize_bands_path(self):
         bands_path = {}
-        file_paths = [entry for entry in self.band_folder.iterdir() if entry.is_file() and entry.suffix == '.tiff']
+        file_paths = [entry for entry in self.band_folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
         for band_path in file_paths:
             band_id = self._extract_band_info(str(band_path))
             if band_id:       
@@ -282,6 +308,34 @@ class Sentinel1(SatelliteImage):
         pattern = r"(vh|vv)"
         match = re.search(pattern, file_path)
         return match.group(1) if match else None
+
+    @band_management_decorator
+    def extract_band_data_of_all_annotations(self, band_ids):
+        band_files = {band_id: rasterio.open(self._loaded_bands[band_id].path) for band_id in band_ids if band_id in self._loaded_bands}
+        anns_band_data = {}
+        annotation_df = self.annotation.load_dataframe()
+        for index, row in annotation_df.iterrows():
+            geometry_bounds = row["geometry"].bounds
+            ann_bands_data = {}
+            for band_id, band in band_files.items():
+                # If the geometry is not within the raster bounds, continue with the next annotation
+                if not (band.bounds[0] <= geometry_bounds[2] and band.bounds[2] >= geometry_bounds[0] 
+                        and band.bounds[1] <= geometry_bounds[3] and band.bounds[3] >= geometry_bounds[1]):
+                    continue
+                ann_band_data, _ = mask(band, [row["geometry"]], crop=True)   
+                if 'nodata' in band.meta and band.meta['nodata'] is not None:
+                    ann_band_masked_data = np.ma.masked_values(ann_band_data, band.meta['nodata'])
+                    mean_value = float(ann_band_masked_data.mean()) if ann_band_masked_data.count() > 0 else -9999.0
+                else:
+                    mean_value = float(ann_band_data.mean()) if ann_band_data.size > 0 else -9999.0
+                ann_bands_data[band_id] = mean_value
+            
+            if ann_bands_data:
+                ann_bands_data["pixel_count"] = ann_band_data.size
+                ann_bands_data["flight_direction"] = self.meta["properties"]["sat:orbit_state"]
+                anns_band_data[row["id"]] = ann_bands_data
+        [band.close() for band in band_files.values()]
+        return anns_band_data
 
     @band_management_decorator
     def calculate_cross_ratio(self, save=True):
