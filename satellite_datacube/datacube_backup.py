@@ -4,7 +4,7 @@ import rasterio
 from matplotlib import pyplot as plt
 import json
 from .utils import patchify
-from .image import Sentinel2
+from .image_backup import Sentinel2
 import random
 
 # TODO:

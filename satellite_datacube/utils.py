@@ -6,19 +6,55 @@ from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
 import pandas as pd
-import re
+from satellite_datacube.annotation import SatelliteImageAnnotation
 
-def find_buffer_with_specific_scl_data(polygon, opened_scl_raster, scl_keys):
+
+
+def patchify_mask(image, patch_size, **kwargs):
+    """
+    Creates patches from satellite image annotations (masks).
+
+    Args:
+        image: The satellite image object related to the annotation.
+        patch_size: The size of each patch.
+        **kwargs: Additional keyword arguments, specifically 'global_ann_file' indicating the global annotation shapefile path.
+    """
+
+
+def extract_band_data_for_annotation(annotation, band_files):
+    ''' Process each opened band for the given annotation '''
+    ann_bands_data = {}
+    for band_id, band in band_files.items():
+        ann_band_data, _ = mask(band, [annotation["geometry"]], crop=True)
+        if band_id == "SCL":
+            unique, counts = np.unique(ann_band_data.flatten(), return_counts=True)
+            ann_bands_data[band_id] = {int(u): int(c) for u, c in zip(unique, counts)}
+        elif band_id in ["NDVI", "NDWI"]:          
+            ann_bands_data[band_id] = np.mean(ann_band_data[ann_band_data>0]) if np.any(ann_band_data>0) else 0
+        else:
+            ann_bands_data[band_id] = ann_band_data.mean()
+    return ann_bands_data
+
+def extract_nearby_ndvi_data(annotation, band_files):
+    polygon_around_annotation, around_ann_scl_mask = get_scl_mask_of_buffered_polygon(annotation["geometry"], band_files["SCL"], scl_keys=[4])            
+    ann_ndvi, _ = mask(band_files["NDVI"], [polygon_around_annotation], crop=True)
+    ann_ndvi_masked = ann_ndvi[around_ann_scl_mask] # only use values where vegetation is in the scl layer
+    if not np.any(around_ann_scl_mask):
+        return 0
+    else:
+        return np.mean(ann_ndvi_masked) 
+
+def get_scl_mask_of_buffered_polygon(polygon, opened_scl_raster, scl_keys):
     buffer_distance = 10
     while buffer_distance <= 100:
         polygon_buffered = polygon.buffer(buffer_distance)
         polygon_around_annotation = polygon_buffered.difference(polygon)
         around_ann_scl_data, _ = mask(opened_scl_raster, [polygon_around_annotation], crop=True)
-        around_ann_vegetation_data = np.isin(around_ann_scl_data, scl_keys) 
-        if np.any(around_ann_vegetation_data): 
+        around_ann_scl_mask = np.isin(around_ann_scl_data, scl_keys) 
+        if np.any(around_ann_scl_mask): 
             break
         buffer_distance += 10
-    return polygon_around_annotation, around_ann_vegetation_data
+    return polygon_around_annotation, around_ann_scl_mask
 
 def transform_spectal_signature(spectral_signature_by_dates):
     # Identify all unique bands and landslide_ids
@@ -39,28 +75,7 @@ def transform_spectal_signature(spectral_signature_by_dates):
                 if band in landslide:
                     dfs[band].loc[landslide_id, date] = landslide[band]
     return pd
-
-def create_patches_with_metadata(source_array, patch_size, source_array_metadata, padding=True):
-    """Utility function to create patches from a source array."""
-    num_bands, size_x, size_y = source_array
-    patches_with_metadata = []
-    for i in range(0, size_x, patch_size):
-        for j in range(0, size_y, patch_size):
-            patch = source_array[:num_bands, i:i+patch_size, j:j+patch_size]
-            # Check if patch needs padding
-            if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
-                patch = pad_patch(patch, patch_size)
-            elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
-                continue  # Skip patches that are smaller than patch_size when padding is False
-            # Update metadata for patch
-            patch_transform= update_patch_transform(source_array_metadata, i, j)
-            patch_metadata = source_array_metadata
-            patch_metadata["transform"] = patch_transform
-            patch_metadata["count"] = num_bands
-            patch_metadata['width'], patch_metadata['height'] = patch_size, patch_size
-            patches_with_metadata.append((patch, patch_metadata))
-    return patches_with_metadata
-
+        
 def pad_patch(patch, patch_size):
     # Determine how much padding is needed
     pad_x = patch_size - patch.shape[1]
@@ -68,6 +83,17 @@ def pad_patch(patch, patch_size):
     # Here, we're padding with zeros - you can adjust the 'constant_values' parameter as needed for your application
     padded_patch = np.pad(patch, ((0, 0), (0, pad_x), (0, pad_y)), mode='constant', constant_values=0)
     return padded_patch
+
+def get_metadata_of_window(src, window):
+    transform = src.window_transform(window)
+    window_meta = src.meta.copy()
+    window_meta.update({
+        "driver": "GTiff",
+        "height": window.height,
+        "width": window.width,
+        "transform": transform
+    })    
+    return window_meta
 
 def update_patch_transform(original_metadata, start_x, start_y):
     original_transform = original_metadata['transform']

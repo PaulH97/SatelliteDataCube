@@ -21,7 +21,6 @@ class SatelliteBand:
         Args:
             band_name (str): Name of the satellite band.
             band_path (str): File path to the raster data of the band.
-        
         """
         self.name = band_name 
         self.path = band_path
@@ -105,7 +104,14 @@ class SatelliteBand:
                 )
 
         return resampled_raster_path
-    
+
+    def get_resolution(self):
+        with rasterio.open(self.path) as src:
+            # src.transform.a is the width of a pixel
+            # src.transform.e is the height of a pixel (typically negative)
+            resolution_x, resolution_y = src.transform.a, -src.transform.e
+            return (int(resolution_x), int(resolution_y))
+
     def resample(self, new_resolution):
         """
         Resample the raster band to a new resolution.

@@ -3,136 +3,127 @@ import rasterio
 from matplotlib import pyplot as plt
 import re
 from rasterio.mask import mask
-from rasterio.windows import Window
-from .utils import band_management_decorator, extract_band_data_for_annotation, extract_nearby_ndvi_data, pad_patch, get_metadata_of_window
+from .utils import band_management_decorator, extract_band_data_for_annotation, extract_nearby_ndvi_data
 from .band import SatelliteBand
 from .annotation import SatelliteImageAnnotation
 from pathlib import Path
 import json
-from datetime import datetime
-
-# TODO After removing self.scl_path -> fix methods where it was used  
-
-def bands_required(f):
-    """Decorator to ensure bands are initialized before calling the method."""
-    def wrapper(self, *args, **kwargs):
-        if not self.bands:
-            raise ValueError("Bands have not been initialized.")
-        return f(self, *args, **kwargs)
-    return wrapper
 
 class SatelliteImage:
     def __init__(self):
-        self.folder = None # folder of all files correlated to the image like bands, patches etc. 
-        self.name = None # S2_mspc_l2a_20190509_B02 - function that extract this nam
-        self.path = None
-        self.bands= {} # dict with band_ids, scl, mask and filepaths as value - for access single raster files
-        self.date = None # date of image
-        self.meta = None # metadata of image with all bands
+        self.band_files_by_id = {}
+        self._loaded_bands = {}
+        self.annotation = None
+        self.array = None
+        self.date = None
 
-    @bands_required
     def __getitem__(self, band_id):
-        try:
-            raster_filepath = self.bands[band_id]
-            if raster_filepath:
-                return SatelliteBand(band_id, raster_filepath)
-        except KeyError:
-            raise ValueError(f"Band id {band_id} not found.")
-    
-    @bands_required
-    def find_band_by_res(self, target_res):
-        for band_id in self.bands:
-            band = self[band_id]  # Use __getitem__ to get the SatelliteBand instance
-            resolution = band.get_resolution() # (10,10)
-            if resolution[0] == target_res:
-                return band
-        return None
+        if band_id not in self._loaded_bands:
+            band_path = self.band_files_by_id.get(band_id)
+            if band_path:
+                self._loaded_bands[band_id] = SatelliteBand(band_id, band_path)
+            else:
+                raise ValueError(f"Band path for '{band_id}' not found.")
+        return self._loaded_bands[band_id]
 
-    @bands_required
-    def stack_bands(self, resolution=10): 
-        print(f"----Stacking bands of image with {resolution}m resolution")
-        band_with_desired_res = self.find_band_by_res(resolution)
-        with rasterio.open(band_with_desired_res.path) as src:
-            meta = src.meta.copy()
-            meta['count'] = len(self.bands)  # Update the metadata to reflect the total number of bands   
-        with rasterio.open(self.path, 'w', **meta) as dst:
-            band_descriptions = []
-            for i, (band_id, raster_filepath) in enumerate(self.bands.items(), start=1):
-                # SatelliteBand.resample modifies the band in place and updates its .array attribute
-                band = SatelliteBand(band_id, raster_filepath).resample(resolution)
-                band_arr = np.squeeze(band.array) # drops first axis: (1,7336,4302) -> (7336,4302)
-                dst.write(band_arr, i)
-                band_descriptions.append(band_id)
-            dst.descriptions = tuple(band_descriptions)
-        self.meta = meta
-        return self
-
-    def create_patches(self, patch_size, overlay=0, padding=True):
-        with rasterio.open(self.path) as src:
-            step_size = patch_size - overlay
-            for i in range(0, src.width,  step_size):
-                for j in range(0, src.height, step_size):
-                    window = Window(j, i, patch_size, patch_size)
-                    patch = src.read(window=window)        
-                    # Check if patch needs padding
-                    if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
-                        patch = pad_patch(patch, patch_size)
-                    elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
-                        continue  # Skip patches that are smaller than patch_size when padding is False
-                    # Update metadata for the patch
-                    patch_meta = get_metadata_of_window(src, window)
-                    patches_folder = self.folder / "patches" / "image"
-                    patches_folder.mkdir(parents=True, exist_ok=True)
-                    patch_filepath = patches_folder / f"patch_{i}_{j}.tif"
-                    with rasterio.open(patch_filepath, 'w', **patch_meta) as dst:
-                            dst.write(patch)
-        return patches_folder
-
-class Sentinel2(SatelliteImage):
-    def __init__(self, folder):
-        super().__init__()   
-        self.folder = Path(folder)
-        self.bands = self._initialize_rasters() # bands + scene layer + annotation
-        self.name = self._initialize_name() # S2_mspc_l2a_20190509
-        self.date = datetime.strptime(self.name.split("_")[-1], "%Y%m%d").date() # date(2019,05,09)
-        self.path = self.folder / f"{self.name}.tif"
+    def get_band(self, band_id):
+        return self.band_files_by_id[band_id]
         
-    def _initialize_name(self):
-        raster_filepath = next(iter(self.bands.values()))
-        band_name = raster_filepath.stem
-        image_name = "_".join(band_name.split("_")[:-1]) 
-        return image_name
+    def add_band(self, band_id, file_path):
+        """
+        Add a new SatelliteBand object to the bands dictionary.
+        """
+        self.band_files_by_id[band_id] = file_path
+        return
+
+    def load_band(self, band_id):
+        """
+        Load and return a SatelliteBand object for the specified band.
+        Args:
+            band_id (str): The name of the band in uppercase letter to load.
+        Returns:
+            SatelliteBand: The loaded SatelliteBand object.
+        """
+        if band_id not in self._loaded_bands:
+            band_path = self.band_files_by_id.get(band_id)
+            if band_path:
+                self._loaded_bands[band_id] = SatelliteBand(band_id, band_path)
+            else:
+                raise ValueError(f"Band path for '{band_id}' not found.")
+        return self._loaded_bands[band_id]
+
+    def unload_band(self, band_id):
+        del self._loaded_bands[band_id]
+
+    def load_all_bands(self):
+        """
+        Load all bands specified in the band_paths.
+        This method iterates through all the band paths and loads each band.
+        """
+        for band_id in self.band_files_by_id.keys():
+            self.load_band(band_id)
+        return self._loaded_bands
     
-    def _initialize_rasters(self):
-        raster_files_dir = {}
+    def unload_all_bands(self):
+        self._loaded_bands = {}
+    
+    @band_management_decorator
+    def resample(self, resolution):
+        for band_id, band in self._loaded_bands.items():
+            band = band.resample(resolution)
+            self.band_files_by_id[band_id] = band.path
+        return self
+    
+    @band_management_decorator
+    def stack_bands(self):
+        bands_arr = []
+        for band_id, band in self._loaded_bands.items():
+            print(band_id)
+            band = band.resample(10)
+            bands_arr.append(band.array)
+            self.band_files_by_id[band_id] = band.path
+        self.array = np.vstack(bands_arr)
+        return self
+    
+class Sentinel2(SatelliteImage):
+    def __init__(self, folder_of_satellite_bands, annotation_shp, date):
+        super().__init__()   
+        self.folder = Path(folder_of_satellite_bands)
+        self.band_files_by_id = self._initialize_bands_path()    
+        self.scl_path = self._initialize_scl()
+        self.annotation = SatelliteImageAnnotation(annotation_shp)
+        self.bad_pixel_ratio = None
+        self.date = date
+    
+    def _initialize_bands_path(self):
+        bands_path = {}
         file_paths = [entry for entry in self.folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
-        for raster_filepath in file_paths:
-            band_id = self._extract_band_info(raster_filepath)
+        for band_path in file_paths:
+            band_id = self._extract_band_info(band_path)
             if band_id:       
-                raster_files_dir[band_id] = raster_filepath
-        return self._sort_raster_filepaths(raster_files_dir)
+                bands_path[band_id] = band_path
+        return self._sort_band_paths(bands_path)
     
-    def _sort_raster_filepaths(self, raster_files_dir):
-        sorted_keys = sorted(raster_files_dir.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'SCL'
-        sorted_raster_files_dirs = {k: raster_files_dir[k] for k in sorted_keys}
-        return sorted_raster_files_dirs
+    def _initialize_scl(self):
+        return list(self.folder.glob('*SCL.tif'))[0]
+
+    def _sort_band_paths(self, bands_path):
+        sorted_keys = sorted(bands_path.keys(), key=self._extract_band_number) # 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B11','B12', 'NDVI', 'NDWI', 'SCL
+        sorted_bands_paths = {k: bands_path[k] for k in sorted_keys}
+        return sorted_bands_paths
     
     @staticmethod
     def _extract_band_info(file_path):
         file_name = file_path.name  
-        pattern = r"(B\d+[A-Z]?|SCL)\.tif"
+        pattern = r"(B\d+[A-Z]?)\.tif"
         match = re.search(pattern, file_name)
         return match.group(1) if match else None
     
     @staticmethod        
     def _extract_band_number(key):
-        if key == "SCL":
-            return 100  
-        elif key == "MSK":
-            return 101  
         match = re.match(r"B(\d+)", key)
         return int(match.group(1)) if match else float('inf')  # if key does not start with 'B', place it at the end
-    
+
     def calculate_bad_pixel_ratio(self):
         if self.scl_path:
             with rasterio.open(self.scl_path) as src:
@@ -245,7 +236,7 @@ class Sentinel1(SatelliteImage):
     def __init__(self, folder_of_satellite_image, annotation_shp, date):
         super().__init__()   
         self.folder = Path(folder_of_satellite_image)
-        self.band_files_by_id = self._initialize_rasters()   
+        self.band_files_by_id = self._initialize_bands_path()   
         self.annotation = SatelliteImageAnnotation(annotation_shp) 
         self.meta = self._load_meta()
         self.date = date
@@ -256,14 +247,14 @@ class Sentinel1(SatelliteImage):
             meta = json.load(file)
         return meta
     
-    def _initialize_rasters(self):
-        raster_files_dir = {}
+    def _initialize_bands_path(self):
+        bands_path = {}
         file_paths = [entry for entry in self.folder.iterdir() if entry.is_file() and entry.suffix == '.tif']
-        for raster_filepath in file_paths:
-            band_id = self._extract_band_info(str(raster_filepath))
+        for band_path in file_paths:
+            band_id = self._extract_band_info(str(band_path))
             if band_id:       
-                raster_files_dir[band_id.upper()] = raster_filepath
-        return raster_files_dir
+                bands_path[band_id.upper()] = band_path
+        return bands_path
 
     def _extract_band_info(self, file_path): 
         pattern = r"(vh|vv)"
