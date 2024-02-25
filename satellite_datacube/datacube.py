@@ -3,6 +3,7 @@ from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
 from .annotation import SatelliteImageAnnotation
 from .utils import transform_spectal_signature
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -10,8 +11,6 @@ import shutil
 import rioxarray
 import xarray as xr
 
-# TODO: Update the function with storing the shapefile in a varibale -> creating mask with that and not using the annotation.tif?
-# maybe i should select timeseries and store it not as instance variable?
 class SatelliteDataCube:
     def __init__(self):
         self.base_folder = None
@@ -99,21 +98,29 @@ class SatelliteDataCube:
             return (dict(image_patches_dict), dict(mask_patches_dict))
 
     def clean(self):
-        # Removes all files that are not needed anymore like resampled bands, single timestep patches
-        for date, image in self.images_by_date.items():
-            patches_folder = image.folder / "patches" 
-            patches_ann_folder = image.folder / "annotation" / "patches"
-            for folder in [patches_folder, patches_ann_folder]:
-                if folder.exists():
-                    shutil.rmtree(patches_folder)  
-                    print(f"Cleaned image folder on date {date} by removing resampled bands and patches.")
-            try:
-                resampled_files = [file for file in image.folder.iterdir() if file.is_file() and ("resampled" in file.name or "NDVI" in file.name or "NDWI" in file.name)]
-                for resampled_file in resampled_files:
-                    resampled_file.unlink()
-            except OSError as e:
-                print(f"Error deleting file {resampled_file}: {e.strerror}")
-                            
+        # Collect all directories and files to be removed
+        dirs_to_remove = []
+        files_to_remove = []
+
+        for image in self.images_by_date.values():
+            dirs_to_remove.append(image.folder / "patches")
+            files_to_remove.extend(image.folder.glob("*resampled*"))
+            files_to_remove.extend(image.folder.glob("*NDVI*"))
+            files_to_remove.extend(image.folder.glob("*NDWI*"))
+
+        # Use ThreadPoolExecutor to remove directories and files in parallel
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor: 
+            future_to_path = {executor.submit(shutil.rmtree, dir_path): dir_path for dir_path in dirs_to_remove if dir_path.exists()}
+            future_to_path.update({executor.submit(lambda p: p.unlink(), file_path): file_path for file_path in files_to_remove if file_path.exists()})
+
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    future.result()  # Wait for the removal to complete
+                    print(f"Successfully removed {path}")
+                except Exception as exc:
+                    print(f"Error removing {path}: {exc}")
+                    
     def load_image(self, date):
         if date in self.images_by_date:
             return self.images_by_date[date]
@@ -189,102 +196,133 @@ class SatelliteDataCube:
         if output_folder:
             plt.savefig(os.path.join(output_folder, f"{self.satellite}_spectralSig_ts{len(time_steps)}.png"))
         return
+   
+    def create_msk_patches(self, patchsize, overlay):
+        # Prepare a list of tasks for parallel processing
+        tasks = [(image, patchsize, overlay, self.ann_file) for image in self.images_by_date.values()]
 
-    def create_patches(self, patchsize, overlay, process_type):
+        # Use ProcessPoolExecutor to parallelize the task
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            # Submit all tasks and keep track of futures
+            future_to_task = {executor.submit(SatelliteDataCube._process_mask_patch, task): task for task in tasks}
+
+            # Iterate over completed futures
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                image, patchsize, overlay, _ = task
+                try:
+                    # Retrieve result to trigger any exceptions that occurred
+                    future.result()
+                    print(f"Task completed: {image} on {image.date}")
+                except Exception as exc:
+                    print(f"Task generated an exception: {image.date}, {exc}")
+    
+    def create_img_patches(self, patchsize, overlay):
+        # Prepare a list of tasks for parallel processing
+        tasks = [(image, patchsize, overlay) for image in self.images_by_date.values()]
+
+        # Use ProcessPoolExecutor to parallelize the task
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            # Submit all tasks and keep track of futures
+            future_to_task = {executor.submit(SatelliteDataCube._process_image_patch, task): task for task in tasks}
+
+            # Iterate over completed futures
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                image, patchsize, overlay = task
+                try:
+                    # Retrieve result to trigger any exceptions that occurred
+                    future.result()
+                    print(f"Task completed: {image} on {image.date}")
+                except Exception as exc:
+                    print(f"Task generated an exception: {image.date}, {exc}")
+    
+    @staticmethod
+    def _process_mask_patch(task):
         """
-        Generates patches for satellite images, masks, or both based on the specified process type.
+        Process a single mask patch task. This function is designed to be run in parallel.
+        """
+        image, patchsize, overlay, ann_file = task
+        patches_dir = image.folder / "patches" / "MSK"
 
-        This function iterates over images in the data cube, processing them according to the
-        selected type: images only ('IMG'), masks only ('MSK'), or both images and masks ('BOTH').
-        It utilizes specific patchify functions tailored for handling images and masks to create
-        the patches. Patches are stored in the satellite image folder under '.../patches/IMG' or '.../patches/MSK'.
+        # Check if patches already exist to avoid redundant processing
+        if patches_dir.exists():
+            print(f"--Patches already exist for {image} on {image.date}. Skipping patch creation...")
+            return
+    
+        import pdb 
+        pdb.set_trace()
+
+        img_ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
+        img_ann.rasterize(resolution=10)
+        img_ann.create_patches(patch_size=patchsize, overlay=overlay) 
+        print(f"--Created mask patches with patch size {patchsize}px.")
+
+    @staticmethod
+    def _process_image_patch(task):
+        """
+        Process a single image patch task. This function is designed to be run in parallel.
+        """
+        image, patchsize, overlay = task
+        patches_dir = image.folder / "patches" / "IMG"
+
+        # Check if patches already exist to avoid redundant processing
+        if patches_dir.exists():
+            print(f"--Patches already exist for {image} on {image.date}. Skipping patch creation...")
+            return
+
+        image.stack_bands()  # Prepare image by stacking bands
+        image.create_patches(patchsize, overlay=overlay)  # Create and store patches
+        print(f"--Created image patches with patch size {patchsize}px and overlay of {overlay}px.")
+
+    @staticmethod
+    def _process_patch_timeseries(task):
+        """
+        Processes a single patch to create a time series and saves it as a netCDF file.
 
         Parameters:
-            patchsize (int): The size of the square patch to be generated. This size applies to
-                both dimensions of the patch (width and height) in pixels.
-            process_type (str): Specifies the type of data to patchify. Acceptable values are
-                'IMG' for images, 'MSK' for masks. The function will execute different patchify 
-                functions based on this parameter.
-        Raises:
-            ValueError: If `process_type` is not one of the expected values ('IMG', 'MSK', 'BOTH'),
-                a ValueError is raised to alert the user of the invalid input.
-        Note:
-            The function expects `self.images_by_date` to be a dictionary where keys are dates
-            and values are image objects, and `self.ann_file` to be the path to the annotation
-            file used for mask generation when process_type is 'MSK' or 'BOTH'.
+            patch_id (str): Identifier for the patch.
+            patch_paths (list): List of file paths to the patch files.
+            var_name (str): Variable name to use in the netCDF dataset.
+            patches_folder (Path): The directory where the netCDF file should be saved.
         """
-        valid_process_types = ["IMG", "MSK"]
-        if process_type not in valid_process_types:
-            raise ValueError(f"Invalid process_type: {process_type}. Expected one of {valid_process_types}.")
-
-        for date, image in self.images_by_date.items():
-            print(f"Process S2 image on date: {date}")
-            # Execute the selected patchify function for generating patches of selected data (images, masks or both)
-            if process_type == "IMG":
-                img_patches_dir = image.folder / "patches" / process_type
-                if not img_patches_dir.exists():
-                    print(f"--Creating patches of image with patch size of {patchsize}px")
-                    image = image.stack_bands()  # stack all bands, scl and msk together
-                    image.create_patches(patchsize, overlay=overlay)
-                else:
-                    print("--Patches already exists for this image")
-            else:
-                ann_patches_dir = image.folder / "patches" / process_type
-                if not ann_patches_dir.exists():
-                    print(f"--Creating patches of image annotation with patch size of {patchsize}px")
-                    img_ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=self.ann_file)
-                    img_ann.rasterize(resolution=10)
-                    img_ann.create_patches(patchsize)
-                else:
-                    print("--Patches already exists for this image annotation")
-
+        patch_id, patch_paths, var_name, patches_folder = task
+        # Load each patch file as an xarray DataArray
+        patches_xarrays = [rioxarray.open_rasterio(path) for path in patch_paths]
+        # Concatenate the DataArrays along a new 'time' dimension
+        patch_ts = xr.concat(patches_xarrays, dim='time').to_dataset(name=var_name)
+        # Construct the file path for the netCDF file
+        patch_ts_filepath = patches_folder / f"{patch_id}.nc"
+        # Save the time series as a netCDF file
+        patch_ts.to_netcdf(patch_ts_filepath, format="NETCDF4", engine="h5netcdf")
+        patch_ts.close()
+        return 
+    
     def build_patch_timeseries(self, process_type):
-        """
-        Constructs a time series for each patch and stores it as a netCDF file.
-        
-        This function iterates over patches, loads them as xarray DataArrays, and concatenates
-        them along a new 'time' dimension to create a 4D time series (time x channels x height x width).
-        The resulting time series is then saved as a netCDF file, with the file naming convention
-        reflecting the patch type and identifier.
-
-        Parameters:
-            patches (dict): A dictionary where keys are patch identifiers and values are lists of
-                file paths to the individual patch files.
-            process_type (str): Specifies the type of data to patchify. Acceptable values are
-                'IMG' for images, 'MSK' for masks.
-        Note:
-            The function assumes the existence of `self.base_folder`, which specifies the base directory
-            where the netCDF files should be stored. The directory structure is organized by patch type.
-        """
-        print("Start building 4D xarrays patches and store them as netCDF files (shape: time x channels x height x width):")
-
-        # Determine the variable name based on the patch type
+        # Validate process_type and retrieve patches
         var_name = {"IMG": "reflectance", "MSK": "class"}.get(process_type, "data")
+        if process_type not in ["IMG", "MSK"]:
+            raise ValueError(f"Invalid process_type: {process_type}. Expected one of ['IMG', 'MSK'].")
 
-        valid_process_types = ["IMG", "MSK"]
-        if process_type not in valid_process_types:
-            raise ValueError(f"Invalid process_type: {process_type}. Expected one of {valid_process_types}.")
-        
         patches = self.collect_patch_paths(process_type=process_type)
+        patches_folder = self.base_folder / "patches" / process_type
+        patches_folder.mkdir(parents=True, exist_ok=True)
 
-        for patch_id, patch_paths in patches.items():
-            # Load each patch file as an xarray DataArray
-            patches_xarrays = [rioxarray.open_rasterio(path) for path in patch_paths]
+        # Prepare tasks for parallel processing
+        tasks = [(patch_id, patch_paths, var_name, patches_folder) for patch_id, patch_paths in patches.items()]
 
-            # Concatenate the DataArrays along a new 'time' dimension
-            patch_ts = xr.concat(patches_xarrays, dim='time').to_dataset(name=var_name)
+        # Parallel processing
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_patch_id = {executor.submit(self._process_patch_timeseries, task): task for task in tasks}
 
-            # Define the folder path based on the patch type
-            patches_folder = self.base_folder / "patches" / process_type
-            patches_folder.mkdir(parents=True, exist_ok=True)
-
-            # Construct the file path for the netCDF file
-            patch_ts_filepath = patches_folder / f"{process_type}_{patch_id}.nc"  # e.g., .../IMG_patch_0_128.nc or .../MSK_patch_0_128.nc
-
-            # Save the time series as a netCDF file
-            patch_ts.to_netcdf(patch_ts_filepath, format="NETCDF4", engine="h5netcdf")
-            patch_ts.close()
-            print(f"----Successfully saved {patch_id} as netCDF")
+            for future in as_completed(future_to_patch_id):
+                task = future_to_patch_id[future]
+                patch_id = task[0]
+                try:
+                    future.result()  # Get result to ensure any exceptions are raised
+                    print(f"Generated timeseries of {process_type} patch with ID: {patch_id}")
+                except Exception as exc:
+                    print(f"Exception for patch {patch_id}: {exc}")
 
 class Sentinel2DataCube(SatelliteDataCube):
 

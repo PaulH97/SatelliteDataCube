@@ -46,6 +46,7 @@ class SatelliteImageAnnotation:
             raster_meta.update({'dtype': 'uint8', 'count': 1})
 
         geometries = self.load_and_transform_to_crs(crs_epsg)["geometry"].to_list()
+
         mask_filepath = self.image.folder / f"{self.image.name}_{resolution}m_mask_.tif" # S2_mspc_l2a_20190509_10m_mask.tif
         with rasterio.open(mask_filepath, 'w', **raster_meta) as dst:
             mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
@@ -70,13 +71,11 @@ class SatelliteImageAnnotation:
                         continue  # Skip patches that are smaller than patch_size when padding is False
                     # Update metadata for the patch
                     patch_meta = get_metadata_of_window(src, window)
-                    patches_folder = self.image.folder / "patches" / "annotation"
+                    patches_folder = self.image.folder / "patches" / "MSK"
                     patches_folder.mkdir(parents=True, exist_ok=True)
                     patch_filepath = patches_folder / f"patch_{i}_{j}.tif"
                     with rasterio.open(patch_filepath, 'w', **patch_meta) as dst:
                             dst.write(patch)
-        print(f"Created patches with size {patch_size} for annotation of image on date {self.image.date}.")
-        print(f"Stored the patches in folder: {patches_folder}")
         return patches_folder
 
 # class Sentinel2Annotation(SatelliteImageAnnotation):

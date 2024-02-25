@@ -50,7 +50,6 @@ class SatelliteImage:
 
     @bands_required
     def stack_bands(self, resolution=10): 
-        print(f"----Stacking bands of image with {resolution}m resolution")
         band_with_desired_res = self.find_band_by_res(resolution)
         with rasterio.open(band_with_desired_res.path) as src:
             meta = src.meta.copy()
@@ -81,7 +80,7 @@ class SatelliteImage:
                         continue  # Skip patches that are smaller than patch_size when padding is False
                     # Update metadata for the patch
                     patch_meta = get_metadata_of_window(src, window)
-                    patches_folder = self.folder / "patches" / "image"
+                    patches_folder = self.folder / "patches" / "IMG"
                     patches_folder.mkdir(parents=True, exist_ok=True)
                     patch_filepath = patches_folder / f"patch_{i}_{j}.tif"
                     with rasterio.open(patch_filepath, 'w', **patch_meta) as dst:

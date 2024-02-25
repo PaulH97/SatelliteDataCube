@@ -6,20 +6,6 @@ from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
 import pandas as pd
-from satellite_datacube.annotation import SatelliteImageAnnotation
-
-
-
-def patchify_mask(image, patch_size, **kwargs):
-    """
-    Creates patches from satellite image annotations (masks).
-
-    Args:
-        image: The satellite image object related to the annotation.
-        patch_size: The size of each patch.
-        **kwargs: Additional keyword arguments, specifically 'global_ann_file' indicating the global annotation shapefile path.
-    """
-
 
 def extract_band_data_for_annotation(annotation, band_files):
     ''' Process each opened band for the given annotation '''
