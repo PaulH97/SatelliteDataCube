@@ -2,7 +2,7 @@ import os
 from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
 from .annotation import SatelliteImageAnnotation
-from .utils import transform_spectal_signature
+from .utils import transform_spectal_signature, extract_patch_coordinates, is_patch_annotated, delete_patches
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +10,7 @@ from collections import defaultdict
 import shutil
 import rioxarray
 import xarray as xr
+import random
 
 class SatelliteDataCube:
     def __init__(self):
@@ -323,6 +324,30 @@ class SatelliteDataCube:
                     print(f"Generated timeseries of {process_type} patch with ID: {patch_id}")
                 except Exception as exc:
                     print(f"Exception for patch {patch_id}: {exc}")
+        return patches_folder
+
+    def filter_patches(self, seed=42, ratio=1):
+        """Categorizes patches into annotated and non-annotated based on mask annotations."""
+        random.seed(seed)
+        img_patches_dir = self.base_folder / "patches" / "IMG"
+        msk_patches_dir = self.base_folder / "patches" / "MSK"
+        img_files = sorted(img_patches_dir.iterdir(), key=extract_patch_coordinates)
+        msk_files = sorted(msk_patches_dir.iterdir(), key=extract_patch_coordinates)
+        patch_pairs = list(zip(img_files, msk_files))
+
+        categorized = {"annotated": [], "non_annotated": []}
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_results = {executor.submit(is_patch_annotated, pair): pair for pair in patch_pairs}
+            for future in as_completed(future_results):
+                has_annotation, pair = future.result()
+                category = "annotated" if has_annotation else "non_annotated"
+                categorized[category].append(pair)
+        
+        # Select non-annotated patches for deletion based on a specified ratio
+        num_to_select = int(len(categorized['annotated']) * ratio)
+        non_annotated_patches = categorized['non_annotated']
+        selected_non_annotated_patches = random.sample(non_annotated_patches, min(num_to_select, len(non_annotated_patches)))
+        delete_patches(selected_non_annotated_patches)
 
 class Sentinel2DataCube(SatelliteDataCube):
 

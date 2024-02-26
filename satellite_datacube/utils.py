@@ -6,6 +6,32 @@ from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
 import pandas as pd
+import re
+import xarray as xr
+
+def delete_patches(patches_paths):
+    for img_path, msk_path in patches_paths:
+        try:
+            img_path.unlink()
+            msk_path.unlink()
+            print(f"Deleted: {img_path} and {msk_path}")
+        except FileNotFoundError as e:
+            print(f"File not found: {e}")
+        except OSError as e:
+            print(f"Error deleting {e.filename}: {e.strerror}")
+
+def is_patch_annotated(img_msk_pair):
+    """Checks if a mask patch contains annotations and returns its classification."""
+    _, msk_path = img_msk_pair
+    msk_data = xr.open_dataset(msk_path)
+    ann_count = np.count_nonzero(msk_data['class'].values == 1)
+    return ann_count > 10, img_msk_pair
+
+def extract_patch_coordinates(filepath):
+    """Extracts the row and column coordinates from the filename of a patch."""
+    filename = filepath.stem
+    match = re.search(r"patch_(\d+)_(\d+)\.nc", filename)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
 
 def extract_band_data_for_annotation(annotation, band_files):
     ''' Process each opened band for the given annotation '''
