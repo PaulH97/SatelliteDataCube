@@ -2,7 +2,7 @@ import os
 from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
 from .annotation import SatelliteImageAnnotation
-from .utils import transform_spectal_signature, extract_patch_coordinates, is_patch_annotated, delete_patches
+from .utils import transform_spectal_signature, extract_patch_coordinates, log_progress
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +10,8 @@ from collections import defaultdict
 import shutil
 import rioxarray
 import xarray as xr
-import random
+from tqdm import tqdm
+import numpy as np
 
 class SatelliteDataCube:
     def __init__(self):
@@ -19,7 +20,7 @@ class SatelliteDataCube:
         self.satellite_images_folder = None
         self.ann_file = None
         self.images_by_date = {}
-
+    
     def _print_initialization_info(self):
         """
         Display detailed initialization information about the data-cube.
@@ -66,7 +67,6 @@ class SatelliteDataCube:
         Returns:
             dict or tuple of dicts: For 'IMG' or 'MSK', returns a dictionary with patch names as keys and list of paths as values.
         """
-
         if process_type not in ["IMG", "MSK"]:
             raise ValueError("Invalid process_type. Must be 'IMG' or 'MSK'.")
 
@@ -95,33 +95,43 @@ class SatelliteDataCube:
             return dict(image_patches_dict)
         elif process_type == "MSK":
             return dict(mask_patches_dict)
-        elif process_type == "BOTH":
-            return (dict(image_patches_dict), dict(mask_patches_dict))
 
     def clean(self):
         # Collect all directories and files to be removed
         dirs_to_remove = []
         files_to_remove = []
-
+        
         for image in self.images_by_date.values():
             dirs_to_remove.append(image.folder / "patches")
             files_to_remove.extend(image.folder.glob("*resampled*"))
             files_to_remove.extend(image.folder.glob("*NDVI*"))
             files_to_remove.extend(image.folder.glob("*NDWI*"))
+            files_to_remove.extend(image.folder.glob("*.tmp.nc"))
 
         # Use ThreadPoolExecutor to remove directories and files in parallel
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor: 
-            future_to_path = {executor.submit(shutil.rmtree, dir_path): dir_path for dir_path in dirs_to_remove if dir_path.exists()}
-            future_to_path.update({executor.submit(lambda p: p.unlink(), file_path): file_path for file_path in files_to_remove if file_path.exists()})
+            future_tasks_dirs = {executor.submit(SatelliteDataCube.safe_delete, dir_path): dir_path for dir_path in dirs_to_remove if dir_path.exists()}
+            future_tasks_files = {executor.submit(SatelliteDataCube.safe_delete, file_path): file_path for file_path in files_to_remove if file_path.exists()}
+            # Combine the future tasks for directories and files
+            future_tasks = {**future_tasks_dirs, **future_tasks_files}
+            log_progress(future_tasks, desc="Cleaning Datacube")
+    
+    @staticmethod
+    def safe_delete(path):
+        result = {"status": "", "details": "", "error": ""}
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)  # Consider `ignore_errors=True` for a more robust deletion.
+            else:
+                path.unlink()
+            result["status"] = "success"
+            result["details"] = f"Deleted {path}"
+            return result
+        except Exception as e:
+            result["status"] = "error",
+            result["error"] = str(e)  # Provides the error message if an error occurred.
+            return result
 
-            for future in as_completed(future_to_path):
-                path = future_to_path[future]
-                try:
-                    future.result()  # Wait for the removal to complete
-                    print(f"Successfully removed {path}")
-                except Exception as exc:
-                    print(f"Error removing {path}: {exc}")
-                    
     def load_image(self, date):
         if date in self.images_by_date:
             return self.images_by_date[date]
@@ -199,45 +209,39 @@ class SatelliteDataCube:
         return
    
     def create_msk_patches(self, patchsize, overlay):
-        # Prepare a list of tasks for parallel processing
         tasks = [(image, patchsize, overlay, self.ann_file) for image in self.images_by_date.values()]
 
-        # Use ProcessPoolExecutor to parallelize the task
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            # Submit all tasks and keep track of futures
-            future_to_task = {executor.submit(SatelliteDataCube._process_mask_patch, task): task for task in tasks}
-
-            # Iterate over completed futures
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                image, patchsize, overlay, _ = task
+            future_tasks = {executor.submit(SatelliteDataCube._process_mask_patch, task): task for task in tasks}
+        
+            count = 0
+            for future in as_completed(future_tasks):
+                count += 1  # Increment the counter for each completed task
+                image = future_tasks[future][0]
                 try:
-                    # Retrieve result to trigger any exceptions that occurred
                     future.result()
-                    print(f"Task completed: {image} on {image.date}")
+                    if count % 10 == 0:  # Check if the count is divisible by 10
+                        print(f"10 image masks processed. Most recent: {image} on {image.date}")
                 except Exception as exc:
-                    print(f"Task generated an exception: {image.date}, {exc}")
-    
+                    print(f"Task generated an exception: {image.date}, {exc}")    
+        
     def create_img_patches(self, patchsize, overlay):
-        # Prepare a list of tasks for parallel processing
         tasks = [(image, patchsize, overlay) for image in self.images_by_date.values()]
-
         # Use ProcessPoolExecutor to parallelize the task
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            # Submit all tasks and keep track of futures
-            future_to_task = {executor.submit(SatelliteDataCube._process_image_patch, task): task for task in tasks}
-
-            # Iterate over completed futures
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                image, patchsize, overlay = task
+            future_tasks = {executor.submit(SatelliteDataCube._process_image_patch, task): task for task in tasks}
+                
+            count = 0
+            for future in as_completed(future_tasks):
+                count += 1  # Increment the counter for each completed task
+                image = future_tasks[future][0]
                 try:
-                    # Retrieve result to trigger any exceptions that occurred
                     future.result()
-                    print(f"Task completed: {image} on {image.date}")
+                    if count % 10 == 0:  # Check if the count is divisible by 10
+                        print(f"10 images processed. Most recent: {image} on {image.date}")
                 except Exception as exc:
-                    print(f"Task generated an exception: {image.date}, {exc}")
-    
+                    print(f"Task generated an exception: {image.date}, {exc}")          
+
     @staticmethod
     def _process_mask_patch(task):
         """
@@ -245,19 +249,23 @@ class SatelliteDataCube:
         """
         image, patchsize, overlay, ann_file = task
         patches_dir = image.folder / "patches" / "MSK"
-
+        result = {"path": str(patches_dir), "status": "", "details": "", "error": ""}
+        
         # Check if patches already exist to avoid redundant processing
         if patches_dir.exists():
-            print(f"--Patches already exist for {image} on {image.date}. Skipping patch creation...")
-            return
-    
-        import pdb 
-        pdb.set_trace()
-
-        img_ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
-        img_ann.rasterize(resolution=10)
-        img_ann.create_patches(patch_size=patchsize, overlay=overlay) 
-        print(f"--Created mask patches with patch size {patchsize}px.")
+            result["status"] = "skipped"
+            result["details"] = f"MSK patches already exist for {image} on {image.date}. Skipping patch creation..."
+            return result
+        try:
+            img_ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
+            img_ann.rasterize(resolution=10)
+            img_ann.create_patches(patch_size=patchsize, overlay=overlay)
+            result["status"] = "success"
+            result["details"] = f"Successfully processed MSK patches for {image} on {image.date}."
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        return result
 
     @staticmethod
     def _process_image_patch(task):
@@ -266,15 +274,22 @@ class SatelliteDataCube:
         """
         image, patchsize, overlay = task
         patches_dir = image.folder / "patches" / "IMG"
-
+        result = {"path": str(patches_dir), "status": "", "details": "", "error": ""}
+        
         # Check if patches already exist to avoid redundant processing
         if patches_dir.exists():
-            print(f"--Patches already exist for {image} on {image.date}. Skipping patch creation...")
-            return
-
-        image.stack_bands()  # Prepare image by stacking bands
-        image.create_patches(patchsize, overlay=overlay)  # Create and store patches
-        print(f"--Created image patches with patch size {patchsize}px and overlay of {overlay}px.")
+            result["status"] = "skipped"
+            result["details"] = f"IMG patches already exist for {image} on {image.date}. Skipping patch creation..."
+            return result
+        try:
+            image.stack_bands()  # Prepare image by stacking bands
+            image.create_patches(patchsize, overlay=overlay)  # Create and store patches
+            result["status"] = "success"
+            result["details"] = f"Successfully processed IMG patches for {image} on {image.date}."
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        return result
 
     @staticmethod
     def _process_patch_timeseries(task):
@@ -288,25 +303,36 @@ class SatelliteDataCube:
             patches_folder (Path): The directory where the netCDF file should be saved.
         """
         patch_id, patch_paths, var_name, patches_folder = task
-        # Load each patch file as an xarray DataArray
-        patches_xarrays = [rioxarray.open_rasterio(path) for path in patch_paths]
-        # Concatenate the DataArrays along a new 'time' dimension
-        patch_ts = xr.concat(patches_xarrays, dim='time').to_dataset(name=var_name)
-        # Construct the file path for the netCDF file
-        patch_ts_filepath = patches_folder / f"{patch_id}.nc"
-        # Save the time series as a netCDF file
-        patch_ts.to_netcdf(patch_ts_filepath, format="NETCDF4", engine="h5netcdf")
-        patch_ts.close()
-        return 
+        result = {"status": "", "details": "", "error": ""}
+        try:
+            patches_xarrays = [rioxarray.open_rasterio(path) for path in patch_paths]
+            patch_ts = xr.concat(patches_xarrays, dim='time').to_dataset(name=var_name)
+            patch_ts_filepath = patches_folder / f"{patch_id}.nc"
+            patch_ts.to_netcdf(patch_ts_filepath, format="NETCDF4", engine="h5netcdf")
+            patch_ts.close()
+            result["status"] = "success"
+            result["details"] = f"Successfully processed patch with ID {patch_id}."
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        finally:
+            # Attempt to explicitly close each DataArray in patches_xarrays if they are not automatically managed
+            for da in patches_xarrays:
+                try:
+                    da.close()
+                except:
+                    pass  # If close method doesn't exist or fails, continue
+        return result
     
     def build_patch_timeseries(self, process_type):
         # Validate process_type and retrieve patches
-        var_name = {"IMG": "reflectance", "MSK": "class"}.get(process_type, "data")
         if process_type not in ["IMG", "MSK"]:
             raise ValueError(f"Invalid process_type: {process_type}. Expected one of ['IMG', 'MSK'].")
+        var_name = {"IMG": "reflectance", "MSK": "class"}.get(process_type)
+        dir_name = self.satellite if process_type == "IMG" else "annotation"
 
         patches = self.collect_patch_paths(process_type=process_type)
-        patches_folder = self.base_folder / "patches" / process_type
+        patches_folder = self.base_folder / "patches" / dir_name
         patches_folder.mkdir(parents=True, exist_ok=True)
 
         # Prepare tasks for parallel processing
@@ -314,41 +340,72 @@ class SatelliteDataCube:
 
         # Parallel processing
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            future_to_patch_id = {executor.submit(self._process_patch_timeseries, task): task for task in tasks}
+            future_tasks = {executor.submit(self._process_patch_timeseries, task): task for task in tasks}
+            log_progress(future_tasks, desc="Building 4D patches")
 
-            for future in as_completed(future_to_patch_id):
-                task = future_to_patch_id[future]
-                patch_id = task[0]
-                try:
-                    future.result()  # Get result to ensure any exceptions are raised
-                    print(f"Generated timeseries of {process_type} patch with ID: {patch_id}")
-                except Exception as exc:
-                    print(f"Exception for patch {patch_id}: {exc}")
-        return patches_folder
+    def reduce_msk_patch_timeseries(self, timestep):
+        """
+        Reduces the time series of mask patches to a single specified timestep.
+        """
+        patches_folder = self.base_folder / "patches" / "annotation"
+        tasks = [(patch_path, timestep) for patch_path in patches_folder.iterdir() if patch_path.suffix == '.nc']
 
-    def filter_patches(self, seed=42, ratio=1):
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_tasks = {executor.submit(SatelliteDataCube._cut_timeseries, task): task for task in tasks}
+            log_progress(future_tasks, desc="Reduce MSK patch timeseries")
+
+    @staticmethod
+    def _cut_timeseries(task):
+        patch_path, timestep = task
+        result = {"status": "", "details": "", "error": ""}
+        try:
+            with xr.open_dataset(patch_path) as msk_data:
+                reduced_ds = msk_data.isel(time=timestep)
+                encoding = {var: {'_FillValue': None} for var in reduced_ds.data_vars}
+                # Temporary file ensures that we do not lose data if the process is interrupted
+                temp_path = patch_path.with_suffix('.tmp.nc')
+                reduced_ds.to_netcdf(temp_path, mode='w', encoding=encoding)
+                temp_path.rename(patch_path)  # Atomically replace the old file
+                result["status"] = "success"
+                result["details"] = f"Successfully reduced MSK patch with ID {patch_path.name}."
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        return result
+
+    @staticmethod
+    def _is_patch_annotated(task):
+        """Checks if a mask patch contains annotations and returns its classification."""
+        img_path, msk_path = task
+        with xr.open_dataset(msk_path) as msk_data:  # Automatically closes the dataset
+            ann_count = np.count_nonzero(msk_data['class'].values == 1)
+        return ann_count > 10, task
+
+    def classify_patches(self):
         """Categorizes patches into annotated and non-annotated based on mask annotations."""
-        random.seed(seed)
-        img_patches_dir = self.base_folder / "patches" / "IMG"
-        msk_patches_dir = self.base_folder / "patches" / "MSK"
+        img_patches_dir = self.base_folder / "patches" / self.satellite
+        msk_patches_dir = self.base_folder / "patches" / "annotation"
         img_files = sorted(img_patches_dir.iterdir(), key=extract_patch_coordinates)
         msk_files = sorted(msk_patches_dir.iterdir(), key=extract_patch_coordinates)
         patch_pairs = list(zip(img_files, msk_files))
 
-        categorized = {"annotated": [], "non_annotated": []}
+        categorized_patches = {"annotated": [], "non_annotated": []}
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            future_results = {executor.submit(is_patch_annotated, pair): pair for pair in patch_pairs}
-            for future in as_completed(future_results):
-                has_annotation, pair = future.result()
-                category = "annotated" if has_annotation else "non_annotated"
-                categorized[category].append(pair)
-        
-        # Select non-annotated patches for deletion based on a specified ratio
-        num_to_select = int(len(categorized['annotated']) * ratio)
-        non_annotated_patches = categorized['non_annotated']
-        selected_non_annotated_patches = random.sample(non_annotated_patches, min(num_to_select, len(non_annotated_patches)))
-        delete_patches(selected_non_annotated_patches)
+            future_tasks = {executor.submit(SatelliteDataCube._is_patch_annotated, pair): pair for pair in patch_pairs}
 
+            with tqdm(total=len(future_tasks), desc="Categorize patches") as pbar:
+                for future in as_completed(future_tasks):
+                    try:
+                        has_annotation, pair = future.result()
+                        category = "annotated" if has_annotation else "non_annotated"
+                        categorized_patches[category].append(pair)
+                        pbar.update(1) 
+                    except Exception as exc:
+                        print(f"Error for: {pair}")
+                    finally:
+                        pbar.refresh()
+        return categorized_patches
+    
 class Sentinel2DataCube(SatelliteDataCube):
 
     def __init__(self, base_folder):

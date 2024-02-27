@@ -8,24 +8,64 @@ from rasterio.transform import Affine
 import pandas as pd
 import re
 import xarray as xr
+from tqdm import tqdm
+from concurrent.futures import as_completed
+
+def log_progress(future_tasks, desc="Processing tasks"):
+    """
+    Logs the progress of asynchronous tasks with a structured completion message based on the return value.
+    
+    Parameters:
+    - future_tasks: A dictionary of Future objects.
+    - desc: Description text for the progress bar.
+    """
+    with tqdm(total=len(future_tasks), desc=desc) as pbar:
+        for future in as_completed(future_tasks):
+            try:
+                result = future.result()  # Get the structured result from the task
+                pbar.update(1)
+                if result["status"] == "success":
+                    # Optionally log success details
+                    pass  # You can remove this pass and add logging if desired
+                else:
+                    # Log error details
+                    print(f"Error for {result['path']}: {result['error']}")
+            except Exception as exc:
+                # Log unexpected exceptions
+                print(f"Unexpected exception encountered: {exc}")
+            finally:
+                pbar.refresh()
+
+def select_non_ann_patches(categorized_patches, ratio, seed):
+    # Assuming non_annotated_patches is initially a list
+    random.seed(seed)
+    num_ann = int(len(categorized_patches['annotated']))
+    num_to_select = int(num_ann * ratio)
+    non_annotated_patches = categorized_patches["non_annotated"]
+
+    # Make sure non_annotated_patches is a list here
+    random.seed(seed)
+    selected_non_annotated_patches = random.sample(non_annotated_patches, min(num_to_select, len(non_annotated_patches)))
+
+    # When determining which patches to delete, convert to sets for the operation, if necessary
+    selected_non_annotated_patches_set = set(selected_non_annotated_patches)
+    non_annotated_patches_set = set(non_annotated_patches)
+    patches_to_delete = non_annotated_patches_set - selected_non_annotated_patches_set
+
+    print(f"Found {num_ann} patches with annotation. Keeping {len(selected_non_annotated_patches)} non-annotated patches.")
+    print(f"Deleting {len(patches_to_delete)} non-annotated patches.")
+
+    return patches_to_delete
 
 def delete_patches(patches_paths):
-    for img_path, msk_path in patches_paths:
+    for img_path, msk_path in tqdm(patches_paths, total=len(patches_paths), desc="Deleting patches"):
         try:
             img_path.unlink()
             msk_path.unlink()
-            print(f"Deleted: {img_path} and {msk_path}")
         except FileNotFoundError as e:
-            print(f"File not found: {e}")
+            tqdm.write(f"File not found: {e}")
         except OSError as e:
-            print(f"Error deleting {e.filename}: {e.strerror}")
-
-def is_patch_annotated(img_msk_pair):
-    """Checks if a mask patch contains annotations and returns its classification."""
-    _, msk_path = img_msk_pair
-    msk_data = xr.open_dataset(msk_path)
-    ann_count = np.count_nonzero(msk_data['class'].values == 1)
-    return ann_count > 10, img_msk_pair
+            tqdm.write(f"Error deleting {e.filename}: {e.strerror}")
 
 def extract_patch_coordinates(filepath):
     """Extracts the row and column coordinates from the filename of a patch."""

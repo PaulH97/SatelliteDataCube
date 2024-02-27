@@ -14,15 +14,22 @@ class SatelliteImageAnnotation:
     def load_dataframe(self):
         if self.dataframe is not None:
             return self.dataframe
-        df = gpd.read_file(self.shp_path) 
-        geometries = df["geometry"].to_list()
+        df = gpd.read_file(self.shp_path)
         repaired_geometries = []
-        for geom in geometries:
-            if geom and not geom.is_valid:
-                geom = geom.buffer(0)
-            repaired_geometries.append(geom)
+        for geom in df["geometry"]:
+            # Check if geometry is None
+            if geom is None:
+                # Here we replace None with an empty GeometryCollection
+                repaired_geom = gpd.GeoSeries([geom]).buffer(0).iloc[0] if geom else geom
+            elif not geom.is_valid:
+                # Repair invalid geometries
+                repaired_geom = geom.buffer(0)
+            else:
+                # Geometry is valid and not None, no need to repair
+                repaired_geom = geom
+            repaired_geometries.append(repaired_geom)
         df["geometry"] = repaired_geometries
-        self.dataframe = df  
+        self.dataframe = df
         return self.dataframe
 
     def load_and_transform_to_crs(self, epsg_code):
