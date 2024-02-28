@@ -316,12 +316,13 @@ class SatelliteDataCube:
             result["status"] = "error"
             result["error"] = str(e)
         finally:
-            # Attempt to explicitly close each DataArray in patches_xarrays if they are not automatically managed
-            for da in patches_xarrays:
-                try:
-                    da.close()
-                except:
-                    pass  # If close method doesn't exist or fails, continue
+            if patches_xarrays:
+                for da in patches_xarrays:
+                    try:
+                        da.close()
+                    except:
+                        pass  # If close method doesn't exist or fails, continue
+
         return result
     
     def build_patch_timeseries(self, process_type):
@@ -395,14 +396,15 @@ class SatelliteDataCube:
 
             with tqdm(total=len(future_tasks), desc="Categorize patches") as pbar:
                 for future in as_completed(future_tasks):
+                    pair = None  # Initialize pair to None or a default value
                     try:
                         has_annotation, pair = future.result()
                         category = "annotated" if has_annotation else "non_annotated"
                         categorized_patches[category].append(pair)
-                        pbar.update(1) 
                     except Exception as exc:
-                        print(f"Error for: {pair}")
+                        tqdm.write(f"Error processing task. Exception: {exc}")
                     finally:
+                        pbar.update(1)
                         pbar.refresh()
         return categorized_patches
     
