@@ -9,8 +9,9 @@ setup(
         'rasterio',
         'matplotlib',
         'simplejson', 
-        'fiona',
         'geopandas',
+        'rioxarray',
+        'xarray'
     ],
     author="Paul Höhn",
     author_email="paul.hoen@outlook.de",

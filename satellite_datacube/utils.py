@@ -7,7 +7,6 @@ from rasterio.mask import mask
 from rasterio.transform import Affine
 import pandas as pd
 import re
-import xarray as xr
 from tqdm import tqdm
 from concurrent.futures import as_completed
 
