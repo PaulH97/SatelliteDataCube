@@ -1,4 +1,5 @@
 import rasterio
+from pathlib import Path
 import geopandas as gpd
 from rasterio.features import geometry_mask
 from .utils import pad_patch, get_metadata_of_window
@@ -8,9 +9,15 @@ class SatelliteImageAnnotation:
     def __init__(self, satellite_image, shapefile_path):
         self.image = satellite_image
         self.shp_path = shapefile_path
-        self.mask_path = None
+        self.mask_path = self.get_valid_mask_file()
         self.dataframe = None
-        
+
+    def get_valid_mask_file(self):
+        for file in self.image.folder.iterdir():  # Corrected method name: iterdir
+            if file.is_file() and file.suffix.lower() in ['.tif', '.tiff'] and "mask" in file.stem.lower():
+                return file
+        return None
+
     def load_dataframe(self):
         if self.dataframe is not None:
             return self.dataframe
@@ -44,27 +51,28 @@ class SatelliteImageAnnotation:
         return annotation_df
     
     def rasterize(self, resolution):
-        band_with_desired_res = self.image.find_band_by_res(resolution)
-        if band_with_desired_res is None:
-            raise ValueError(f"Resolution {resolution} not found. Please refine your resolution to match one of the available image bands.")
-        with rasterio.open(band_with_desired_res.path) as src:
-            crs_epsg = src.crs.to_epsg()
-            raster_meta = src.meta.copy()
-            raster_meta.update({'dtype': 'uint8', 'count': 1})
+        if not self.mask_path:
+            band_with_desired_res = self.image.find_band_by_res(resolution)
+            if band_with_desired_res is None:
+                raise ValueError(f"Resolution {resolution} not found. Please refine your resolution to match one of the available image bands.")
+            with rasterio.open(band_with_desired_res.path) as src:
+                crs_epsg = src.crs.to_epsg()
+                raster_meta = src.meta.copy()
+                raster_meta.update({'dtype': 'uint8', 'count': 1})
 
-        geometries = self.load_and_transform_to_crs(crs_epsg)["geometry"].to_list()
+            geometries = self.load_and_transform_to_crs(crs_epsg)["geometry"].to_list()
 
-        mask_filepath = self.image.folder / f"{self.image.name}_{resolution}m_mask_.tif" # S2_mspc_l2a_20190509_10m_mask.tif
-        with rasterio.open(mask_filepath, 'w', **raster_meta) as dst:
-            mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
-            dst.write(mask.astype(rasterio.uint8), 1)
-        self.mask_path = mask_filepath
+            mask_filepath = self.image.folder / f"{self.image.name}_{resolution}m_mask_.tif" # S2_mspc_l2a_20190509_10m_mask.tif
+            with rasterio.open(mask_filepath, 'w', **raster_meta) as dst:
+                mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
+                dst.write(mask.astype(rasterio.uint8), 1)
+            self.mask_path = mask_filepath
         return self
     
     def plot(self):
         return self.band.plot()
     
-    def create_patches(self, patch_size, overlay=0, padding=True):
+    def create_patches(self, patch_size, overlay=0, padding=True, output_dir=None):
         with rasterio.open(self.mask_path) as src:
             step_size = patch_size - overlay
             for i in range(0, src.width,  step_size):
@@ -78,7 +86,7 @@ class SatelliteImageAnnotation:
                         continue  # Skip patches that are smaller than patch_size when padding is False
                     # Update metadata for the patch
                     patch_meta = get_metadata_of_window(src, window)
-                    patches_folder = self.image.folder / "patches" / "MSK"
+                    patches_folder = output_dir if output_dir else self.image.folder / "patches" / "MSK"
                     patches_folder.mkdir(parents=True, exist_ok=True)
                     patch_filepath = patches_folder / f"patch_{i}_{j}.tif"
                     with rasterio.open(patch_filepath, 'w', **patch_meta) as dst:

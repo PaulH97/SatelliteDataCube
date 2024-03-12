@@ -9,68 +9,47 @@ import pandas as pd
 import re
 from tqdm import tqdm
 from concurrent.futures import as_completed
+import xarray as xr
+from traceback import format_exc
+
+def patch_to_xarray(patch, transform, crs, start_x, start_y):
+    # Create an xarray DataArray for the patch, including spatial metadata
+    patch_xarray = xr.DataArray(
+        patch,
+        dims=('band', 'y', 'x'),
+        coords={
+            'band': np.arange(patch.shape[0]),
+            'y': np.arange(start_y, start_y + patch.shape[1]),  # Calculate start_y from transform
+            'x': np.arange(start_x, start_x + patch.shape[2]),  # Calculate start_x from transform
+        },
+        attrs={
+            'transform': list(transform),
+            'crs': crs.to_string(),
+        }
+    )
+    return patch_xarray
 
 def log_progress(future_tasks, desc="Processing tasks"):
-    """
-    Logs the progress of asynchronous tasks with a structured completion message based on the return value.
-    
-    Parameters:
-    - future_tasks: A dictionary of Future objects.
-    - desc: Description text for the progress bar.
-    """
     with tqdm(total=len(future_tasks), desc=desc) as pbar:
         for future in as_completed(future_tasks):
             try:
-                result = future.result()  # Get the structured result from the task
+                result = future.result()
                 pbar.update(1)
                 if result["status"] == "success":
-                    # Optionally log success details
-                    pass  # You can remove this pass and add logging if desired
+                    pass  # Success logging
                 else:
-                    # Log error details
-                    print(f"Error for {result['path']}: {result['error']}")
+                    print(f"Task raised following error: {result['error']}")
             except Exception as exc:
-                # Log unexpected exceptions
-                print(f"Unexpected exception encountered: {exc}")
+                # Log the traceback to get detailed information about where the exception occurred
+                traceback_details = format_exc()
+                print(f"Unexpected exception: {traceback_details}")
+                raise RuntimeError("A task in the pool failed.") from exc
             finally:
                 pbar.refresh()
 
-def select_non_ann_patches(categorized_patches, ratio, seed):
-    # Assuming non_annotated_patches is initially a list
-    random.seed(seed)
-    num_ann = int(len(categorized_patches['annotated']))
-    num_to_select = int(num_ann * ratio)
-    non_annotated_patches = categorized_patches["non_annotated"]
-
-    # Make sure non_annotated_patches is a list here
-    random.seed(seed)
-    selected_non_annotated_patches = random.sample(non_annotated_patches, min(num_to_select, len(non_annotated_patches)))
-
-    # When determining which patches to delete, convert to sets for the operation, if necessary
-    selected_non_annotated_patches_set = set(selected_non_annotated_patches)
-    non_annotated_patches_set = set(non_annotated_patches)
-    patches_to_delete = non_annotated_patches_set - selected_non_annotated_patches_set
-
-    print(f"Found {num_ann} patches with annotation. Keeping {len(selected_non_annotated_patches)} non-annotated patches.")
-    print(f"Deleting {len(patches_to_delete)} non-annotated patches.")
-
-    return patches_to_delete
-
-def delete_patches(patches_paths):
-    for img_path, msk_path in tqdm(patches_paths, total=len(patches_paths), desc="Deleting patches"):
-        try:
-            img_path.unlink()
-            msk_path.unlink()
-        except FileNotFoundError as e:
-            tqdm.write(f"File not found: {e}")
-        except OSError as e:
-            tqdm.write(f"Error deleting {e.filename}: {e.strerror}")
-
-def extract_patch_coordinates(filepath):
-    """Extracts the row and column coordinates from the filename of a patch."""
-    filename = filepath.stem
-    match = re.search(r"patch_(\d+)_(\d+)\.nc", filename)
-    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+def write_patch(patch, patch_filepath, patch_meta):
+    with rasterio.open(patch_filepath, 'w', **patch_meta) as dst:
+        dst.write(patch)
 
 def extract_band_data_for_annotation(annotation, band_files):
     ''' Process each opened band for the given annotation '''
