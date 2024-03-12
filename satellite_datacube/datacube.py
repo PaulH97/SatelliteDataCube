@@ -2,7 +2,7 @@ import os
 from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
 from .annotation import SatelliteImageAnnotation
-from .utils import transform_spectal_signature, pad_patch, log_progress, patch_to_xarray
+from .utils import transform_spectal_signature, pad_patch, log_progress, patch_to_xarray, available_workers
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +11,8 @@ import shutil
 import rasterio
 import xarray as xr
 import logging
+import traceback
+import json
 
 class SatelliteDataCube:
     def __init__(self):
@@ -122,58 +124,23 @@ class SatelliteDataCube:
         end_date = max(self.images_by_date.keys())
         return start_date, end_date
 
-    def create_spectral_signature_of_single_annotation(self, annotation_id, indizes=False):
-        ann_dc_spectral_sig = {}
-        for image_date, image in self.selected_images_by_date.items():
-            ann_spetral_signature = image.create_spectral_signature_of_single_annotation(annotation_id, indizes=indizes)
-            ann_dc_spectral_sig[image_date] = ann_spetral_signature
-        return ann_dc_spectral_sig
+    def create_spectral_signature(self, bands, output_dir=None):
+        output_dir = self.base_folder / "other" if not output_dir else output_dir
+        ouput_path = Path(output_dir) / f"{self.base_folder.name}_s2_specSig.json"
+        dc_specSig = {}
+        if not ouput_path.exists():
+            for date, image in self.images_by_date.items():
+                specSig = image.extract_band_data_of_annotations(bands)
+                dc_specSig[date] = specSig
+                print("Extracted spectral signature from image at date:", date)
+        else:
+            with open(ouput_path, "r") as file:
+                return json.load(file)
+        return dc_specSig
 
-    def create_spectral_signature_of_all_annotations(self, indizes=False):
-        datacube_spectral_sig = {}
-        for image_date, image in self.selected_images_by_date.items():
-            annotations_speSignature = image.create_spectral_signature(annotation=self.annotation, indizes=indizes)
-            datacube_spectral_sig[image_date] = annotations_speSignature
-        self.spectral_signature = transform_spectal_signature(datacube_spectral_sig) # self.spectral_signature['B02'])
-        return self.spectral_signature
-   
-    def create_patches_of_single_(self, patchsize, overlay, output_dir=None):
-        tasks = [(image, patchsize, overlay, self.ann_file, output_dir) for image in self.images_by_date.values()]
-
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            future_tasks = {executor.submit(SatelliteDataCube._process_mask_patch, task): task for task in tasks}
-        
-            count = 0
-            for future in as_completed(future_tasks):
-                count += 1  # Increment the counter for each completed task
-                image = future_tasks[future][0]
-                try:
-                    future.result()
-                    if count % 10 == 0:  # Check if the count is divisible by 10
-                        print(f"10 image masks processed. Most recent: {image} on {image.date}")
-                except Exception as exc:
-                    print(f"Task generated an exception: {image.date}, {exc}")    
-
-    def create_patches_of_single_images(self, patchsize, overlay, output_dir=None):
-        tasks = [(image, patchsize, overlay, output_dir) for image in self.images_by_date.values()]
-        # Use ProcessPoolExecutor to parallelize the task
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            future_tasks = {executor.submit(SatelliteDataCube._process_image_patch, task): task for task in tasks}
-                
-            count = 0
-            for future in as_completed(future_tasks):
-                count += 1  # Increment the counter for each completed task
-                image = future_tasks[future][0]
-                try:
-                    future.result()
-                    if count % 10 == 0:  # Check if the count is divisible by 10
-                        print(f"10 images processed. Most recent: {image} on {image.date}")
-                except Exception as exc:
-                    print(f"Task generated an exception: {image.date}, {exc}")          
-    
     def rasterize_annotations(self, resolution):
         tasks = [(image, self.ann_file, resolution) for image in self.images_by_date.values()]
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with ProcessPoolExecutor(max_workers=available_workers()) as executor:
             future_tasks = {executor.submit(SatelliteDataCube._rasterize_annotation, task): task for task in tasks}
             log_progress(future_tasks=future_tasks, desc="Rasterize annotation of images")
         return [SatelliteImageAnnotation(image, self.ann_file) for image in self.images_by_date.values()]
@@ -184,7 +151,7 @@ class SatelliteDataCube:
         result = {"status": "", "details": "", "error": ""}
         try:
             annotation = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
-            annotation.rasterize(resolution)
+            annotation.rasterize(resolution=resolution)
             result["status"] = "success"
             result["details"] = f"Successfully processed IMG patches for {image} on {image.date}."
         except Exception as e:
@@ -194,14 +161,14 @@ class SatelliteDataCube:
 
     def stack_bands_of_images(self):
         tasks = [(image) for image in self.images_by_date.values()] # necessary to put it in tuple - for serialization 
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with ProcessPoolExecutor(max_workers=available_workers()) as executor:
             future_tasks = {executor.submit(SatelliteDataCube._stacking_image_bands, task): task for task in tasks}
             log_progress(future_tasks=future_tasks, desc="Stacking bands of images")
         return list(self.images_by_date.values())
     
     @staticmethod
     def _stacking_image_bands(task):
-        result = {"status": "", "details": "", "error": ""}
+        result = {"status": "", "details": "", "error": "", "traceback": ""}
         image = task
         try:
             image.stack_bands() 
@@ -210,6 +177,7 @@ class SatelliteDataCube:
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
+            result["traceback"] = traceback.format_exc()  # Capture full traceback
         return result
       
     def create_img_patches(self, patch_size, overlay=0, padding=True, output_dir=None):
@@ -239,7 +207,6 @@ class SatelliteDataCube:
         output_dir = output_dir  if output_dir else self.base_folder 
         patches_dir = Path(output_dir) / self.satellite
         if not patches_dir.exists():
-            patches_dir.mkdir(parents=True, exist_ok=True)
             var_name = "reflectance" # Define your variable name here
             tasks = []
             images = self.stack_bands_of_images()
@@ -250,7 +217,8 @@ class SatelliteDataCube:
                     for j in range(0, src.height, step_size):
                         task = (i, j, patch_size, images_paths, padding, var_name, patches_dir)
                         tasks.append(task)
-            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+
+            with ProcessPoolExecutor(max_workers=available_workers()) as executor:
                 future_tasks = {executor.submit(SatelliteDataCube._extract_and_combine_patches, task): task for task in tasks}
                 log_progress(future_tasks=future_tasks, desc="Creating 4D IMG patches")
         return patches_dir
@@ -282,7 +250,6 @@ class SatelliteDataCube:
         output_dir = output_dir if output_dir else self.base_folder
         patches_dir = Path(output_dir) / "annotation"
         if not patches_dir.exists():
-            patches_dir.mkdir(parents=True, exist_ok=True)
             var_name = "class" 
             annotations = self.rasterize_annotations(resolution=10)
             masks_paths = [annotation.mask_path for annotation in annotations]
@@ -296,7 +263,7 @@ class SatelliteDataCube:
                         task = (i, j, patch_size, mask_path, padding, var_name, patches_dir)
                         tasks.append(task)
 
-            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            with ProcessPoolExecutor(max_workers=available_workers()) as executor:
                 future_tasks = {executor.submit(SatelliteDataCube._extract_and_combine_patches, task): task for task in tasks}
                 log_progress(future_tasks=future_tasks, desc="Creating 4D MSK patches")
         
@@ -325,6 +292,7 @@ class SatelliteDataCube:
             patch_4d = xr.concat(patches, dim='time') if len(patches) > 1 else patches[0].expand_dims('time')
             patch_ds = patch_4d.to_dataset(name=var_name)
             patch_ts_filepath = output_dir / f"patch_{i}_{j}.nc"
+            patch_ts_filepath.parent.mkdir(parents=True, exist_ok=True)
             patch_ds.to_netcdf(patch_ts_filepath, format="NETCDF4", engine="h5netcdf")
             result["status"] = "success"
             result["details"] = f"Successfully processed patches for patch_{i}_{j}"
@@ -351,7 +319,7 @@ class SatelliteDataCube:
 
         if files_to_remove:
             # Use ThreadPoolExecutor to remove directories and files in parallel
-            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            with ThreadPoolExecutor(max_workers=available_workers()) as executor:
                 future_tasks = {executor.submit(SatelliteDataCube._safe_delete, file_path): file_path for file_path in files_to_remove if file_path.exists()}
                 log_progress(future_tasks, desc="Cleaning Datacube")
         else:
