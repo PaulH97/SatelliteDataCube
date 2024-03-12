@@ -12,6 +12,21 @@ from concurrent.futures import as_completed
 import xarray as xr
 from traceback import format_exc
 
+def extract_band_number(key):
+    order = {"SCL": 100, "NDVI": 102, "NDWI": 101}
+    return order.get(key, int(re.findall(r'\d+', key)[0]) if re.findall(r'\d+', key) else float('inf'))
+
+def extract_band_info(file_name):
+    pattern = r"(B\d+[A-Z]?|SCL|NDVI|NDWI)\.tif"
+    match = re.search(pattern, file_name)
+    return match.group(1) if match else None
+
+def available_workers():
+    total_cores = os.cpu_count()
+    load_average = os.getloadavg()[0]  # Get 1-minute load average
+    free_cores = max(1, min(total_cores, int(total_cores - load_average)))
+    return free_cores
+
 def patch_to_xarray(patch, transform, crs, start_x, start_y):
     # Create an xarray DataArray for the patch, including spatial metadata
     patch_xarray = xr.DataArray(
@@ -36,11 +51,13 @@ def log_progress(future_tasks, desc="Processing tasks"):
                 result = future.result()
                 pbar.update(1)
                 if result["status"] == "success":
-                    pass  # Success logging
+                    # Success logging
+                    pass
                 else:
+                    # Here, log the error along with the traceback
                     print(f"Task raised following error: {result['error']}")
+                    print("Error details:", result["traceback"])
             except Exception as exc:
-                # Log the traceback to get detailed information about where the exception occurred
                 traceback_details = format_exc()
                 print(f"Unexpected exception: {traceback_details}")
                 raise RuntimeError("A task in the pool failed.") from exc
