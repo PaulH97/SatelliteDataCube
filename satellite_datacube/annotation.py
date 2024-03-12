@@ -4,94 +4,109 @@ import geopandas as gpd
 from rasterio.features import geometry_mask
 from .utils import pad_patch, get_metadata_of_window
 from rasterio.windows import Window
- 
+
 class SatelliteImageAnnotation:
     def __init__(self, satellite_image, shapefile_path):
         self.image = satellite_image
-        self.shp_path = shapefile_path
-        self.mask_path = self.get_valid_mask_file()
-        self.dataframe = None
+        self.shp_path = Path(shapefile_path)
+        self.mask_path = self._find_valid_mask_file()
+        self.dataframe = self._load_dataframe()
 
-    def get_valid_mask_file(self, resolution=10):
-        files = [file for file in self.image.folder.iterdir() if file.is_file() and file.suffix.lower() in ['.tif', '.tiff']]
-        mask_files = [file for file in files if f"{resolution}m_mask" in file.stem.lower()] if resolution else [file for file in files if "mask" in file.stem.lower()]
-        return mask_files[0] if mask_files else None
+    def _find_valid_mask_file(self, resolution=10):
+        mask_suffixes = ['.tif', '.tiff']
+        mask_keyword = f"{resolution}m_mask" if resolution else "mask"
+        files = [file for file in self.image.folder.iterdir() if file.is_file() and file.suffix.lower() in mask_suffixes and mask_keyword in file.stem.lower()]
+        return files[0] if files else None
 
-    def load_dataframe(self):
-        if self.dataframe is not None:
-            return self.dataframe
+    def _load_dataframe(self):
         df = gpd.read_file(self.shp_path)
-        repaired_geometries = []
-        for geom in df["geometry"]:
-            # Check if geometry is None
-            if geom is None:
-                # Here we replace None with an empty GeometryCollection
-                repaired_geom = gpd.GeoSeries([geom]).buffer(0).iloc[0] if geom else geom
-            elif not geom.is_valid:
-                # Repair invalid geometries
-                repaired_geom = geom.buffer(0)
-            else:
-                # Geometry is valid and not None, no need to repair
-                repaired_geom = geom
-            repaired_geometries.append(repaired_geom)
-        df["geometry"] = repaired_geometries
-        self.dataframe = df
-        return self.dataframe
+        df["geometry"] = df["geometry"].apply(self._repair_geometry)
+        return df
 
-    def load_and_transform_to_crs(self, epsg_code):
-        """
-        Transforms the loaded dataframe to the given CRS specified by an EPSG code.
-        """
-        annotation_df = self.load_dataframe()  
-        target_crs = rasterio.crs.CRS.from_epsg(epsg_code)
-        # Check if the dataframe's CRS differs from the target CRS
-        if annotation_df.crs != target_crs:
-            annotation_df = annotation_df.to_crs(target_crs)
-        return annotation_df
-    
-    def rasterize(self, resolution):
+    @staticmethod
+    def _repair_geometry(geom):
+        if geom is None or not geom.is_valid:
+            return geom.buffer(0) if geom else None
+        return geom
+
+    def transform_annotations_to_image_crs(self):
+        with rasterio.open(self.image.path) as src:
+            image_crs = src.crs
+        if self.dataframe.crs != image_crs:
+            self.dataframe.to_crs(image_crs, inplace=True)
+
+    def rasterize_annotations(self, resolution):
         if not self.mask_path:
-            print("Rasterizing...")
-            band_with_desired_res = self.image.find_band_by_res(resolution)
-            if band_with_desired_res is None:
-                raise ValueError(f"Resolution {resolution} not found. Please refine your resolution to match one of the available image bands.")
-            with rasterio.open(band_with_desired_res.path) as src:
-                crs_epsg = src.crs.to_epsg()
-                raster_meta = src.meta.copy()
-                raster_meta.update({'dtype': 'uint8', 'count': 1})
+            self._create_mask(resolution)
+        return self.mask_path
 
-            geometries = self.load_and_transform_to_crs(crs_epsg)["geometry"].to_list()
+    def _create_mask(self, resolution):
+        self.transform_annotations_to_image_crs()
+        band_path = self.image.find_band_by_resolution(resolution)
+        if band_path is None:
+            raise ValueError(f"Resolution {resolution} not found in image bands.")
 
-            mask_filepath = self.image.folder / f"{self.image.name}_{resolution}m_mask_.tif" # S2_mspc_l2a_20190509_10m_mask.tif
-            with rasterio.open(mask_filepath, 'w', **raster_meta) as dst:
-                mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
-                dst.write(mask.astype(rasterio.uint8), 1)
-            self.mask_path = mask_filepath
-        return self
-    
-    def plot(self):
-        return self.band.plot()
-    
+        with rasterio.open(band_path) as src:
+            raster_meta = src.meta.copy()
+            raster_meta.update({'dtype': 'uint8', 'count': 1})
+
+        geometries = self.dataframe["geometry"].values
+        mask_filepath = self.image.folder / f"{self.image.name}_{resolution}m_mask.tif"
+
+        with rasterio.open(mask_filepath, 'w', **raster_meta) as dst:
+            mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
+            dst.write(mask.astype(rasterio.uint8), 1)
+
+        self.mask_path = mask_filepath
+
     def create_patches(self, patch_size, overlay=0, padding=True, output_dir=None):
+        output_dir = Path(output_dir) if output_dir else self.image.folder / "patches" / "MSK"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         with rasterio.open(self.mask_path) as src:
-            step_size = patch_size - overlay
-            for i in range(0, src.width,  step_size):
-                for j in range(0, src.height, step_size):
-                    window = Window(j, i, patch_size, patch_size)
-                    patch = src.read(window=window)        
-                    # Check if patch needs padding
-                    if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
-                        patch = pad_patch(patch, patch_size)
-                    elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
-                        continue  # Skip patches that are smaller than patch_size when padding is False
-                    # Update metadata for the patch
-                    patch_meta = get_metadata_of_window(src, window)
-                    patches_folder = output_dir if output_dir else self.image.folder / "patches" / "MSK"
-                    patches_folder.mkdir(parents=True, exist_ok=True)
-                    patch_filepath = patches_folder / f"patch_{i}_{j}.tif"
-                    with rasterio.open(patch_filepath, 'w', **patch_meta) as dst:
-                            dst.write(patch)
+            patches_folder = self._generate_patches(src, patch_size, overlay, padding, output_dir)
         return patches_folder
+
+    def _generate_patches(self, src, patch_size, overlay, padding, output_dir):
+        step_size = patch_size - overlay
+        for i in range(0, src.width, step_size):
+            for j in range(0, src.height, step_size):
+                patch, window = self._extract_patch(src, i, j, patch_size, padding)
+                if patch is not None:
+                    self._save_patch(patch, window, src, i, j, output_dir)
+        return output_dir
+
+    @staticmethod
+    def _extract_patch(src, i, j, patch_size, padding):
+        window = Window(i, j, patch_size, patch_size)
+        patch = src.read(window=window)
+        if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
+            patch = np.pad(patch, ((0, 0), (0, patch_size - patch.shape[1]), (0, patch_size - patch.shape[2])), mode='constant')
+        elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
+            return None, None
+        return patch, window
+    
+    def _save_patch(self, patch, window, src, i, j, output_dir):
+        patch_meta = src.meta.copy()
+        patch_meta.update({
+            'height': window.height,
+            'width': window.width,
+            'transform': rasterio.windows.transform(window, src.transform)
+        })
+        patch_filename = f"patch_{i}_{j}.tif"
+        patch_filepath = output_dir / patch_filename
+        
+        with rasterio.open(patch_filepath, 'w', **patch_meta) as patch_dst:
+            patch_dst.write(patch)
+
+    # def calculate_scl_data_of_annotation(self):
+    #     annotation_scl = {}
+    #     annotation_df = self.annotation.load_dataframe()
+    #     for index, row in annotation_df.iterrows():
+    #         with rasterio.open(self.scl_path) as src:
+    #             out_image, out_transform = mask(src, [row["geometry"]], crop=True)
+    #             annotation_scl[row["id"]] = out_image.flatten()
+    #     return annotation_scl
 
 # class Sentinel2Annotation(SatelliteImageAnnotation):
 #     def __init__(self, shapefile_path):
