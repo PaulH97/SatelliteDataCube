@@ -12,11 +12,10 @@ class SatelliteImageAnnotation:
         self.mask_path = self.get_valid_mask_file()
         self.dataframe = None
 
-    def get_valid_mask_file(self):
-        for file in self.image.folder.iterdir():  # Corrected method name: iterdir
-            if file.is_file() and file.suffix.lower() in ['.tif', '.tiff'] and "mask" in file.stem.lower():
-                return file
-        return None
+    def get_valid_mask_file(self, resolution=10):
+        files = [file for file in self.image.folder.iterdir() if file.is_file() and file.suffix.lower() in ['.tif', '.tiff']]
+        mask_files = [file for file in files if f"{resolution}m_mask" in file.stem.lower()] if resolution else [file for file in files if "mask" in file.stem.lower()]
+        return mask_files[0] if mask_files else None
 
     def load_dataframe(self):
         if self.dataframe is not None:
@@ -52,6 +51,7 @@ class SatelliteImageAnnotation:
     
     def rasterize(self, resolution):
         if not self.mask_path:
+            print("Rasterizing...")
             band_with_desired_res = self.image.find_band_by_res(resolution)
             if band_with_desired_res is None:
                 raise ValueError(f"Resolution {resolution} not found. Please refine your resolution to match one of the available image bands.")
