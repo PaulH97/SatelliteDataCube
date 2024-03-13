@@ -11,6 +11,39 @@ from tqdm import tqdm
 from concurrent.futures import as_completed
 import xarray as xr
 from traceback import format_exc
+import json
+
+def split_dataframe(df, n_chunks):
+    """Split a DataFrame into roughly equal parts using groupby.
+
+    Args:
+        df (pandas.DataFrame): The DataFrame to split.
+        n_chunks (int): The number of chunks to split the DataFrame into.
+
+    Returns:
+        list of pandas.DataFrame: A list of DataFrame chunks.
+    """
+    df['group'] = df.index % n_chunks  # Create a group column to split by
+    chunks = [group for _, group in df.groupby('group')]
+    df.drop(columns=['group'], inplace=True)  # Clean up temporary column
+    return chunks
+
+def load_spectral_signature(output_path):
+    try:
+        with open(output_path, "r") as file:
+            spectral_signature = json.load(file)
+            return spectral_signature
+    except Exception as e:
+        print(f"Failed to load spectral signatures from {output_path}: {e}")
+        return {}
+
+def save_spectral_signature(spectral_signature, output_path):
+    try:
+        with open(output_path, "w") as file:
+            json.dump(spectral_signature, file)
+        print(f"Spectral signatures saved to {output_path}")
+    except Exception as e:
+        print(f"Failed to save spectral signatures to {output_path}: {e}")
 
 def extract_band_number(key):
     order = {"SCL": 100, "NDVI": 102, "NDWI": 101}
@@ -91,16 +124,16 @@ def extract_nearby_ndvi_data(annotation, band_files):
     else:
         return np.mean(ann_ndvi_masked) 
 
-def get_scl_mask_of_buffered_polygon(polygon, opened_scl_raster, scl_keys):
-    buffer_distance = 10
-    while buffer_distance <= 100:
-        polygon_buffered = polygon.buffer(buffer_distance)
-        polygon_around_annotation = polygon_buffered.difference(polygon)
-        around_ann_scl_data, _ = mask(opened_scl_raster, [polygon_around_annotation], crop=True)
-        around_ann_scl_mask = np.isin(around_ann_scl_data, scl_keys) 
-        if np.any(around_ann_scl_mask): 
-            break
-        buffer_distance += 10
+def buffer_ann_and_extract_scl_data(ann_polygon, scl_raster, scl_keys, buffer_distance=10):
+    with rasterio.open(scl_raster, "r") as src:
+        while buffer_distance <= 100:
+            polygon_buffered = ann_polygon.buffer(buffer_distance)
+            polygon_around_annotation = polygon_buffered.difference(ann_polygon)
+            around_ann_scl_data, _ = mask(src, [polygon_around_annotation], crop=True)
+            around_ann_scl_mask = np.isin(around_ann_scl_data, scl_keys) 
+            if np.any(around_ann_scl_mask): 
+                break
+            buffer_distance += 10
     return polygon_around_annotation, around_ann_scl_mask
 
 def transform_spectal_signature(spectral_signature_by_dates):

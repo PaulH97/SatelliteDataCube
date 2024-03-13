@@ -2,7 +2,6 @@ import numpy as np
 import rasterio
 from matplotlib import pyplot as plt
 import re
-from rasterio.mask import mask
 from rasterio.windows import Window
 from .utils import band_management_decorator, extract_band_data_for_annotation, extract_nearby_ndvi_data, pad_patch, get_metadata_of_window, extract_band_info, extract_band_number
 from .band import SatelliteBand
@@ -205,20 +204,6 @@ class Sentinel2(SatelliteImage):
                 dst.write(index)
             self.bands["NDWI"] = index_path
         return index
-
-    def create_spectral_signature(self, band_ids, annotation_file):
-        if not self.exists_and_stacked():
-            self.stack_bands()
-        image = rasterio.open(self.path)
-        ann = SatelliteImageAnnotation(satellite_image=self, shapefile_path=annotation_file)
-        ann.transform_annotations_to_image_crs()
-        anns_band_data = {} # TODO Here continue work!!!!
-        for index, row in ann.dataframe.iterrows():
-            ann_bands_data = extract_band_data_for_annotation(annotation=row, band_files=band_files)
-            ann_bands_data["NDVI2"] = extract_nearby_ndvi_data(annotation=row, band_files=band_files)
-            anns_band_data[row["id"]] = ann_bands_data
-        [band.close() for band in band_files.values()]
-        return anns_band_data
     
     def plot_rgb(self):
         red = self._loaded_bands["B04"].stretch_contrast()

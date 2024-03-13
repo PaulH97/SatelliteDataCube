@@ -2,7 +2,7 @@ import os
 from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
 from .annotation import SatelliteImageAnnotation
-from .utils import transform_spectal_signature, pad_patch, log_progress, patch_to_xarray, available_workers
+from .utils import save_spectral_signature, pad_patch, log_progress, patch_to_xarray, available_workers
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +12,8 @@ import rasterio
 import xarray as xr
 import logging
 import traceback
-import json
+from tqdm import tqdm
+from traceback import format_exc
 
 class SatelliteDataCube:
     def __init__(self):
@@ -123,21 +124,91 @@ class SatelliteDataCube:
         start_date = min(self.images_by_date.keys())
         end_date = max(self.images_by_date.keys())
         return start_date, end_date
+    
+    def create_spectral_signature(self, band_ids, indizes=False, output_dir=None):
+        """
+        Creates spectral signatures for annotations across multiple satellite images in parallel.
+        
+        This method iterates over all satellite images, calculates spectral signatures for each
+        annotation, and compiles them into a comprehensive dictionary, which is then saved to a JSON file.
 
-    def create_spectral_signature(self, bands, output_dir=None):
-        output_dir = self.base_folder / "other" if not output_dir else output_dir
-        ouput_path = Path(output_dir) / f"{self.base_folder.name}_s2_specSig.json"
-        dc_specSig = {}
-        if not ouput_path.exists():
-            for date, image in self.images_by_date.items():
-                specSig = image.extract_band_data_of_annotations(bands)
-                dc_specSig[date] = specSig
-                print("Extracted spectral signature from image at date:", date)
-        else:
-            with open(ouput_path, "r") as file:
-                return json.load(file)
+        Parameters:
+        - band_ids (list of str): List of band identifiers for which spectral signatures will be calculated.
+        - indizes (bool): Flag indicating whether to calculate additional indices (e.g., NDVI) for each image.
+        - output_dir (Path or str, optional): Directory where the spectral signature JSON file will be saved.
+        Defaults to a subdirectory named 'other' in the base folder if not specified.
+
+        Returns:
+        - dict: A dictionary mapping annotation IDs to their spectral signatures across all images, organized by date.
+
+        The method also logs errors and success messages for each image's processing, ensuring that any
+        issues encountered are reported.
+        """
+        output_dir = self.base_folder / "other" if not output_dir else Path(output_dir)
+        output_path = output_dir / f"{self.base_folder.name}_s2_specSig.json"
+
+        tasks = [(image, self.ann_file, band_ids, indizes) for image in self.images_by_date.values()]
+
+        with ProcessPoolExecutor(max_workers=available_workers()) as executor:
+            future_tasks = {executor.submit(SatelliteDataCube._create_specSig_of_image, task): task for task in tasks}
+            dc_specSig = {}
+            for future in tqdm(as_completed(future_tasks), total=len(future_tasks), desc="Creating spectral signature"):
+                img_date, img_specSig, logs = future.result()
+                for ann_id, bands in img_specSig.items():
+                    if ann_id not in dc_specSig:
+                        dc_specSig[ann_id] = {}
+                    dc_specSig[ann_id][img_date.strftime("%Y%m%d")] = bands
+                try:
+                    if logs["status"] == "success":
+                        pass
+                    else:
+                        print(f"Task raised following error: {logs['error']}")
+                except Exception as exc:
+                    traceback_details = format_exc()
+                    print(f"Unexpected exception {exc}: {traceback_details}")
+
+        save_spectral_signature(dc_specSig, output_path)
         return dc_specSig
 
+    @staticmethod
+    def _create_specSig_of_image(task):
+        """
+        Static method to create spectral signatures for a single satellite image's annotations.
+        
+        This method is designed to be called in parallel for multiple images. It checks if the spectral
+        signature file already exists to avoid duplicate processing and calculates the spectral signatures
+        based on specified band IDs.
+
+        Parameters:
+        - task (tuple): A tuple containing information required for processing a single image, including
+        the image object, annotation file path, band IDs, indices calculation flag, and output file path.
+
+        Returns:
+        - tuple: A tuple containing the image date, the calculated spectral signatures for the image,
+        and a result dictionary with the status, details, and any errors encountered.
+        
+        The spectral signatures include various bands and, if specified, additional indices like NDVI.
+        Errors and processing details are captured in a result dictionary for logging and debugging.
+        """
+        image, ann_file, band_ids, indizes = task
+        result = {"status": "", "details": "", "error": ""}
+        img_specSig = {}
+        try:
+            if indizes:
+                image.calculate_all_indizes()
+            ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
+            ann_specSig = ann.create_spectral_signature(band_ids) 
+            for ann_id, bands in ann_specSig.items():
+                if ann_id not in img_specSig:
+                    img_specSig[ann_id] = {}
+                img_specSig[ann_id][image.date.strftime("%Y%m%d")] = bands
+            result["status"] = "success"
+            result["details"] = f"Successfully created spectral signature for {image} on {image.date}."
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        return image.date, img_specSig, result
+            
     def rasterize_annotations(self, resolution):
         tasks = [(image, self.ann_file, resolution) for image in self.images_by_date.values()]
         with ProcessPoolExecutor(max_workers=available_workers()) as executor:
@@ -301,7 +372,7 @@ class SatelliteDataCube:
             result["error"] = str(e)
         return result
 
-    def clean(self):
+    def clean(self, indizes=False):
         """
         Cleans up the satellite data cube by removing unnecessary directories and files.
         
@@ -314,8 +385,9 @@ class SatelliteDataCube:
         files_to_remove = []
         for image in self.images_by_date.values():
             files_to_remove.extend(image.folder.glob("*resampled*"))
-            files_to_remove.extend(image.folder.glob("*NDVI*"))
-            files_to_remove.extend(image.folder.glob("*NDWI*"))
+            if indizes:
+                files_to_remove.extend(image.folder.glob("*NDVI*"))
+                files_to_remove.extend(image.folder.glob("*NDWI*"))
 
         if files_to_remove:
             # Use ThreadPoolExecutor to remove directories and files in parallel
