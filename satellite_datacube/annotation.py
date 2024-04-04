@@ -1,13 +1,12 @@
+from .band import SatelliteBand
 import rasterio
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import geopandas as gpd
 from rasterio.features import geometry_mask
-from .utils import buffer_ann_and_extract_scl_data, split_dataframe, available_workers
-from rasterio.windows import Window
+from .utils import buffer_ann_and_extract_scl_data
+from rasterio.windows import Window, transform
 import numpy as np
 from rasterio.mask import mask
-from tqdm import tqdm
 
 class SatelliteImageAnnotation:
     def __init__(self, satellite_image, shapefile_path):
@@ -28,6 +27,7 @@ class SatelliteImageAnnotation:
         self.shp_path = Path(shapefile_path)
         self.mask_path = self._find_valid_mask_file()
         self.dataframe = self._load_dataframe()
+        self._transform_dataframe_to_image_crs()
 
     def _find_valid_mask_file(self, resolution=10):
         """
@@ -70,7 +70,7 @@ class SatelliteImageAnnotation:
             return geom.buffer(0) if geom else None
         return geom
 
-    def transform_annotations_to_image_crs(self):
+    def _transform_dataframe_to_image_crs(self):
         """
         Transform the annotations in the dataframe to match the coordinate reference system (CRS) of the satellite image.
         """
@@ -79,7 +79,7 @@ class SatelliteImageAnnotation:
         if self.dataframe.crs != image_crs:
             self.dataframe.to_crs(image_crs, inplace=True)
 
-    def rasterize_annotations(self, resolution):
+    def rasterize(self, resolution):
         """
         Rasterize the annotations based on a specified resolution, updating or creating a mask file.
 
@@ -103,8 +103,8 @@ class SatelliteImageAnnotation:
         Raises:
         - ValueError: If no band is found matching the specified resolution in the image bands.
         """
-        self.transform_annotations_to_image_crs()
-        band_path = self.image.find_band_by_resolution(resolution)
+        self._transform_dataframe_to_image_crs()
+        band_path = self.image.find_band_by_res(resolution)
         if band_path is None:
             raise ValueError(f"Resolution {resolution} not found in image bands.")
 
@@ -180,7 +180,8 @@ class SatelliteImageAnnotation:
         - tuple: A tuple containing the extracted patch and its window. If padding is False and the patch is smaller
         than the specified size, returns (None, None).
         """
-        window = Window(i, j, patch_size, patch_size)
+        args = [i, j, patch_size, patch_size]
+        window = Window(*args)
         patch = src.read(window=window)
         if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
             patch = np.pad(patch, ((0, 0), (0, patch_size - patch.shape[1]), (0, patch_size - patch.shape[2])), mode='constant')
@@ -206,7 +207,7 @@ class SatelliteImageAnnotation:
         patch_meta.update({
             'height': window.height,
             'width': window.width,
-            'transform': rasterio.windows.transform(window, src.transform)
+            'transform': transform(window, src.transform)
         })
         patch_filename = f"patch_{i}_{j}.tif"
         patch_filepath = output_dir / patch_filename
@@ -214,46 +215,81 @@ class SatelliteImageAnnotation:
         with rasterio.open(patch_filepath, 'w', **patch_meta) as patch_dst:
             patch_dst.write(patch)
 
-    def create_spectral_signature(self, band_ids):
+    def create_spectral_signature(self, band_ids, filtering=False):
         """
-        Generates spectral signatures for annotations within a dataframe by extracting
-        data from specified bands of satellite imagery.
-
-        This method first transforms annotation coordinates to the image coordinate reference system (CRS).
-        It then opens the satellite image bands specified by `band_ids` and extracts the spectral data
-        for the geometries defined in the dataframe's annotations. For each annotation, the method calculates
-        the mean spectral value for regular bands, mean value for NDVI and NDWI bands where values are greater than 0,
-        and the frequency of each unique value in the SCL band.
+        Generates spectral signatures for annotations, extracting data from specified
+        bands of satellite imagery. Optionally filters annotations based on pixel quality.
 
         Parameters:
-        - band_ids (list of str): A list of band identifiers for which spectral data will be extracted.
+        - band_ids (list of str): Identifiers for the bands from which data will be extracted.
+        - filtering (bool): Whether to filter annotations based on the quality of pixels in the "SCL" band.
 
         Returns:
-        - dict: A dictionary mapping each annotation ID to its spectral signature. The spectral signature is
-        represented as a dictionary of band IDs to their extracted values (mean or distribution depending on the band type).
-
-        Note:
-        - This function assumes that `self.image.bands` contains a mapping of band IDs to their file paths,
-        and `self.dataframe` contains the annotations with geometries and IDs.
+        - dict: Mapping each annotation ID to its spectral signature across specified bands.
         """
-        self.transform_annotations_to_image_crs()
-        anns_band_data = {} 
-        opened_bands = {band_id: rasterio.open(band_path) for band_id, band_path in self.image.bands.items()}
+        if filtering and "SCL" not in band_ids:
+            band_ids.append("SCL")  # Ensure "SCL" is included for filtering
+        
+        [idx_function() for idx, idx_function in self.image.index_functions.items() if idx in band_ids]
+        opened_bands = {}
+        for band_id, band_path in self.image.bands.items():
+            if band_id in band_ids:
+                band = SatelliteBand(band_name=band_id, band_path=band_path).resample(10)
+                opened_bands[band_id] = rasterio.open(band.path)
+        
+        anns_band_data = {}
         for index, row in self.dataframe.iterrows():
-            ann_bands_data ={}
+            ann_bands_data = {}
             for band_id, band in opened_bands.items():
-                if band_id in band_ids:
-                    ann_band_data, _ = mask(band, [row["geometry"]], crop=True)
+                try:
                     if band_id == "SCL":
+                        ann_band_data, _ = mask(band, [row["geometry"]], crop=True, nodata=99) # we need to define a new noData value outside 0-12
                         unique, counts = np.unique(ann_band_data.flatten(), return_counts=True)
                         ann_bands_data[band_id] = {int(u): int(c) for u, c in zip(unique, counts)}
-                    elif band_id in ["NDVI", "NDWI"]:          
-                        ann_bands_data[band_id] = np.mean(ann_band_data[ann_band_data>0]) if np.any(ann_band_data>0) else 0
                     else:
-                        ann_bands_data[band_id] = ann_band_data.mean()
+                        ann_band_data, _ = mask(band, [row["geometry"]], crop=True, nodata=-9999)
+                        valid_data = ann_band_data[ann_band_data > 0] # filters out the nodata values 
+                        ann_bands_data[band_id] = np.mean(valid_data) if valid_data.size > 0 else 0
+                except Exception as e:
+                    print(f"Error processing band {band_id}: {e}")
+                    ann_bands_data[band_id] = None
+
             anns_band_data[row["id"]] = ann_bands_data
+        
+        if filtering:
+            anns_band_data = self.filter_ann_by_bad_pixels(anns_band_data)
         [band.close() for band in opened_bands.values()]
+
         return anns_band_data
+    
+    @staticmethod
+    def filter_ann_by_bad_pixels(anns_band_data, bad_pixel_ratio=30):
+        """
+        Filters annotations by their bad pixel ratio in the "SCL" band. If the ratio of bad pixels
+        to total pixels exceeds the given threshold, the annotation's data is replaced with an empty
+        dictionary, effectively retaining the annotation ID but indicating its data is unreliable.
+
+        Parameters:
+        - anns_band_data (dict): The dictionary containing annotation IDs as keys and corresponding
+        band data as values.
+        - bad_pixel_ratio (float, optional): The threshold ratio (percentage) of bad pixels above which
+        the annotation data is considered unreliable. Defaults to 50.
+
+        Returns:
+        - dict: The filtered annotations dictionary with annotations having a high bad pixel ratio
+        having their data replaced with an empty dictionary.
+        """
+        filtered_anns_band_data = {}
+        for ann_id, bands in anns_band_data.items():
+            ls_pixel_count = sum([count for count in bands["SCL"].values()])
+            bad_pixel_count = sum([count for scl_key, count in bands["SCL"].items() if int(scl_key) in [0,1,2,3,8,9,10,11]])
+            ann_bad_pixel_ratio = (bad_pixel_count/ls_pixel_count) * 100
+            if ann_bad_pixel_ratio <= bad_pixel_ratio:
+                bands.pop("SCL", None)
+                filtered_anns_band_data[ann_id] = bands 
+            else:  
+                filtered_anns_band_data[ann_id] = {}
+        return filtered_anns_band_data
 
     def get_ndvi_around_polygon(self, buffer_distance=10):
         """
@@ -273,14 +309,18 @@ class SatelliteImageAnnotation:
         calculated around the buffered polygon. If no vegetation is detected within the buffered area, the NDVI
         value is set to 0.
         """
+        # 
+        self.image.calculate_ndvi()
+        scl_band = SatelliteBand(band_name="SCL", band_path=self.image.bands["SCL"]).resample(10)
         around_anns_ndvi_data = {} 
         for index, row in self.dataframe.iterrows():
             polygon_around_ann, scl_mask_around_ann = buffer_ann_and_extract_scl_data(
                 ann_polygon=row["geometry"], 
-                scl_raster=self.image.bands["SCL"], 
+                scl_band=scl_band, 
                 scl_keys=[4], # stands for vegetation
-                buffer_distance=buffer_distance)            
-            ndvi, _ = mask(self.image.bands["NDVI"], [polygon_around_ann], crop=True)
+                buffer_distance=buffer_distance)  
+            with rasterio.open(self.image.bands["NDVI"],  "r") as src:          
+                ndvi, _ = mask(src, [polygon_around_ann], crop=True)
             ndvi_masked = ndvi[scl_mask_around_ann] # only use values where vegetation is in the scl layer
             ndvi_around_ann = np.mean(ndvi_masked) if np.any(scl_mask_around_ann) else 0
             around_anns_ndvi_data[row["id"]] = {"NDVI_around": ndvi_around_ann}

@@ -13,6 +13,15 @@ import xarray as xr
 from traceback import format_exc
 import json
 
+def load_spectral_signature(specSig_json):
+    try:
+        with open(specSig_json, "r") as file:
+            spectral_signature = json.load(file)
+            return spectral_signature
+    except Exception as e:
+        print(f"Failed to load spectral signatures from {specSig_json}: {e}")
+        return {}
+
 def split_dataframe(df, n_chunks):
     """Split a DataFrame into roughly equal parts using groupby.
 
@@ -28,15 +37,6 @@ def split_dataframe(df, n_chunks):
     df.drop(columns=['group'], inplace=True)  # Clean up temporary column
     return chunks
 
-def load_spectral_signature(output_path):
-    try:
-        with open(output_path, "r") as file:
-            spectral_signature = json.load(file)
-            return spectral_signature
-    except Exception as e:
-        print(f"Failed to load spectral signatures from {output_path}: {e}")
-        return {}
-
 def save_spectral_signature(spectral_signature, output_path):
     try:
         with open(output_path, "w") as file:
@@ -49,7 +49,7 @@ def extract_band_number(key):
     order = {"SCL": 100, "NDVI": 102, "NDWI": 101}
     return order.get(key, int(re.findall(r'\d+', key)[0]) if re.findall(r'\d+', key) else float('inf'))
 
-def extract_band_info(file_name):
+def extract_S2band_info(file_name):
     pattern = r"(B\d+[A-Z]?|SCL|NDVI|NDWI)\.tif"
     match = re.search(pattern, file_name)
     return match.group(1) if match else None
@@ -60,22 +60,25 @@ def available_workers():
     free_cores = max(1, min(total_cores, int(total_cores - load_average)))
     return free_cores
 
-def patch_to_xarray(patch, transform, crs, start_x, start_y):
-    # Create an xarray DataArray for the patch, including spatial metadata
-    patch_xarray = xr.DataArray(
-        patch,
-        dims=('band', 'y', 'x'),
+def create_xarray_dataset(patch_data, timesteps, var_name, transform, crs):
+    data_array = xr.DataArray(
+        patch_data,
+        dims=('time', 'band', 'y', 'x'),
         coords={
-            'band': np.arange(patch.shape[0]),
-            'y': np.arange(start_y, start_y + patch.shape[1]),  # Calculate start_y from transform
-            'x': np.arange(start_x, start_x + patch.shape[2]),  # Calculate start_x from transform
+            'time': timesteps,
+            'band': np.arange(patch_data.shape[1]),
+            'y': np.arange(patch_data.shape[2]),
+            'x': np.arange(patch_data.shape[3]),
         },
-        attrs={
-            'transform': list(transform),
-            'crs': crs.to_string(),
-        }
+        name=var_name
     )
-    return patch_xarray
+    dataset = data_array.to_dataset()
+    # Add spatial_ref as a non-dimensional coordinate
+    dataset = dataset.assign_coords(spatial_ref=0)
+    dataset.coords['spatial_ref'].attrs['transform'] = list(transform)
+    dataset.coords['spatial_ref'].attrs['crs'] = str(crs.to_wkt())
+    
+    return dataset
 
 def log_progress(future_tasks, desc="Processing tasks"):
     with tqdm(total=len(future_tasks), desc=desc) as pbar:
@@ -124,8 +127,8 @@ def extract_nearby_ndvi_data(annotation, band_files):
     else:
         return np.mean(ann_ndvi_masked) 
 
-def buffer_ann_and_extract_scl_data(ann_polygon, scl_raster, scl_keys, buffer_distance=10):
-    with rasterio.open(scl_raster, "r") as src:
+def buffer_ann_and_extract_scl_data(ann_polygon, scl_band, scl_keys, buffer_distance=10):
+    with rasterio.open(scl_band.path, "r") as src:
         while buffer_distance <= 100:
             polygon_buffered = ann_polygon.buffer(buffer_distance)
             polygon_around_annotation = polygon_buffered.difference(ann_polygon)
