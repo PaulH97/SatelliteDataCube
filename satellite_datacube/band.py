@@ -4,6 +4,9 @@ from matplotlib import pyplot as plt
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from pathlib import Path 
+from pathlib import Path
+import rasterio
+from rasterio.warp import reproject, Resampling
 
 class SatelliteBand:
     """
@@ -23,57 +26,40 @@ class SatelliteBand:
             band_path (str): File path to the raster data of the band.
         """
         self.name = band_name 
-        self.path = band_path
+        self.path = Path(band_path)
+
+    def load_array(self):
+        """Lazily loads the raster array."""
         with rasterio.open(self.path, "r") as src:
-            self.array = src.read() # shape(CxHxW)
-            self.meta = src.meta.copy()
+            return src.read() 
+
+    def load_meta(self):
+        """Lazily loads the raster metadata."""
+        with rasterio.open(self.path, "r") as src:
+            return src.meta 
 
     def _calculate_scale_factor(self, new_resolution):
-        """
-        Calculate the scale factor for resampling based on new resolution.
-        Args:
-            new_resolution (int): The desired resolution in (m).
-        Returns:
-            float: The scale factor.
-        """
-        old_resolution = self.meta["transform"].a  # Assuming square pixels
+        """Calculate the scale factor for resampling based on new resolution."""
+        old_resolution = self.load_meta()["transform"].a  # Assuming square pixels
         return old_resolution / new_resolution
 
     def _calculate_new_transform(self, scale_factor):
-        """
-        Calculate a new affine transform based on the scale factor.
-        Args:
-            scale_factor (float): The scale factor for resampling.
-        Returns:
-            Affine: The new affine transform.
-        """
-        old_transform = self.meta["transform"]
-        return old_transform * old_transform.scale(1/scale_factor,1/scale_factor)
+        """Calculate a new affine transform based on the scale factor."""
+        old_transform = self.load_meta()["transform"]
+        return old_transform * old_transform.scale(1/scale_factor, 1/scale_factor)
 
     def _calculate_new_dimensions(self, scale_factor):
-        """
-        Calculate new dimensions (width and height) of the raster based on the scale factor.
-        Args:
-            scale_factor (float): The scale factor for resampling.
-        Returns:
-            tuple: New dimensions (width, height) of the raster.
-        """
-        return int(self.meta["width"]*scale_factor), int(self.meta["height"]*scale_factor)
-    
+        """Calculate new dimensions (width and height) of the raster based on the scale factor."""
+        meta = self.load_meta()
+        return int(meta["width"] * scale_factor), int(meta["height"] * scale_factor)
+
     def _update_metadata_to_new_resolution(self, new_resolution):
-        """
-        Update the metadata of the raster to reflect a new resolution.
-        Args:
-            new_resolution (float): The desired resolution.
-        Returns:
-            dict: Updated metadata.
-        """
+        """Update the metadata of the raster to reflect a new resolution."""
         scale_factor = self._calculate_scale_factor(new_resolution)
         new_transform = self._calculate_new_transform(scale_factor)
         new_width, new_height = self._calculate_new_dimensions(scale_factor)
 
-        # Set up metadata for the new raster
-        new_meta = self.meta
+        new_meta = self.load_meta()
         new_meta.update({
             'transform': new_transform,
             'width': new_width,
@@ -82,61 +68,47 @@ class SatelliteBand:
         return new_meta
 
     def _reproject_band(self, metadata):
-        """
-        Reproject the raster band based on new metadata.
-        Args:
-            metadata (dict): Metadata containing new projection information.
-        Returns:
-            Path: Path to the resampled raster file.
-        """
-        resampled_raster_path = self.path.parent / (self.path.stem + "_resampled.tif")
+        """Reproject the raster band based on new metadata."""
+        resampled_raster_path = self.path.parent / (f"{self.path.stem}_resampled.tif")
 
         with rasterio.open(self.path) as src:
             with rasterio.open(resampled_raster_path, 'w', **metadata) as dst:
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=rasterio.band(dst, 1),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=metadata["transform"],
-                    dst_crs=metadata["crs"],
-                    resampling=Resampling.bilinear
-                )
-
+                for i in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, i),
+                        destination=rasterio.band(dst, i),
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=metadata["transform"],
+                        dst_crs=metadata["crs"],
+                        resampling=Resampling.bilinear
+                    )
         return resampled_raster_path
 
     def get_resolution(self):
-        with rasterio.open(self.path) as src:
-            # src.transform.a is the width of a pixel
-            # src.transform.e is the height of a pixel (typically negative)
-            resolution_x, resolution_y = src.transform.a, -src.transform.e
-            return (int(resolution_x), int(resolution_y))
+        """Get the resolution of the raster."""
+        meta = self.load_meta()
+        # Assuming square pixels, i.e., transform.a = transform.e
+        return (int(meta["transform"].a), int(-meta["transform"].e))
 
     def resample(self, new_resolution):
-        """
-        Resample the raster band to a new resolution.
-        Args:
-            new_resolution (float): The desired resolution.
-        Returns:
-            SatelliteBand: The current instance after resampling.
-        """
-        band_res = self.meta["transform"].a
-        if band_res != new_resolution:
+        """Resample the raster band to a new resolution."""
+        meta = self.load_meta()
+        if meta["transform"].a != new_resolution:
             new_meta = self._update_metadata_to_new_resolution(new_resolution)
             resampled_band_path = self._reproject_band(new_meta)
-            self.path = Path(resampled_band_path)
-            with rasterio.open(self.path, "r") as src:
-                self.array = src.read() 
-                self.meta = src.meta.copy()
+            # Update the path to point to the resampled raster
+            self.path = resampled_band_path
         return self
-      
+    
     def normalize_with_zscore(self):
         """
         Apply z-score normalization to the raster band array.
         Returns:
             numpy.ndarray: Normalized array.
         """
-        return (self.array - self.array.mean()) / self.array.std()
+        array = self.load_array()
+        return (array - array.mean()) / array.std()
          
     def normalize_with_minmax(self):
         """
@@ -144,21 +116,24 @@ class SatelliteBand:
         Returns:
             numpy.ndarray: Normalized array.
         """
-        min_val, max_val = self.array.min(), self.array.max()
+        array = self.load_array()
+        min_val, max_val = array.min(), array.max()
         min_boundary, max_boundary = 0, 1
-        return (max_boundary - min_boundary) * ((self.array - min_val) / (max_val - min_val)) + min_boundary
+        return (max_boundary - min_boundary) * ((array - min_val) / (max_val - min_val)) + min_boundary
 
     def stretch_contrast(self, percentiles=(4,92)):
-        band_min = np.percentile(self.array, percentiles[0]).astype(np.float32)
-        band_max = np.percentile(self.array, percentiles[1]).astype(np.float32)
-        band_streched = (self.array - band_min) / (band_max - band_min)
+        array = self.load_array()
+        band_min = np.percentile(array, percentiles[0]).astype(np.float32)
+        band_max = np.percentile(array, percentiles[1]).astype(np.float32)
+        band_streched = (array - band_min) / (band_max - band_min)
         return band_streched
 
     def plot_histogram(self):
         """
         Plot histogram of the satellite band.
         """
-        band_array = np.moveaxis(self.array, 0, -1) # HxWxC
+        array = self.load_array()
+        band_array = np.moveaxis(array, 0, -1) # HxWxC
 
         q25, q75 = np.percentile(band_array, [25, 75])
         bin_width = 2 * (q75 - q25) * len(band_array) ** (-1/3)

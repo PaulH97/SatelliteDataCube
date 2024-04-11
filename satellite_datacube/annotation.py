@@ -3,10 +3,10 @@ import rasterio
 from pathlib import Path
 import geopandas as gpd
 from rasterio.features import geometry_mask
-from .utils import buffer_ann_and_extract_scl_data
 from rasterio.windows import Window, transform
 import numpy as np
 from rasterio.mask import mask
+from shapely import MultiPolygon
 
 class SatelliteImageAnnotation:
     def __init__(self, satellite_image, shapefile_path):
@@ -25,11 +25,11 @@ class SatelliteImageAnnotation:
         """
         self.image = satellite_image
         self.shp_path = Path(shapefile_path)
-        self.mask_path = self._find_valid_mask_file()
-        self.dataframe = self._load_dataframe()
+        self.mask_path = self._find_or_create_mask_file()
+        self.gdf = self._load_dataframe()
         self._transform_dataframe_to_image_crs()
 
-    def _find_valid_mask_file(self, resolution=10):
+    def _find_or_create_mask_file(self, resolution=10):
         """
         Find the first valid mask file within the satellite image folder that matches the specified resolution.
 
@@ -41,8 +41,8 @@ class SatelliteImageAnnotation:
         """
         mask_suffixes = ['.tif', '.tiff']
         mask_keyword = f"{resolution}m_mask" if resolution else "mask"
-        files = [file for file in self.image.folder.iterdir() if file.is_file() and file.suffix.lower() in mask_suffixes and mask_keyword in file.stem.lower()]
-        return files[0] if files else None
+        files = [file for file in self.image.folder.iterdir() if file.is_file() and file.suffix.lower() in mask_suffixes and mask_keyword in file.stem.lower()]        
+        return files[0] if files else self.rasterize(resolution)
 
     def _load_dataframe(self):
         """
@@ -74,10 +74,19 @@ class SatelliteImageAnnotation:
         """
         Transform the annotations in the dataframe to match the coordinate reference system (CRS) of the satellite image.
         """
-        with rasterio.open(self.image.path) as src:
+        image_path = self.image.path if self.image.path.exists() else self.image.index_path
+        with rasterio.open(image_path) as src:
             image_crs = src.crs
-        if self.dataframe.crs != image_crs:
-            self.dataframe.to_crs(image_crs, inplace=True)
+        if self.gdf.crs != image_crs:
+            self.gdf.to_crs(image_crs, inplace=True)
+
+    def select_ann_within_mask(self, extent, overlap_percentage=50):
+        ann_temp_gdf = self.gdf.copy()
+        ann_temp_gdf['intersection_area'] = ann_temp_gdf.geometry.intersection(extent).area
+        ann_temp_gdf['original_area'] = ann_temp_gdf.geometry.area
+        ann_temp_gdf['overlap_percentage'] = (ann_temp_gdf['intersection_area'] / ann_temp_gdf['original_area']) * 100
+    
+        return ann_temp_gdf[ann_temp_gdf['overlap_percentage'] >= overlap_percentage]
 
     def rasterize(self, resolution):
         """
@@ -104,15 +113,16 @@ class SatelliteImageAnnotation:
         - ValueError: If no band is found matching the specified resolution in the image bands.
         """
         self._transform_dataframe_to_image_crs()
-        band_path = self.image.find_band_by_res(resolution)
-        if band_path is None:
+        band = self.image.find_band_by_res(resolution)
+
+        if band is None:
             raise ValueError(f"Resolution {resolution} not found in image bands.")
 
-        with rasterio.open(band_path) as src:
+        with rasterio.open(band.path) as src:
             raster_meta = src.meta.copy()
             raster_meta.update({'dtype': 'uint8', 'count': 1})
 
-        geometries = self.dataframe["geometry"].values
+        geometries = self.gdf["geometry"].values
         mask_filepath = self.image.folder / f"{self.image.name}_{resolution}m_mask.tif"
 
         with rasterio.open(mask_filepath, 'w', **raster_meta) as dst:
@@ -238,7 +248,7 @@ class SatelliteImageAnnotation:
                 opened_bands[band_id] = rasterio.open(band.path)
         
         anns_band_data = {}
-        for index, row in self.dataframe.iterrows():
+        for index, row in self.gdf.iterrows():
             ann_bands_data = {}
             for band_id, band in opened_bands.items():
                 try:
@@ -291,103 +301,68 @@ class SatelliteImageAnnotation:
                 filtered_anns_band_data[ann_id] = {}
         return filtered_anns_band_data
 
-    def get_ndvi_around_polygon(self, buffer_distance=10):
-        """
-        Calculate the mean Normalized Difference Vegetation Index (NDVI) around each polygon (annotation)
-        in the satellite image's associated dataframe. This method applies a buffer to each polygon
-        and then masks the NDVI band with this buffered area, considering only the areas marked as
-        vegetation in the SCL (Scene Classification Layer) band. The mean NDVI value is computed for
-        areas within the buffer that are classified as vegetation.
+    def preprocess_annotation_zones(self, buffer_distance=20):
+        landslide_zones = MultiPolygon([geom.buffer(buffer_distance) for geom in self.gdf.geometry])
+        landslide_zones = MultiPolygon([geom.buffer(0) for geom in self.gdf.geometry if not geom.is_valid])
+        return landslide_zones.simplify(1.0, preserve_topology=True)
 
-        Parameters:
-        - buffer_distance (int): The distance (in the same units as the satellite image's projection) to extend
-        around each polygon to create a buffer for NDVI calculation. Defaults to 10.
+    @staticmethod
+    def calculate_annotation_buffer_ndvi(geometry, landslide_zones, scl_src, ndvi_src, num_of_pixels):
+        buffer_dist = 100  # Starting buffer distance
+        while True:
+            ann_large_buffer = geometry.buffer(buffer_dist)
+            buffered_zone = ann_large_buffer.difference(landslide_zones)
+            scl_data, _ = mask(scl_src, [buffered_zone], crop=True)
+            ndvi_data, _ = mask(ndvi_src, [buffered_zone], crop=True)
+            vegetation_mask = scl_data[0] == 4
+            ndvi_masked = ndvi_data[0][vegetation_mask].flatten()
 
-        Returns:
-        - dict: A dictionary where each key is an annotation ID from the dataframe, and each value is another
-        dictionary with a single key-value pair. This pair's key is 'NDVI_around', and its value is the mean NDVI
-        calculated around the buffered polygon. If no vegetation is detected within the buffered area, the NDVI
-        value is set to 0.
-        """
-        # 
+            if len(ndvi_masked) < num_of_pixels:
+                buffer_dist *= 1.5  # Increase buffer distance geometrically
+            else:
+                ndvi_mean = np.mean(ndvi_masked)
+                ndvi_median = np.median(ndvi_masked)
+                break
+        return ndvi_mean, ndvi_median
+    
+    @staticmethod 
+    def calculate_annotation_ndvi(geometry, scl_src, ndvi_src, bad_pixel_threshold):
+        bad_pixel_values = [0,1,2,3,8,9,10,11]
+        scl_data_ls, _ = mask(scl_src, [geometry], crop=True, nodata=99, all_touched=True)
+        ndvi_data_ls, _ = mask(ndvi_src, [geometry], crop=True)
+        good_pixel_mask = ~np.isin(scl_data_ls[0], bad_pixel_values)
+        ndvi_masked_ls = ndvi_data_ls[0][good_pixel_mask].flatten()
+
+        if len(good_pixel_mask) / len(scl_data_ls.flatten()) * 100 >= bad_pixel_threshold:
+            ndvi_mean_ls = np.mean(ndvi_masked_ls)
+            ndvi_median_ls = np.median(ndvi_masked_ls)
+        else:
+            ndvi_mean_ls = ndvi_median_ls = None  # Handle case with no good pixels
+        return ndvi_mean_ls, ndvi_median_ls
+
+    def calculate_ndvis_for_dating(self, num_of_pixels=500, bad_pixel_threshold=30):
         self.image.calculate_ndvi()
-        scl_band = SatelliteBand(band_name="SCL", band_path=self.image.bands["SCL"]).resample(10)
-        around_anns_ndvi_data = {} 
-        for index, row in self.dataframe.iterrows():
-            polygon_around_ann, scl_mask_around_ann = buffer_ann_and_extract_scl_data(
-                ann_polygon=row["geometry"], 
-                scl_band=scl_band, 
-                scl_keys=[4], # stands for vegetation
-                buffer_distance=buffer_distance)  
-            with rasterio.open(self.image.bands["NDVI"],  "r") as src:          
-                ndvi, _ = mask(src, [polygon_around_ann], crop=True)
-            ndvi_masked = ndvi[scl_mask_around_ann] # only use values where vegetation is in the scl layer
-            ndvi_around_ann = np.mean(ndvi_masked) if np.any(scl_mask_around_ann) else 0
-            around_anns_ndvi_data[row["id"]] = {"NDVI_around": ndvi_around_ann}
-        return around_anns_ndvi_data
-    
-    #     def create_spectral_signature_in_parallel(self, band_ids, chunks=100):
-    #     """
-    #     Creates spectral signatures for annotations in parallel, using specified satellite image bands.
+        ndvi_path = self.image.bands["NDVI"]
+        scl_path = SatelliteBand("SCL", self.image.bands["SCL"]).resample(10).path
+        landslide_zones = self.preprocess_annotation_zones()
 
-    #     This method transforms annotations to match the image CRS, splits the annotations into chunks,
-    #     and processes each chunk in parallel to calculate spectral signatures.
+        anns_ndvi_data = {}
 
-    #     Parameters:
-    #     - band_ids (list of str): List of band identifiers to include in the spectral signature calculation.
-    #     - chunks (int): The number of chunks to split the annotations into for parallel processing.
+        with rasterio.open(scl_path) as scl_src, rasterio.open(ndvi_path) as ndvi_src:
+            for idx, row in self.gdf.iterrows():
+                print(f"Start row {idx}")
 
-    #     Returns:
-    #     - dict: A dictionary mapping annotation IDs to their calculated spectral signatures.
-    #     """
-    #     self.transform_annotations_to_image_crs()
-    #     dataframe_chunks = split_dataframe(self.dataframe, chunks)
-    #     selected_band_paths = {band_id: band_path for band_id, band_path in self.image.bands.items() if band_id in band_ids}
-        
-    #     progress_bar = tqdm(total=len(self.dataframe), desc="Creating spectral signatures")
-        
-    #     with ProcessPoolExecutor(max_workers=available_workers()) as executor:
-    #         futures = {executor.submit(self.process_chunk, chunk, selected_band_paths): len(chunk) for chunk in dataframe_chunks}
-    #         anns_band_data = {}
-    #         for future in as_completed(futures):
-    #             chunk_results = future.result()
-    #             anns_band_data.update(chunk_results)
-    #             # Update the progress bar by the number of annotations processed in the chunk
-    #             progress_bar.update(futures[future])
+                buffer_ndvi_mean, buffer_ndvi_median = self.calculate_annotation_buffer_ndvi(
+                    row["geometry"], landslide_zones, scl_src, ndvi_src, num_of_pixels)
                 
-    #     progress_bar.close()
-    #     return anns_band_data
+                landslide_ndvi_mean, landslide_ndvi_median = self.calculate_annotation_ndvi(
+                    row["geometry"], scl_src, ndvi_src, bad_pixel_threshold)
+                
+                anns_ndvi_data[row["id"]] = {
+                    "Buffer_NDVI_Mean": buffer_ndvi_mean,
+                    "Buffer_NDVI_Median": buffer_ndvi_median,
+                    "Landslide_NDVI_Mean": landslide_ndvi_mean,
+                    "Landslide_NDVI_Median": landslide_ndvi_median
+                }
 
-    # @staticmethod
-    # def process_chunk(dataframe_chunk, band_paths):
-    #     """
-    #     Processes a chunk of annotations to calculate spectral signatures based on provided band paths.
-
-    #     This method opens each specified band file, masks the band data with the annotation geometries,
-    #     and calculates various statistics (e.g., mean values, unique counts) for the spectral signature.
-
-    #     Parameters:
-    #     - dataframe_chunk (pandas.DataFrame): A chunk of the dataframe containing annotations to process.
-    #     - band_paths (dict): A dictionary mapping band identifiers to their file paths.
-
-    #     Returns:
-    #     - dict: A dictionary mapping each annotation ID in the chunk to its calculated spectral signature.
-    #     """
-    #     anns_band_data = {}
-    #     opened_bands = {band_id: rasterio.open(band_path) for band_id, band_path in band_paths.items()}
-        
-    #     for index, row in dataframe_chunk.iterrows():
-    #         ann_bands_data = {}
-    #         for band_id, band in opened_bands.items():
-    #             ann_band_data, _ = mask(band, [row["geometry"]], crop=True)
-    #             if band_id == "SCL":
-    #                 unique, counts = np.unique(ann_band_data.flatten(), return_counts=True)
-    #                 ann_bands_data[band_id] = {int(u): int(c) for u, c in zip(unique, counts)}
-    #             elif band_id in ["NDVI", "NDWI"]:
-    #                 ann_bands_data[band_id] = np.mean(ann_band_data[ann_band_data > 0]) if np.any(ann_band_data > 0) else 0
-    #             else:
-    #                 ann_bands_data[band_id] = np.mean(ann_band_data)
-    #         anns_band_data[row["id"]] = ann_bands_data
-    
-    #     [band.close() for band in opened_bands.values()]
-    #     return anns_band_data
+        return anns_ndvi_data

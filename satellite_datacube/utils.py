@@ -2,16 +2,28 @@ import os
 import rasterio
 import random
 import numpy as np
+from shapely.geometry import Polygon
 from matplotlib import pyplot as plt
 from rasterio.mask import mask
 from rasterio.transform import Affine
+from rasterio.windows import bounds
 import pandas as pd
 import re
 from tqdm import tqdm
 from concurrent.futures import as_completed
 import xarray as xr
-from traceback import format_exc
+import traceback
 import json
+
+def get_patch_extent_as_polygon(opened_raster, window):
+    window_transform = opened_raster.window_transform(window)
+    (left, bottom, right, top) = bounds(window, window_transform)
+    return Polygon([(left, top), (right, top), (right, bottom), (left, bottom)])
+
+def find_closest_image(images, target_date):
+    # Find the image with the closest date to the target_date
+    closest_image = min(images, key=lambda img: abs(img.date - target_date))
+    return closest_image
 
 def load_spectral_signature(specSig_json):
     try:
@@ -54,11 +66,11 @@ def extract_S2band_info(file_name):
     match = re.search(pattern, file_name)
     return match.group(1) if match else None
 
-def available_workers():
+def available_workers(reduce_by=10):
     total_cores = os.cpu_count()
     load_average = os.getloadavg()[0]  # Get 1-minute load average
     free_cores = max(1, min(total_cores, int(total_cores - load_average)))
-    return free_cores
+    return free_cores-reduce_by
 
 def create_xarray_dataset(patch_data, timesteps, var_name, transform, crs):
     data_array = xr.DataArray(
@@ -87,16 +99,18 @@ def log_progress(future_tasks, desc="Processing tasks"):
                 result = future.result()
                 pbar.update(1)
                 if result["status"] == "success":
-                    # Success logging
                     pass
                 else:
-                    # Here, log the error along with the traceback
-                    print(f"Task raised following error: {result['error']}")
-                    print("Error details:", result["traceback"])
+                    # Log the error along with the traceback if the task execution was unsuccessful
+                    error_message = result.get('error', 'Unknown Error')
+                    traceback_details = result.get('traceback', 'No traceback available')
+                    print(f"Task ended with error: {error_message}")
+                    print(f"Error details: {traceback_details}")
             except Exception as exc:
-                traceback_details = format_exc()
-                print(f"Unexpected exception: {traceback_details}")
-                raise RuntimeError("A task in the pool failed.") from exc
+                # This block will catch exceptions raised by the task itself
+                traceback_details = traceback.format_exc()
+                print(f"Unexpected exception occurred: {exc}")
+                print(f"Traceback details: {traceback_details}")
             finally:
                 pbar.refresh()
 
@@ -390,7 +404,7 @@ def mask_image(labels_df, satellite_image, output_folder=""):
                 out_image, out_transform = mask(src_band, [bbox], crop=True)
                 out_images.append(out_image)
         
-                src_meta = src_band.meta.copy()
+                src_meta = src_band.load_meta()
                 src_meta.update({
                     "driver": "GTiff",
                     "height": out_image.shape[1],  

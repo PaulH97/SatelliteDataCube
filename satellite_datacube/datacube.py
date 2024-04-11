@@ -2,7 +2,7 @@ import os
 from matplotlib import pyplot as plt
 from .image import Sentinel1, Sentinel2
 from .annotation import SatelliteImageAnnotation
-from .utils import save_spectral_signature, load_spectral_signature, pad_patch, log_progress, create_xarray_dataset, available_workers
+from .utils import get_patch_extent_as_polygon, find_closest_image, save_spectral_signature, load_spectral_signature, pad_patch, log_progress, create_xarray_dataset, available_workers
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +15,11 @@ import traceback
 from tqdm import tqdm
 import numpy as np
 import random
-from collections import OrderedDict
+from rasterio.features import shapes
+from shapely.geometry import shape as Shape
+from skimage.measure import label
+from skimage.morphology import remove_small_objects
+import geopandas as gpd
 
 class SatelliteDataCube:
     def __init__(self):
@@ -33,7 +37,8 @@ class SatelliteDataCube:
         self.satellite = None
         self.satellite_images_folder = None
         self.ann_file = None
-        self.images_by_date = {}
+        self.images = []
+        # self.masks = [] # list of SatelliteImageAnnotation
         self.specSig = None
     
     def _print_initialization_info(self):
@@ -58,83 +63,89 @@ class SatelliteDataCube:
         - Length of data-cube: 90
         """
         divider = "-" * 20
+        dates = [image.date for image in self.images]
+        dates.sort()
         #print(f"{divider} {os.path.basename(self.base_folder)} {divider}")
         print(f"{2*divider}")
         print("Initialized data-cube with following parameter:")
         print(f"- Base folder: {self.base_folder}")
         print(f"- Satellite mission: {self.satellite}")
-        print(f"- Start-End: {min(self.images_by_date.keys())} -> {max(self.images_by_date.keys())}")
-        print(f"- Length of data-cube: {len(self.images_by_date)}")
+        print(f"- Start-End: {min(dates)} -> {max(dates)}")
+        print(f"- Length of data-cube: {len(self.images)}")
         print(f"{2*divider}")
+        del dates
+
+    def _pad_images(self, selected_images, total_images_needed):
+        additional_needed = total_images_needed - len(selected_images)
+        if additional_needed > 0:
+            adding_images_front = additional_needed // 2
+            adding_images_back = additional_needed - adding_images_front
+            images_front = [self.images[0]] * adding_images_front
+            images_back = [self.images[-1]] * adding_images_back
+            selected_images = images_front + selected_images + images_back
+        return selected_images
+
+    def filter_images_by_date(self, pre_post_date, total_images):
+        pre_date = datetime.strptime(pre_post_date[0], "%Y-%m-%d").date()
+        post_date = datetime.strptime(pre_post_date[1], "%Y-%m-%d").date()
     
-    def select_images_for_timeseries(self, total_images=80):
-        """
-        Selects images to fill a timeseries of a specific length by randomly adding images 
-        to reach the desired total after allocating a base number per month.
-        """
-        # Determine the number of months with data
-        unique_months = {(date.year, date.month) for date in self.images_by_date.keys() }
+        # Use the find_closest_image function to find the closest images to pre and post dates
+        pre_event_image = find_closest_image(self.images, pre_date)
+        post_event_image = find_closest_image(self.images, post_date)
+        
+        selected_images = [pre_event_image, post_event_image]
+        remaining_slots = total_images - len(selected_images)
+        additional_candidates = [img for img in self.images if img.date != pre_date and img.date != post_date]
+
+        if remaining_slots > 0:
+            if len(additional_candidates) >= remaining_slots:
+                selected_images += random.sample(additional_candidates, remaining_slots)
+            else:
+                # Use all additional candidates and then pad the selection if necessary
+                selected_images += additional_candidates
+                selected_images = self._pad_images(selected_images, total_images)
+        
+        return sorted(selected_images, key=lambda image: image.date)
+
+    def filter_images_by_number(self, total_images):
+        unique_months = {(image.date.year, image.date.month) for image in self.images}
         months_count = len(unique_months)
-        base_number_per_month = int(total_images/months_count)
+        base_number_per_month = max(int(total_images / months_count), 1)  # Ensure at least one image per month
 
-        images = list(self.images_by_date.items())
-        with ProcessPoolExecutor(max_workers=available_workers()) as executor:
-            results = list(tqdm(executor.map(SatelliteDataCube._calculate_bad_pixel_ratio_for_image, images), total=len(images), desc="Calculate bad pixel ratio of images"))
-
-        ratios = {image[0]: result for image, result in zip(images, results)}
-        all_images_sorted = sorted(images, key=lambda item: ratios[item[0]])
+        # with ProcessPoolExecutor(max_workers=available_workers()) as executor:
+        #     ratios = [executor.submit(image.calculate_bad_pixel_ratio()) for image in self.images]
+        ratios = [image.calculate_bad_pixel_ratio() for image in self.images]   
+        images_ratios = {image: result for image, result in zip(self.images, ratios)}
+        all_images_sorted = sorted(self.images, key=lambda image: images_ratios[image])
 
         selected_images_per_month = {}
-        for date, image in all_images_sorted:
-            year_month = (date.year, date.month)
+        for image in all_images_sorted:
+            year_month = (image.date.year, image.date.month)
             if len(selected_images_per_month.get(year_month, [])) < base_number_per_month:
                 selected_images_per_month.setdefault(year_month, []).append(image)
 
-        # Randomly select remainder images
-        all_images_flat = [image for _, image in all_images_sorted]
         selected_images = [image for images in selected_images_per_month.values() for image in images]
-        additional_images = [image for image in all_images_flat if image not in selected_images]
-        additional_selected_images = random.sample(additional_images, total_images-len(selected_images))
 
-        # Add additional images randomly
-        for image in additional_selected_images:
-            year_month = (image.date.year, image.date.month)
-            selected_images_per_month[year_month].append(image)
+        additional_images = [image for image in all_images_sorted if image not in selected_images]
+        additional_needed = min(total_images - len(selected_images), len(additional_images))
+        selected_images += random.sample(additional_images, additional_needed)
 
-        selected_images_per_month = OrderedDict(sorted(selected_images_per_month.items(), key=lambda item:item[0]))
+        # Add images at the beginning/end if the total is still not met
+        timeseries_length = len(selected_images)
+        if timeseries_length < total_images:
+            missing_images = total_images - timeseries_length
+            adding_images_front = missing_images // 2
+            adding_images_back = missing_images - adding_images_front
+            images_front = [self.images[0]] * adding_images_front
+            images_back = [self.images[-1]] * adding_images_back
+            selected_images = images_front + selected_images + images_back
 
-        return selected_images_per_month
+        return sorted(selected_images, key=lambda image:image.date)
     
-    @staticmethod
-    def _calculate_bad_pixel_ratio_for_image(item):
-        key, image = item
-        return key, image.calculate_bad_pixel_ratio()
-
-    def select_images_with_dates(self, dates):
-        """
-        Selects and returns satellite images that match a given list of dates.
-        
-        This method filters the images stored in the data cube by the specified dates. It updates
-        the `selected_images_by_date` attribute with a dictionary of images that match the given
-        dates. If a date in the list does not correspond to any image in the data cube, it is 
-        simply ignored.
-        
-        Parameters:
-        - dates (list of datetime.date): A list of dates for which to select matching satellite images.
-        
-        Returns:
-        - dict: A dictionary mapping the selected dates to their corresponding satellite images. 
-                The keys are dates, and the values are the satellite images (instances of Sentinel2
-                or another relevant class).
-        """
-        # Filter the `images_by_date` dictionary to include only the images with dates present in the given list.
-        selected_images_by_date = {date: self.images_by_date[date] for date in dates if date in self.images_by_date}
-
-        return selected_images_by_date
-
     def get_image_dates_range(self):
-        start_date = min(self.images_by_date.keys())
-        end_date = max(self.images_by_date.keys())
+        dates = [image.date for image in self.images]
+        start_date = min(dates)
+        end_date = max(dates)
         return start_date, end_date
         
     def create_spectral_signature(self, band_ids, output_dir=None, filtering=False):
@@ -160,8 +171,9 @@ class SatelliteDataCube:
         output_path = output_dir / f"{self.base_folder.name}_S2_specSig.json" 
         if not output_path.exists():
             print(f"Start extracting values for building a spectral signature with filtering: {filtering}")
-            tasks = [(image, self.ann_file, band_ids, filtering) for image in self.images_by_date.values()]
-            with ProcessPoolExecutor() as executor:
+            tasks = [(image, self.ann_file, band_ids, filtering) for image in self.images]
+
+            with ProcessPoolExecutor(max_workers=available_workers(reduce_by=5)) as executor:
                 future_tasks = {executor.submit(SatelliteDataCube._create_specSig_of_ann_for_image, task): task for task in tasks}
                 dc_specSig = {}
                 for future in tqdm(as_completed(future_tasks), total=len(future_tasks), desc="Creating spectral signature"):
@@ -201,7 +213,7 @@ class SatelliteDataCube:
         Errors and processing details are captured in a result dictionary for logging and debugging.
         """
         image, ann_file, band_ids, filtering = task
-        result = {"status": "", "details": "", "error": ""}
+        result = {"status": "", "details": "", "error": "", "traceback": ""}
         try:
             img_date = image.date.strftime("%Y%m%d")
             ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
@@ -211,10 +223,12 @@ class SatelliteDataCube:
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
+            result["traceback"] = traceback.format_exc() 
         return img_date, img_specSig, result
             
     def rasterize_annotations(self, resolution):
-        tasks = [(image, self.ann_file, resolution) for image in self.images_by_date.values()]
+        tasks = [(image, self.ann_file, resolution) for image in self.images]
+
         with ProcessPoolExecutor(max_workers=available_workers()) as executor:
             future_tasks = {executor.submit(SatelliteDataCube._rasterize_annotation, task): task for task in tasks}
             log_progress(future_tasks=future_tasks, desc="Rasterize annotation of images")
@@ -223,7 +237,7 @@ class SatelliteDataCube:
     @staticmethod
     def _rasterize_annotation(task):
         image, ann_file, resolution = task
-        result = {"status": "", "details": "", "error": ""}
+        result = {"status": "", "details": "", "error": "", "traceback": ""}
         try:
             annotation = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
             annotation.rasterize(resolution=resolution)
@@ -232,15 +246,15 @@ class SatelliteDataCube:
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
+            result["traceback"] = traceback.format_exc()  # Capture full traceback
         return result
 
-    def stack_bands_of_images(self, resolution=10, include_indizes=False):
-        tasks = [(image, resolution, include_indizes) for image in self.images_by_date.values()] # necessary to put it in tuple - for serialization 
-
-        with ProcessPoolExecutor(max_workers=available_workers()-5) as executor:
+    def stack_bands_of_images(self, resolution, include_indizes):
+        tasks = [(image, resolution, include_indizes) for image in self.images] # necessary to put it in tuple - for serialization 
+        with ProcessPoolExecutor(max_workers=available_workers()) as executor:
             future_tasks = {executor.submit(SatelliteDataCube._stacking_image_bands, task): task for task in tasks}
             log_progress(future_tasks=future_tasks, desc="Stacking bands of images")
-        return list(self.images_by_date.values())
+        return 
     
     @staticmethod
     def _stacking_image_bands(task):
@@ -255,15 +269,52 @@ class SatelliteDataCube:
             result["error"] = str(e)
             result["traceback"] = traceback.format_exc()  # Capture full traceback
         return result
-      
-    def create_img_patches(self, patch_size, overlay=0, padding=True, output_dir=None, include_indizes=False):
-        """
-        Splits satellite imagery into smaller, overlapped patches for processing or analysis, and saves them to a specified directory.
 
-        This method divides a set of satellite images into patches of a specified size, optionally with an overlay between adjacent patches and padding at the image edges. It is designed to handle large satellite data cubes by processing images in parallel, improving efficiency for large-scale analysis.
+    def _prepare_tasks_for_patches(self, patch_size, overlay, total_images, ann_ratio=0.8):
+        print("Preparing single tasks for creating patches, e.g. filter images and balance data")
+        ann = SatelliteImageAnnotation(self.images[0], self.ann_file)
+        img_tasks, msk_tasks = [], []
+        patches_with_ann_count = 0
+        patches_without_ann_count = 0
+        with rasterio.open(self.images[0].path) as src:
+            step_size = patch_size - overlay
+            for i in tqdm(range(0, src.width, step_size), desc="Filter timeseries before patch generation"):
+                for j in range(0, src.height, step_size):
+                    args = [i, j, patch_size, patch_size]
+                    window = Window(*args)
+                    patch_extent = get_patch_extent_as_polygon(src, window)
+                    ann_within_patch = ann.select_ann_within_mask(patch_extent, overlap_percentage=10)
+                    
+                    total_patches_count = patches_with_ann_count + patches_without_ann_count
+                    current_dist = patches_with_ann_count / total_patches_count if total_patches_count > 0 else 1
+
+                    if (not ann_within_patch.empty or (ann_within_patch.empty and current_dist > ann_ratio)):
+                        if not ann_within_patch.empty:
+                            for idx, row in ann_within_patch.iterrows():
+                                patches_with_ann_count += 1 
+                                pre_post_date = (row["pre_date"], row["post_date"])
+                                selected_images = self.filter_images_by_date(pre_post_date, total_images) 
+                                selected_images_paths = [image.path for image in selected_images if image.path.exists()]
+                                img_tasks.append((i, j, patch_size, selected_images_paths))
+                                msk_tasks.append((i, j, patch_size, [ann.mask_path])) # 
+                        else:
+                            patches_without_ann_count += 1
+                            selected_images = random.sample(self.images, total_images)
+                            selected_images_paths = [image.path for image in selected_images if image.path.exists()]
+                            img_tasks.append((i, j, patch_size, selected_images_paths))
+                            msk_tasks.append((i, j, patch_size, [ann.mask_path]))    
+        
+        return img_tasks, msk_tasks
+
+    def create_patches(self, patch_size, total_images, overlay=0, padding=True, output_dir=None, ann_ratio=0.8):
+        """
+        Splits satellite imagery and masks into smaller, overlapped patches for processing or analysis, and saves them to a specified directory.
+
+        This method divides a set of satellite images with there coressponding single global mask into patches of a specified size, optionally with an overlay between adjacent patches and padding at the image edges. It is designed to handle large satellite data cubes by processing images in parallel, improving efficiency for large-scale analysis.
 
         Parameters:
         - patch_size (int): The size of each square patch (in pixels). Each patch will be patch_size x patch_size.
+        - total_images(int): The number of images (timesteps in SITS) should be included
         - overlay (int, optional): The overlap size (in pixels) between adjacent patches. Defaults to 0, meaning no overlap.
         - padding (bool, optional): If True, adds padding to the patches at the edges of the images. Defaults to True.
         - output_dir (Path or str, optional): The directory where the patches will be saved. If not specified, patches will be saved in a default directory structure: base_folder/patches/satellite.
@@ -280,85 +331,28 @@ class SatelliteDataCube:
         # Custom usage with an overlay of 10 pixels, padding disabled, and specifying an output directory
         SatelliteDataCube.create_img_patches(patch_size=512, overlay=10, padding=False, output_dir="path/to/output/dir")
         """
-        output_dir = output_dir  if output_dir else self.base_folder 
-        patches_dir = Path(output_dir) / self.satellite # type: ignore
-        if not patches_dir.exists():
-            var_name = "reflectance" 
-            tasks = []
-            
-            if not include_indizes:
-                images_paths = [image.path for image in self.images_by_date.values()]
-            else:
-                images_paths = [image.index_path for image in self.images_by_date.values()]
+        output_dir = output_dir if output_dir else Path(self.base_folder, "patches")
 
-            # Filter/Pad images
-            selected_images_per_month = self.select_images_for_timeseries(total_images=80)
-            print(f"Length of selected image timeseries of datacube: {len([image.date for images in selected_images_per_month.values() for image in images])}")
-            #[print(f"{date}: {len(images)}") for date, images in selected_images_per_month.items()]
-                        
-            with rasterio.open(images_paths[0]) as src:
-                step_size = patch_size - overlay
-                for i in range(0, src.width, step_size):
-                    for j in range(0, src.height, step_size):
-                        task = (i, j, patch_size, images_paths, padding, var_name, patches_dir)
-                        tasks.append(task)
-            
-            print(tasks[0])
-            self._extract_and_combine_patches(tasks[0])
+        if not output_dir.exists():    
+            img_tasks, msk_tasks = self._prepare_tasks_for_patches(patch_size, overlay, total_images, ann_ratio=ann_ratio) 
+            img_tasks_extended, msk_tasks_extended = [], []
+            for idx, (img_task, msk_task) in enumerate(zip(img_tasks, msk_tasks)):
+                img_patch_file = Path(output_dir) / self.satellite / f"img_{idx}.nc" # type: ignore
+                msk_patch_file = Path(output_dir) / "annotation"  / f"msk_{idx}.nc"
+                img_patch_file.parent.mkdir(parents=True, exist_ok=True)
+                msk_patch_file.parent.mkdir(parents=True, exist_ok=True)
+                img_tasks_extended.append(img_task + (padding, "reflectance", img_patch_file))
+                msk_tasks_extended.append(msk_task +(padding, "class", msk_patch_file))
 
-            import pdb
-            pdb.set_trace()
-            
-            with ProcessPoolExecutor(max_workers=available_workers()) as executor:
-                future_tasks = {executor.submit(SatelliteDataCube._extract_and_combine_patches, task): task for task in tasks}
+            with ProcessPoolExecutor(max_workers=available_workers(reduce_by=5)) as executor:
+                future_tasks = {executor.submit(SatelliteDataCube._extract_and_combine_patches, task): task for task in img_tasks_extended}
                 log_progress(future_tasks=future_tasks, desc="Creating 4D IMG patches")
-        return patches_dir
-
-    def create_msk_patches(self, patch_size, overlay=0, padding=True, output_dir=None):
-        """
-        Splits annotations of satellite imagery into smaller, overlapped patches for processing or analysis, and saves them to a specified directory.
-
-        This method divides a set of satellite image annotations into patches of a specified size, optionally with an overlay between adjacent patches and padding at the image edges. It is designed to handle large satellite data cubes by processing images in parallel, improving efficiency for large-scale analysis.
-
-        Parameters:
-        - patch_size (int): The size of each square patch (in pixels). Each patch will be patch_size x patch_size.
-        - overlay (int, optional): The overlap size (in pixels) between adjacent patches. Defaults to 0, meaning no overlap.
-        - padding (bool, optional): If True, adds padding to the patches at the edges of the images. Defaults to True.
-        - output_dir (Path or str, optional): The directory where the patches will be saved. If not specified, patches will be saved in a default directory structure: base_folder/patches/satellite.
-
-        The method first gathers paths of satellite images to process, calculates the number of patches based on the specified patch size and overlay, and then processes each patch in parallel, utilizing all available CPU cores. Each patch is extracted from the satellite images annotation, optionally padded, and saved to the output directory in a 4D mask format suitable for further analysis.
-
-        Returns:
-        None. The patches are saved directly to the specified output directory.
-
-        Examples:
-        # Basic usage with default settings
-        SatelliteDataCube.create_msk_patches(patch_size=256)
-
-        # Custom usage with an overlay of 10 pixels, padding disabled, and specifying an output directory
-        SatelliteDataCube.create_msk_patches(patch_size=512, overlay=10, padding=False, output_dir="path/to/output/dir")
-        """
-        output_dir = output_dir if output_dir else self.base_folder
-        patches_dir = Path(output_dir) / "annotation"
-        if not patches_dir.exists():
-            var_name = "class" 
-            # annotations = self.rasterize_annotations(resolution=10)
-            masks_paths = [SatelliteImageAnnotation(image, self.ann_file).mask_path for image in self.images_by_date.values()]            
-            mask_path = masks_paths[0] # we use a global mask that is equal for all timesteps, so we need only one timestep - saving computation and memory
-            tasks = []
-
-            with rasterio.open(mask_path) as src:
-                step_size = patch_size - overlay
-                for i in range(0, src.width, step_size):
-                    for j in range(0, src.height, step_size):
-                        task = (i, j, patch_size, [mask_path], padding, var_name, patches_dir)
-                        tasks.append(task)
-
+            
             with ProcessPoolExecutor(max_workers=available_workers()) as executor:
-                future_tasks = {executor.submit(SatelliteDataCube._extract_and_combine_patches, task): task for task in tasks}
+                future_tasks = {executor.submit(SatelliteDataCube._extract_and_combine_patches, task): task for task in msk_tasks_extended}
                 log_progress(future_tasks=future_tasks, desc="Creating 4D MSK patches")
-        
-        return patches_dir
+    
+        return output_dir
 
     @staticmethod
     def _extract_and_combine_patches(task):
@@ -369,7 +363,7 @@ class SatelliteDataCube:
         - task: A tuple containing the following elements:
           - i, j: The starting row and column indices for patch extraction.
           - patch_size: The size of each patch (assumed square).
-          - raster_paths: A list of paths to the raster files from which patches will be extracted.
+          - rasters: A list of raster object from type SatelliteImage or SatelliteImageAnnotation
           - padding: A boolean indicating whether to pad patches that are smaller than `patch_size`.
           - var_name: The variable name to be used in the xarray dataset.
           - patches_dir: The directory where the resulting NetCDF file will be saved.
@@ -378,40 +372,42 @@ class SatelliteDataCube:
         A dictionary with the keys 'status', 'details', and 'error'. 'status' can be 'success' or 'error',
         'details' provides additional information, and 'error' contains error message if any.
         """
-        i, j, patch_size, raster_paths, padding, var_name, patches_dir = task
-        result = {"status": "", "details": "", "error": ""}
+        i, j, patch_size, raster_paths, padding, var_name, patch_file = task
+        result = {"status": "", "details": "", "error": "", "traceback": ""}
         try:
             patches = []
+            timesteps = []
             transform, crs = None, None
-            timesteps = [pd.to_datetime(path.parts[-2]) for path in raster_paths]
-            for raster_path in raster_paths:
+            timestamp_path_pairs = [(pd.to_datetime(path.parts[-2]), path) for path in raster_paths]
+            timestamp_path_pairs = sorted(timestamp_path_pairs, key=lambda x: x[0])
+            for timestep, raster_path in timestamp_path_pairs:
                 with rasterio.open(raster_path) as src:
-                    window = Window(j, i, patch_size, patch_size)
+                    args = [j, i, patch_size, patch_size]
+                    window = Window(*args)
                     patch = src.read(window=window, boundless=True, fill_value=0)
                     if padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
                         patch = pad_patch(patch, patch_size)
                     elif not padding and (patch.shape[1] != patch_size or patch.shape[2] != patch_size):
                         continue
                     if transform is None and crs is None:
-                        transform = src.transform
+                        transform = src.window_transform(window)
                         crs = src.crs
                     patches.append(patch)
+                    timesteps.append(timestep)
 
             data = np.stack(patches) if len(patches) > 1 else np.expand_dims(patches[0], axis=0)
             dataset = create_xarray_dataset(data, timesteps, var_name, transform, crs)
-
-            patch_ts_filepath = patches_dir / f"patch_{i}_{j}.nc"
-            patch_ts_filepath.parent.mkdir(parents=True, exist_ok=True)
-            dataset.to_netcdf(patch_ts_filepath, format="NETCDF4", engine="h5netcdf")
+            dataset.to_netcdf(patch_file, format="NETCDF4", engine="h5netcdf")
             
             result["status"] = "success"
-            result["details"] = f"Successfully processed patches for patch_{i}_{j}"
+            result["details"] = f"Successfully created: {patch_file}"
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
+            result["traceback"] = traceback.format_exc() 
         return result
 
-    def clean(self, indizes=False):
+    def clean(self, resampled_images, indizes, stacked_image, mask):
         """
         Cleans up the satellite data cube by removing unnecessary directories and files.
         
@@ -422,8 +418,13 @@ class SatelliteDataCube:
         """
         # Collect all directories and files to be removed
         files_to_remove = []
-        for image in self.images_by_date.values():
-            files_to_remove.extend(image.folder.glob("*resampled*"))
+        for image in self.images:
+            if resampled_images:
+                files_to_remove.extend(image.folder.glob("*resampled*"))
+            if stacked_image:
+                files_to_remove.append(image.path)
+            if mask:
+                files_to_remove.extend(image.folder.glob("*mask*"))
             if indizes:
                 files_to_remove.extend(image.folder.glob("*NDVI*"))
                 files_to_remove.extend(image.folder.glob("*NDWI*"))
@@ -436,6 +437,37 @@ class SatelliteDataCube:
         else:
             print("No files to delete")
 
+    @staticmethod
+    def _safe_delete(path):
+        """
+        Safely deletes a given path, whether it's a file or a directory.
+        
+        This method attempts to delete the specified path. If the path is a directory, it is
+        removed with all its contents. If it's a file, it's directly deleted. The method
+        handles exceptions gracefully, returning a status message indicating the outcome.
+        
+        Parameters:
+        - path (Path): A pathlib.Path object representing the file or directory to be deleted.
+        
+        Returns:
+        - dict: A dictionary containing the status of the operation ('success' or 'error'),
+                details of the operation, and any error message if an error occurred.
+        """
+        result = {"status": "", "details": "", "error": "", "traceback": ""}
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink()
+            result["status"] = "success"
+            result["details"] = f"Deleted {path}"
+        except Exception as e:
+            # If an exception occurs, capture its details and mark the status as error
+            result["status"] = "error"
+            result["error"] = str(e)  
+            result["traceback"] = traceback.format_exc() 
+        return result 
+    
     def plot_spectral_signature(self, spectral_signature, output_folder=""):
         bands = list(spectral_signature[list(spectral_signature.keys())[0]].keys())
         fig, ax = plt.subplots(figsize=(10,6))
@@ -455,40 +487,7 @@ class SatelliteDataCube:
         if output_folder:
             plt.savefig(os.path.join(output_folder, f"{self.satellite}_spectralSig_ts{len(time_steps)}.png"))
         return
-    
-    @staticmethod
-    def _safe_delete(path):
-        """
-        Safely deletes a given path, whether it's a file or a directory.
-        
-        This method attempts to delete the specified path. If the path is a directory, it is
-        removed with all its contents. If it's a file, it's directly deleted. The method
-        handles exceptions gracefully, returning a status message indicating the outcome.
-        
-        Parameters:
-        - path (Path): A pathlib.Path object representing the file or directory to be deleted.
-        
-        Returns:
-        - dict: A dictionary containing the status of the operation ('success' or 'error'),
-                details of the operation, and any error message if an error occurred.
-        """
-        result = {"status": "", "details": "", "error": ""}
-        try:
-            if path.is_dir():
-                # Remove the directory and all its contents, ignoring any errors that occur during deletion
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                # Remove the file
-                path.unlink()
-            result["status"] = "success"
-            result["details"] = f"Deleted {path}"
-        except Exception as e:
-            # If an exception occurs, capture its details and mark the status as error
-            result["status"] = "error",
-            result["error"] = str(e)  # Store the error message
-            
-        return result  # Return the result dictionary with the operation's outcome
-    
+ 
 class Sentinel2DataCube(SatelliteDataCube):
     """
     A class for managing Sentinel-2 satellite image data.
@@ -517,7 +516,7 @@ class Sentinel2DataCube(SatelliteDataCube):
             raise FileNotFoundError(f"Satellite images folder {self.satellite_images_folder} does not exist or is not a directory.")
 
         self.ann_file = self._init_annotation()
-        self.images_by_date = self._init_images()
+        self.images = self._init_images()
         self._print_initialization_info()
 
     def _init_annotation(self):
@@ -538,48 +537,25 @@ class Sentinel2DataCube(SatelliteDataCube):
 
     def _init_images(self):
         """
-        Initalizes satellite images from the satellite images folder, organizing them by date.
+        Initializes satellite images from the satellite images folder, organizing them chronologically in a list.
 
         Returns:
-            dict: A dictionary mapping dates to Sentinel2 image instances, sorted by date.
+        list: A list of Sentinel2 image instances, sorted by date.
         """
-        images_by_date = {}
+        images = []
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
                 try:
                     date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
-                    images_by_date[date_satellite_image] = Sentinel2(folder=satellite_image_folder)
+                    image_instance = Sentinel2(folder=satellite_image_folder)
+                    image_instance.date = date_satellite_image  # Ensure each image has a 'date' attribute
+                    images.append(image_instance)
                 except ValueError:
                     logging.warning(f"Skipping {satellite_image_folder.name}: Does not match date format YYYYMMDD.")
-        
-        return dict(sorted(images_by_date.items()))
 
-    def _find_higher_quality_satellite_image(self, satellite_image, search_limit=5):
-        """Search for the nearest good quality image before and after the current date. 
-        If none is found, return the one with the least bad pixels from the search range.
-        
-        Returns:
-            Sentinel2: SatelliteImage object with the best quality
-        """
-        satellite_images_dates = sorted(self.images_by_date.keys())
-        start_date_idx = satellite_images_dates.index(satellite_image.date)
-
-        alternative_satellite_images = []
-        # Search within the range for acceptable images
-        for offset in range(1, search_limit + 1):
-            for direction in [-1, 1]:
-                new_date_idx = start_date_idx + (direction * offset)
-                if 0 <= new_date_idx < len(satellite_images_dates):
-                    new_date = satellite_images_dates[new_date_idx]
-                    neighbor_satellite_image = self.images_by_date.get(new_date)
-                    if neighbor_satellite_image.is_quality_acceptable():
-                        return neighbor_satellite_image
-                    else:
-                        alternative_satellite_images.append((neighbor_satellite_image, neighbor_satellite_image.calculate_bad_pixels()))
-                else:
-                    continue
-        alternative_satellite_images.sort(key=lambda x: x[1])  # Sorting by bad pixel ratio
-        return alternative_satellite_images[0][0] if alternative_satellite_images else satellite_image
+        # Sort the list by date
+         
+        return images
 
     def add_image(self, image_folder, date):
         """
@@ -596,55 +572,25 @@ class Sentinel2DataCube(SatelliteDataCube):
         Returns:
         - None
         """
-        # Assume Sentinel2 is a class that represents a satellite image and requires
-        # the folder path for initialization. Replace Sentinel2 with the correct class name as necessary.
-        self.images_by_date[date] = Sentinel2(image_folder)
+        self.images.append(Sentinel2(image_folder))
+        self.images.sort(key=lambda image: image.date)
 
-    def remove_image(self, date):
+    def remove_image_by_index(self, idx):
         """
-        Removes a satellite image from the data cube.
-
-        This method removes an image associated with a specific date from the images_by_date dictionary,
-        effectively deleting it from the data cube.
+        Removes a satellite image from the data cube by index.
 
         Parameters:
-        - date (datetime.date): The date of the image to be removed.
+        - idx (int): The index of the image to be removed in the images list.
 
         Returns:
-        - bool: True if the image was successfully removed, False if the image was not found.
+        - bool: True if the image was successfully removed, False if the index was out of bounds.
         """
-        # Check if the date exists in the dictionary before attempting to remove it
-        if date in self.images_by_date:
-            del self.images_by_date[date]
+        if 0 <= idx < len(self.images):
+            del self.images[idx]
             return True
-        else:
-            return False
+        return False
 
-    def find_best_selected_images(self):
-        try: 
-            updated_images_by_date = {}
-            for date, image in self.selected_images_by_date.items():
-                print("[" + " ".join(str(x) for x in range(len(self.images_by_date.keys()) + 1)) + "]", end='\r')
-                if image.is_quality_acceptable():
-                    updated_images_by_date[date] = image
-                else:
-                    neighbour_satellite_image = self._find_higher_quality_satellite_image(image)
-                    updated_images_by_date[neighbour_satellite_image.date] = neighbour_satellite_image
-            self.selected_images_by_date = updated_images_by_date
-        except ValueError:
-            raise ValueError("An error occurred while updating the satellite images of data-cube.Please make sure that you first select images with the functions select_images_by date() or select_imgaes_by_date().")
-        return 
-        
-    def select_images_with_badPixelRatio(self, bad_pixel_ratio):
-        selected_dates = []
-        for date, image in self.images_by_date.items():
-            image_bad_pixel_ratio = image.calculate_bad_pixel_ratio()
-            if image_bad_pixel_ratio <= bad_pixel_ratio:
-                selected_dates.append(date)
-        self.selected_images_by_date = {date: self.images_by_date[date] for date in selected_dates if date in self.images_by_date}
-        return
-    
-    def calculate_ndvi_around_annotations(self, output_dir=None, buffer_distance=10):
+    def calculate_ndvis_for_dating(self, output_dir=None, num_of_pixels=500, bad_pixel_threshold=30):
         """
         Asynchronously calculates NDVI values around annotations for each image in the dataset,
         and saves the results in a JSON file. If the file already exists, the saved results are loaded instead.
@@ -662,28 +608,36 @@ class Sentinel2DataCube(SatelliteDataCube):
         output_dir = self.base_folder / "other" if not output_dir else Path(output_dir)
         output_path = output_dir / f"{self.base_folder.name}_ndvi_around_ann.json"
         if not output_path.exists():
-            tasks = [(image, self.ann_file, buffer_distance) for image in self.images_by_date.values()]
-            with ProcessPoolExecutor() as executor:
-                future_tasks = {executor.submit(SatelliteDataCube._calculate_ndvi_around_ann_of_image, task): task for task in tasks}
-                dc_ndvi_around_ann = {}
-                for future in tqdm(as_completed(future_tasks), total=len(future_tasks), desc="Calculation NDVI around annotations"):
-                    try:
-                        img_date, img_ndvi_around_ann, logs = future.result()
-                        for ann_id, bands in img_ndvi_around_ann.items():
-                            if ann_id not in dc_ndvi_around_ann:
-                                dc_ndvi_around_ann[ann_id] = {}
-                            dc_ndvi_around_ann[ann_id][img_date] = bands
-                        if logs.get("status") != "success":
-                            print(f"Task raised following error: {logs.get('error', 'Unknown error')}")
-                    except Exception as exc:
-                        print(f"Unexpected exception {exc}: {traceback.format_exc()}")
-                save_spectral_signature(dc_ndvi_around_ann, output_path)
-                return dc_ndvi_around_ann
+            tasks = [(image, self.ann_file, num_of_pixels, bad_pixel_threshold) for image in self.images]
+            
+            for task in tasks:
+                image, ann_file, num_of_pixels, bad_pixel_threshold = task
+                ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
+                img_ann_ndvi_data = ann.calculate_ndvis_for_dating()
+                import pdb 
+                pdb.set_trace()
+                    
+            # with ProcessPoolExecutor() as executor:
+            #     future_tasks = {executor.submit(Sentinel2DataCube._calculate_ndvi_around_ann_of_image, task): task for task in tasks}
+            #     dc_ndvi_around_ann = {}
+            #     for future in tqdm(as_completed(future_tasks), total=len(future_tasks), desc="Calculation NDVI around annotations"):
+            #         try:
+            #             img_date, img_ndvi_around_ann, logs = future.result()
+            #             for ann_id, bands in img_ndvi_around_ann.items():
+            #                 if ann_id not in dc_ndvi_around_ann:
+            #                     dc_ndvi_around_ann[ann_id] = {}
+            #                 dc_ndvi_around_ann[ann_id][img_date] = bands
+            #             if logs.get("status") != "success":
+            #                 print(f"Task raised following error: {logs.get('error', 'Unknown error')}")
+            #         except Exception as exc:
+            #             print(f"Unexpected exception {exc}: {traceback.format_exc()}")
+            #     save_spectral_signature(dc_ndvi_around_ann, output_path)
+            #     return dc_ndvi_around_ann
         else:
             return load_spectral_signature(output_path)
 
     @staticmethod
-    def _calculate_ndvi_around_ann_of_image(task):
+    def _calculate_ndvis_of_image(task):
         """
         Helper function to calculate NDVI around annotations for a single image.
         Intended to be used with concurrent execution in mind.
@@ -695,18 +649,63 @@ class Sentinel2DataCube(SatelliteDataCube):
         - tuple: Contains the image date, calculated NDVI around annotations, and a result dictionary
         indicating the status of the operation.
         """
-        image, ann_file, buffer_distance = task
-        result = {"status": "", "details": "", "error": ""}
+        image, ann_file, num_of_pixels, bad_pixel_threshold = task
+        result = {"status": "", "details": "", "error": "", "traceback": ""}
         try:
             img_date = image.date.strftime("%Y%m%d")
             ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
-            img_ndvi_around_ann = ann.get_ndvi_around_polygon(buffer_distance)
+            img_ann_ndvi_data = ann.calculate_ndvis_for_dating(num_of_pixels, bad_pixel_threshold)
             result["status"] = "success"
             result["details"] = f"Successfully calculated ndvi around annotations for {image} on {img_date}."
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
-        return img_date, img_ndvi_around_ann, result
+            result["traceback"] = traceback.format_exc() 
+        return img_date, img_ann_ndvi_data, result
+    
+    def find_consistent_vegetation_areas(self, scl_values=[4], min_area_pixels=100):
+        """
+        Identifies contiguous areas where the Scene Classification Layer (SCL) value is consistently 
+        within the specified values across a series of Sentinel-2 images.
+
+        Parameters:
+        - image_paths: List of file paths to the Sentinel-2 SCL images.
+        - scl_values: List of SCL values that indicate desired conditions (e.g., vegetation).
+        - min_area_pixels: Minimum area in pixels to be considered a valid polygon.
+
+        Returns:
+        - A GeoDataFrame containing polygons of the identified areas.
+        """
+        scl_data = []
+        for image in self.images:
+            scl_path = image.bands["SCL"]
+            with rasterio.open(scl_path) as src:
+                scl_data.append(src.read())  # Assuming SCL is the first band
+        
+        # Stack the arrays to form a 3D array (time, height, width)
+        scl_stack = np.stack(scl_data)
+
+        # Identify pixels that consistently have the desired SCL values across all time points
+        consistent_mask = np.isin(scl_stack, scl_values).all(axis=0)
+        labeled_areas = label(consistent_mask)
+        
+        # Remove small objects (areas) to ensure we're focusing on significant ones
+        filtered_areas = remove_small_objects(labeled_areas, min_size=min_area_pixels)
+        filtered_areas_uint8 = filtered_areas.astype(np.uint8)
+        
+        # Convert the labeled mask to polygons
+        transform = None
+        with rasterio.open(self.images[0].path) as src:
+            transform = src.transform
+            crs = src.crs
+        
+        mask_polygons = []
+        for shape, value in shapes(filtered_areas_uint8, mask=filtered_areas_uint8, transform=transform): # type: ignore
+            if value == 0:
+                continue
+            mask_polygons.append(shape) 
+    
+        return gpd.GeoDataFrame(geometry=[Shape(polygon) for polygon in mask_polygons], crs=crs.to_string())
 
 class Sentinel1DataCube(SatelliteDataCube):
     def __init__(self, base_folder):
@@ -714,15 +713,8 @@ class Sentinel1DataCube(SatelliteDataCube):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-1-nrb"
         self.satellite_images_folder = self.base_folder / self.satellite
-        self.images_by_date = self._load_satellite_images()
+        self.images_by_date = self._init_images()
         self._print_initialization_info()
-     
-    def _load_satellite_images(self):
-        images_by_date = {}
-        for satellite_image_folder in self.satellite_images_folder.iterdir():
-            if satellite_image_folder.is_dir():
-                date_satellite_image = datetime.strptime(satellite_image_folder.name, "%Y%m%d").date()
-                annotation_shapefile = [file for folder in self.base_folder.iterdir() if folder.name == 'annotations' for file in folder.glob("*.shp")][0]
-                images_by_date[date_satellite_image] = Sentinel1(satellite_image_folder, annotation_shapefile, date_satellite_image)
-        satellite_images_by_date_sorted = dict(sorted(images_by_date.items()))
-        return satellite_images_by_date_sorted
+    
+    def _init_images(self):
+        pass
