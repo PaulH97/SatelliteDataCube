@@ -7,6 +7,8 @@ from rasterio.windows import Window, transform
 import numpy as np
 from rasterio.mask import mask
 from shapely import MultiPolygon
+from tqdm import tqdm
+import random
 
 class SatelliteImageAnnotation:
     def __init__(self, satellite_image, shapefile_path):
@@ -302,67 +304,94 @@ class SatelliteImageAnnotation:
         return filtered_anns_band_data
 
     def preprocess_annotation_zones(self, buffer_distance=20):
-        landslide_zones = MultiPolygon([geom.buffer(buffer_distance) for geom in self.gdf.geometry])
-        landslide_zones = MultiPolygon([geom.buffer(0) for geom in self.gdf.geometry if not geom.is_valid])
-        return landslide_zones.simplify(1.0, preserve_topology=True)
+        annotation_zones = MultiPolygon([geom.buffer(buffer_distance) for geom in self.gdf.geometry])
+        annotation_zones = MultiPolygon([geom.buffer(0) for geom in self.gdf.geometry if not geom.is_valid])
+        return annotation_zones.simplify(1.0, preserve_topology=True)
 
     @staticmethod
-    def calculate_annotation_buffer_ndvi(geometry, landslide_zones, scl_src, ndvi_src, num_of_pixels):
+    def calculate_annotation_buffer_ndvi(geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count):
         buffer_dist = 100  # Starting buffer distance
+        num_of_pixels = ann_pixel_count * 5
         while True:
             ann_large_buffer = geometry.buffer(buffer_dist)
-            buffered_zone = ann_large_buffer.difference(landslide_zones)
+            buffered_zone = ann_large_buffer.difference(annotation_zones)
             scl_data, _ = mask(scl_src, [buffered_zone], crop=True)
             ndvi_data, _ = mask(ndvi_src, [buffered_zone], crop=True)
-            vegetation_mask = scl_data[0] == 4
+            vegetation_mask = scl_data[0] == 4  # Targets only vegetation pixels
             ndvi_masked = ndvi_data[0][vegetation_mask].flatten()
 
-            if len(ndvi_masked) < num_of_pixels:
-                buffer_dist *= 1.5  # Increase buffer distance geometrically
-            else:
+            if ndvi_masked.size > 0 and ndvi_masked.size >= num_of_pixels:
+                # ndvi_masked = np.random.choice(ndvi_masked, num_of_pixels, replace=False)
                 ndvi_mean = np.mean(ndvi_masked)
                 ndvi_median = np.median(ndvi_masked)
                 break
+            elif ndvi_masked.size > 0 and ndvi_masked.size < num_of_pixels:
+                # If there's some data but not enough, adjust the buffer and try again
+                buffer_dist *= 1.5
+            else:
+                buffer_dist *= 1.5 
+                if buffer_dist > 500:  # Prevent infinite loop
+                    ndvi_mean = None 
+                    ndvi_median = None
+                    break
+
         return ndvi_mean, ndvi_median
-    
+        
     @staticmethod 
-    def calculate_annotation_ndvi(geometry, scl_src, ndvi_src, bad_pixel_threshold):
-        bad_pixel_values = [0,1,2,3,8,9,10,11]
-        scl_data_ls, _ = mask(scl_src, [geometry], crop=True, nodata=99, all_touched=True)
-        ndvi_data_ls, _ = mask(ndvi_src, [geometry], crop=True)
-        good_pixel_mask = ~np.isin(scl_data_ls[0], bad_pixel_values)
-        ndvi_masked_ls = ndvi_data_ls[0][good_pixel_mask].flatten()
+    def calculate_annotation_ndvi(geometry, scl_src, ndvi_src, good_pixel_threshold):
+        bad_pixel_values = [0, 1, 2, 3, 8, 9, 10, 11]
+        scl_ann, _ = mask(scl_src, [geometry], crop=True, nodata=99, all_touched=True)
+        ndvi_ann, _ = mask(ndvi_src, [geometry], crop=True)
+        
+        valid_scl_mask = scl_ann != 99
+        valid_ndvi_mask = ~np.isnan(ndvi_ann)
+        combined_valid_mask = valid_scl_mask & valid_ndvi_mask
+        
+        good_pixel_mask = (~np.isin(scl_ann[combined_valid_mask], bad_pixel_values))
+        valid_ndvi_ann = ndvi_ann[combined_valid_mask].flatten()
 
-        if len(good_pixel_mask) / len(scl_data_ls.flatten()) * 100 >= bad_pixel_threshold:
-            ndvi_mean_ls = np.mean(ndvi_masked_ls)
-            ndvi_median_ls = np.median(ndvi_masked_ls)
+        if good_pixel_mask.size != valid_ndvi_ann.size:
+            raise ValueError("Mismatch in good pixel mask and valid NDVI data sizes.")
+            
+        good_pixel_percentage = (np.sum(good_pixel_mask) / good_pixel_mask.size) * 100.0
+
+        if good_pixel_percentage >= good_pixel_threshold:
+            ndvi_masked_ann = valid_ndvi_ann[good_pixel_mask]
+
+            if ndvi_masked_ann.size > 0:
+                ndvi_mean_ann = np.nanmean(ndvi_masked_ann)
+                ndvi_median_ann = np.nanmedian(ndvi_masked_ann)
+            else:
+                ndvi_mean_ann = ndvi_median_ann = None
         else:
-            ndvi_mean_ls = ndvi_median_ls = None  # Handle case with no good pixels
-        return ndvi_mean_ls, ndvi_median_ls
+            ndvi_mean_ann = ndvi_median_ann = None
 
-    def calculate_ndvis_for_dating(self, num_of_pixels=500, bad_pixel_threshold=30):
+        ann_pixel_count = np.sum(combined_valid_mask)
+
+        return ndvi_mean_ann, ndvi_median_ann, ann_pixel_count
+
+    def calculate_ndvis_for_dating(self, good_pixel_threshold=70):
         self.image.calculate_ndvi()
         ndvi_path = self.image.bands["NDVI"]
         scl_path = SatelliteBand("SCL", self.image.bands["SCL"]).resample(10).path
-        landslide_zones = self.preprocess_annotation_zones()
+        annotation_zones = self.preprocess_annotation_zones()
 
         anns_ndvi_data = {}
-
+        
         with rasterio.open(scl_path) as scl_src, rasterio.open(ndvi_path) as ndvi_src:
-            for idx, row in self.gdf.iterrows():
-                print(f"Start row {idx}")
+            for _, row in self.gdf.iterrows():
+
+                annotation_ndvi_mean, annotation_ndvi_median, ann_pixel_count = self.calculate_annotation_ndvi(
+                    row["geometry"], scl_src, ndvi_src, good_pixel_threshold)
 
                 buffer_ndvi_mean, buffer_ndvi_median = self.calculate_annotation_buffer_ndvi(
-                    row["geometry"], landslide_zones, scl_src, ndvi_src, num_of_pixels)
-                
-                landslide_ndvi_mean, landslide_ndvi_median = self.calculate_annotation_ndvi(
-                    row["geometry"], scl_src, ndvi_src, bad_pixel_threshold)
-                
+                    row["geometry"], annotation_zones, scl_src, ndvi_src, ann_pixel_count)
+                                
                 anns_ndvi_data[row["id"]] = {
+                    "Annotation_NDVI_Mean": annotation_ndvi_mean,
+                    "Annotation_NDVI_Median": annotation_ndvi_median,
                     "Buffer_NDVI_Mean": buffer_ndvi_mean,
-                    "Buffer_NDVI_Median": buffer_ndvi_median,
-                    "Landslide_NDVI_Mean": landslide_ndvi_mean,
-                    "Landslide_NDVI_Median": landslide_ndvi_median
+                    "Buffer_NDVI_Median": buffer_ndvi_median
                 }
 
         return anns_ndvi_data
