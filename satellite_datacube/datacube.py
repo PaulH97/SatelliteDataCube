@@ -20,6 +20,7 @@ from shapely.geometry import shape as Shape
 from skimage.measure import label
 from skimage.morphology import remove_small_objects
 import geopandas as gpd
+import json
 
 class SatelliteDataCube:
     def __init__(self):
@@ -590,51 +591,40 @@ class Sentinel2DataCube(SatelliteDataCube):
             return True
         return False
 
-    def calculate_ndvis_for_dating(self, output_dir=None, num_of_pixels=500, bad_pixel_threshold=30):
-        """
-        Asynchronously calculates NDVI values around annotations for each image in the dataset,
-        and saves the results in a JSON file. If the file already exists, the saved results are loaded instead.
+    def calculate_ndvis_for_dating(self, output_dir=None, good_pixel_threshold=70):
+        output_dir = Path(self.base_folder) / "other" if not output_dir else Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
+        output_path = output_dir / f"{Path(self.base_folder).name}_ann_ndvi_data.json"
+        
+        if output_path.exists():
+            return self.load_spectral_signature(output_path)
 
-        Parameters:
-        - output_dir (Path, optional): The directory where the output JSON file is saved. If not provided,
-        a default 'other' directory within the base folder is used.
-        - buffer_distance (int, optional): The distance in meters to buffer around each annotation before
-        calculating NDVI. Defaults to 10.
+        tasks = [(image, self.ann_file, good_pixel_threshold) for image in self.images]
+        dc_ann_ndvi_data = {}
 
-        Returns:
-        - dict: A dictionary with annotation IDs as keys, each mapping to a dictionary of dates with
-        their corresponding NDVI values.
-        """
-        output_dir = self.base_folder / "other" if not output_dir else Path(output_dir)
-        output_path = output_dir / f"{self.base_folder.name}_ndvi_around_ann.json"
-        if not output_path.exists():
-            tasks = [(image, self.ann_file, num_of_pixels, bad_pixel_threshold) for image in self.images]
+        for task in tqdm(tasks, total=len(tasks), desc="Calculate NDVI values for dating"):
+            img_date, img_ann_ndvi_data, logs = self._calculate_ndvis_of_image(task)
+            for ann_id, ndvis in img_ann_ndvi_data.items():
+                dc_ann_ndvi_data.setdefault(ann_id, {})[img_date] = ndvis
+            if logs.get("status") != "success":
+                print(f"Task raised the following error: {logs.get('error', 'Unknown error')}")
+
+        # with ProcessPoolExecutor(max_workers=available_workers(reduce_by=10)) as executor:
+        #     future_tasks = {executor.submit(Sentinel2DataCube._calculate_ndvis_of_image, task): task for task in tasks}
             
-            for task in tasks:
-                image, ann_file, num_of_pixels, bad_pixel_threshold = task
-                ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
-                img_ann_ndvi_data = ann.calculate_ndvis_for_dating()
-                import pdb 
-                pdb.set_trace()
-                    
-            # with ProcessPoolExecutor() as executor:
-            #     future_tasks = {executor.submit(Sentinel2DataCube._calculate_ndvi_around_ann_of_image, task): task for task in tasks}
-            #     dc_ndvi_around_ann = {}
-            #     for future in tqdm(as_completed(future_tasks), total=len(future_tasks), desc="Calculation NDVI around annotations"):
-            #         try:
-            #             img_date, img_ndvi_around_ann, logs = future.result()
-            #             for ann_id, bands in img_ndvi_around_ann.items():
-            #                 if ann_id not in dc_ndvi_around_ann:
-            #                     dc_ndvi_around_ann[ann_id] = {}
-            #                 dc_ndvi_around_ann[ann_id][img_date] = bands
-            #             if logs.get("status") != "success":
-            #                 print(f"Task raised following error: {logs.get('error', 'Unknown error')}")
-            #         except Exception as exc:
-            #             print(f"Unexpected exception {exc}: {traceback.format_exc()}")
-            #     save_spectral_signature(dc_ndvi_around_ann, output_path)
-            #     return dc_ndvi_around_ann
-        else:
-            return load_spectral_signature(output_path)
+        # # Process results outside of the with block
+        # for future in tqdm(as_completed(future_tasks), total=len(tasks), desc="Calculating NDVI around annotations"):
+        #     try:
+        #         img_date, img_ann_ndvi_data, logs = future.result()
+        #         for ann_id, ndvis in img_ann_ndvi_data.items():
+        #             dc_ann_ndvi_data.setdefault(ann_id, {})[img_date] = ndvis
+        #         if logs.get("status") != "success":
+        #             print(f"Task raised the following error: {logs.get('error', 'Unknown error')}")
+        #     except Exception as exc:
+        #         print(f"Unexpected exception {exc}")
+
+        self.save_spectral_signature(dc_ann_ndvi_data, output_path)
+        return dc_ann_ndvi_data
 
     @staticmethod
     def _calculate_ndvis_of_image(task):
@@ -649,12 +639,12 @@ class Sentinel2DataCube(SatelliteDataCube):
         - tuple: Contains the image date, calculated NDVI around annotations, and a result dictionary
         indicating the status of the operation.
         """
-        image, ann_file, num_of_pixels, bad_pixel_threshold = task
+        image, ann_file, good_pixel_threshold = task
         result = {"status": "", "details": "", "error": "", "traceback": ""}
         try:
             img_date = image.date.strftime("%Y%m%d")
             ann = SatelliteImageAnnotation(satellite_image=image, shapefile_path=ann_file)
-            img_ann_ndvi_data = ann.calculate_ndvis_for_dating(num_of_pixels, bad_pixel_threshold)
+            img_ann_ndvi_data = ann.calculate_ndvis_for_dating(good_pixel_threshold)
             result["status"] = "success"
             result["details"] = f"Successfully calculated ndvi around annotations for {image} on {img_date}."
         except Exception as e:
@@ -663,49 +653,15 @@ class Sentinel2DataCube(SatelliteDataCube):
             result["traceback"] = traceback.format_exc() 
         return img_date, img_ann_ndvi_data, result
     
-    def find_consistent_vegetation_areas(self, scl_values=[4], min_area_pixels=100):
-        """
-        Identifies contiguous areas where the Scene Classification Layer (SCL) value is consistently 
-        within the specified values across a series of Sentinel-2 images.
+    @staticmethod
+    def save_spectral_signature(data, path):
+        with open(path, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
-        Parameters:
-        - image_paths: List of file paths to the Sentinel-2 SCL images.
-        - scl_values: List of SCL values that indicate desired conditions (e.g., vegetation).
-        - min_area_pixels: Minimum area in pixels to be considered a valid polygon.
-
-        Returns:
-        - A GeoDataFrame containing polygons of the identified areas.
-        """
-        scl_data = []
-        for image in self.images:
-            scl_path = image.bands["SCL"]
-            with rasterio.open(scl_path) as src:
-                scl_data.append(src.read())  # Assuming SCL is the first band
-        
-        # Stack the arrays to form a 3D array (time, height, width)
-        scl_stack = np.stack(scl_data)
-
-        # Identify pixels that consistently have the desired SCL values across all time points
-        consistent_mask = np.isin(scl_stack, scl_values).all(axis=0)
-        labeled_areas = label(consistent_mask)
-        
-        # Remove small objects (areas) to ensure we're focusing on significant ones
-        filtered_areas = remove_small_objects(labeled_areas, min_size=min_area_pixels)
-        filtered_areas_uint8 = filtered_areas.astype(np.uint8)
-        
-        # Convert the labeled mask to polygons
-        transform = None
-        with rasterio.open(self.images[0].path) as src:
-            transform = src.transform
-            crs = src.crs
-        
-        mask_polygons = []
-        for shape, value in shapes(filtered_areas_uint8, mask=filtered_areas_uint8, transform=transform): # type: ignore
-            if value == 0:
-                continue
-            mask_polygons.append(shape) 
-    
-        return gpd.GeoDataFrame(geometry=[Shape(polygon) for polygon in mask_polygons], crs=crs.to_string())
+    @staticmethod
+    def load_spectral_signature(path):
+        with open(path, 'r') as f:
+            return json.load(f)
 
 class Sentinel1DataCube(SatelliteDataCube):
     def __init__(self, base_folder):

@@ -169,7 +169,7 @@ class Sentinel2(SatelliteImage):
                 'crs': red.load_meta()["crs"],
                 'transform': red.load_meta()["transform"],
                 'compress': 'lzw',
-                'nodata': 0
+                'nodata': np.NaN
             }
             index_path = self.folder / f"{self.name}_NDVI.tif"
             with rasterio.open(index_path, 'w', **profile) as dst:
@@ -193,7 +193,7 @@ class Sentinel2(SatelliteImage):
                 'crs': nir.load_meta()["crs"],
                 'transform': nir.load_meta()["transform"],
                 'compress': 'lzw',
-                'nodata': 0
+                'nodata': np.NaN
             }
             index_path = self.folder / f"{self.name}_NDWI.tif"
             with rasterio.open(index_path, 'w', **profile) as dst:
