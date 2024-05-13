@@ -11,6 +11,7 @@ from tqdm import tqdm
 import random
 
 class SatelliteImageAnnotation:
+
     def __init__(self, satellite_image, shapefile_path):
         """
         Initialize a SatelliteImageAnnotation object. Each satellite image should have a corresponding annotation. 
@@ -227,7 +228,7 @@ class SatelliteImageAnnotation:
         with rasterio.open(patch_filepath, 'w', **patch_meta) as patch_dst:
             patch_dst.write(patch)
 
-    def create_spectral_signature(self, band_ids, filtering=False):
+    def create_spectral_signature(self, band_ids):
         """
         Generates spectral signatures for annotations, extracting data from specified
         bands of satellite imagery. Optionally filters annotations based on pixel quality.
@@ -239,10 +240,6 @@ class SatelliteImageAnnotation:
         Returns:
         - dict: Mapping each annotation ID to its spectral signature across specified bands.
         """
-        if filtering and "SCL" not in band_ids:
-            band_ids.append("SCL")  # Ensure "SCL" is included for filtering
-        
-        [idx_function() for idx, idx_function in self.image.index_functions.items() if idx in band_ids]
         opened_bands = {}
         for band_id, band_path in self.image.bands.items():
             if band_id in band_ids:
@@ -254,23 +251,14 @@ class SatelliteImageAnnotation:
             ann_bands_data = {}
             for band_id, band in opened_bands.items():
                 try:
-                    if band_id == "SCL":
-                        ann_band_data, _ = mask(band, [row["geometry"]], crop=True, nodata=99) # we need to define a new noData value outside 0-12
-                        unique, counts = np.unique(ann_band_data.flatten(), return_counts=True)
-                        ann_bands_data[band_id] = {int(u): int(c) for u, c in zip(unique, counts)}
-                    else:
-                        ann_band_data, _ = mask(band, [row["geometry"]], crop=True, nodata=-9999)
-                        valid_data = ann_band_data[ann_band_data > 0] # filters out the nodata values 
-                        ann_bands_data[band_id] = np.mean(valid_data) if valid_data.size > 0 else 0
+                    ann_band_data, _ = mask(band, [row["geometry"]], crop=True, nodata=-9999)
+                    valid_data = ann_band_data[ann_band_data > 0] # filters out the nodata values 
+                    ann_bands_data[band_id] = np.mean(valid_data) if valid_data.size > 0 else 0
                 except Exception as e:
                     print(f"Error processing band {band_id}: {e}")
                     ann_bands_data[band_id] = None
 
             anns_band_data[row["id"]] = ann_bands_data
-        
-        if filtering:
-            anns_band_data = self.filter_ann_by_bad_pixels(anns_band_data)
-        [band.close() for band in opened_bands.values()]
 
         return anns_band_data
     
@@ -395,3 +383,23 @@ class SatelliteImageAnnotation:
                 }
 
         return anns_ndvi_data
+    
+class SatCubeAnnotation:
+    def __init__(self, inventory_dir):
+        self.inventory_dir = Path(inventory_dir)
+        self.name = f"{inventory_dir.name}_annotator" 
+        self.path = self._initalize_annotation()
+    
+    def _initalize_annotation(self):
+        annotation_dir = self.inventory_dir / "annotations"
+        annotation_file = annotation_dir.glob("*.shp")[0]
+        if annotation_file.exists():
+            return annotation_file
+        return None
+    
+    def rasterize_annotations(self, resolution):
+        pass
+
+    def create_patches(self, patch_size, overlay, output_dir, total_images):
+        pass
+

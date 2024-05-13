@@ -743,17 +743,17 @@ class Sentinel12Datacube:
         self.annotations = SatCubeAnnotation(base_folder)
         self.patches_dir = self.base_folder / "patches" # Path to the patches directory - store here patches of S1, S2 and Annotations
         self.folds_dir = None
-    
-    def stack_bands_of_images(self, resolution, include_indizes):
+
+    def preprocess_data(self, resolution, include_indizes):
+        # Check if preprocess is necessary -Y create function for that 
         self.s1_datacube.stack_bands_of_images(resolution, include_indizes)
         self.s2_datacube.stack_bands_of_images(resolution, include_indizes)
-        return
-    
-    def rasterize_annotations(self, resolution):
-        self.annotations.rasterize(resolution)
+        self.annotations.rasterize_annotations(resolution)
         return
 
     def create_patches(self, patch_size, total_images, overlay=0, padding=True, output_dir=None):
+        # TODO have aparameter that recalls the create patches function to generate more different patches because inside the patch function there is a random selection of total images 
+        # this can be kind of an augmentation
         self.s1_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
         self.s2_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
         self.annotations.create_patches(patch_size, overlay, padding, output_dir)
@@ -768,6 +768,12 @@ class Sentinel12Datacube:
     def train_model(self, config_file):
         pass
 
+    def test_model(self, model_path):
+        pass
+
+    def predict(self, model_path):
+        pass
+    
     def clean(self, resampled_images=True, indizes=True, stacked_image=False):
         self.s1_datacube.clean(indizes, stacked_image)
         self.s2_datacube.clean(resampled_images, indizes, stacked_image)
