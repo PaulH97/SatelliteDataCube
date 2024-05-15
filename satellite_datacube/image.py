@@ -92,6 +92,15 @@ class Sentinel2(SatelliteImage):
         sorted_keys = sorted(raster_files_dir.keys(), key=extract_band_number)
         return {k: raster_files_dir[k] for k in sorted_keys}
 
+    def load_meta(self):
+        if self.path.exists():
+            with rasterio.open(self.path) as src:
+                src_meta = src.meta.copy()
+            return src_meta
+        else:
+            print("No stacked image exists. Please use stack_bands() to create such a file.") 
+            return None
+
     def stack_bands(self, resolution=10, include_indizes=True):
         """
         Stacks all bands and indices (if requested) of the satellite image into a single multi-band raster file.
@@ -177,11 +186,12 @@ class Sentinel2(SatelliteImage):
         return index
     
     def calculate_ndwi(self, save=True):
-        np.seterr(divide='ignore', invalid='ignore')
-        nir =  SatelliteBand(band_name="B08)", band_path=self.bands["B08"])
-        swir1 = SatelliteBand(band_name="B11)", band_path=self.bands["B11"]).resample(10)
-        nir_arr, swir1_arr = nir.load_array().astype(float), swir1.load_array().astype(float)
-        index = ((nir_arr - swir1_arr) / (nir_arr + swir1_arr))
+        nir = SatelliteBand(band_name="B08", band_path=self.bands["B08"])
+        swir1 = SatelliteBand(band_name="B11", band_path=self.bands["B11"]).resample(10)
+        nir_arr = np.nan_to_num(nir.load_array().astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        swir1_arr = np.nan_to_num(swir1.load_array().astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        small_value = 1e-10  # Avoid division by zero
+        index = (nir_arr - swir1_arr) / (nir_arr + swir1_arr + small_value)
         if save:
             profile = {
                 'driver': 'GTiff',
@@ -216,16 +226,21 @@ class Sentinel1(SatelliteImage):
         super().__init__(folder)
         self.folder = Path(folder)
         self.bands = self._initialize_bands()
-        self.name = self._initialize_name()
-        self.orbit_state = self.name.split("_")[-1] # S1A_IW_NRB_20170413t110840_48RUV_VH
-        self.date = datetime.strptime(self.name.split("_")[-2], "%Y%m%dt%H%M%S").date() # S1A_IW_NRB_20170413t110840_48RUV.tif
+        self.name = None
+        self.orbit_state = None 
+        self.date =  None
+        self.path = None
         self.index_functions = {"CR": self.calculate_CR}
-        self.path = self.folder / f"{self.name}.tif"
+        self._initialize_attributes()
         
-    def _initialize_name(self):
-        raster_filepath = Path(next(iter(self.bands.values()))) 
-        band_name = raster_filepath.stem # S1A_IW_NRB_20170413t110840_48RUV_VH.tif
-        return "_".join(band_name.split("_")[:-1])
+    def _initialize_attributes(self):
+        raster_filepath = Path(next(iter(self.bands.values()))) # s1a_iw_nrb_20170219t095846_015351_0192dd_20ppc-20ppb_vv_dsc.tif
+        name_parts = raster_filepath.stem.split("_")
+        self.name = "_".join(name_parts[:-2])
+        self.orbit_state = name_parts[-1]
+        self.date = datetime.strptime(name_parts[3], "%Y%m%dt%H%M%S").date()
+        self.path = self.folder / f"{self.name}.tif"
+        return 
 
     def _initialize_bands(self):
         bands_with_path = {}
@@ -237,42 +252,22 @@ class Sentinel1(SatelliteImage):
         sorted_keys = sorted(bands_with_path.keys())
         return {k: bands_with_path[k] for k in sorted_keys}
 
-    def stack_bands(self, resolution=10, include_indizes=False):
-        """
-        Stacks all bands and indices (if requested) of the satellite image into a single multi-band raster file.
-        Args:
-            resolution (int): The target resolution for resampling all bands. Defaults to 10.
-            include_indizes (bool): If True, indices like NDVI and NDWI are calculated, added to the bands,
-                                    and included in the stacking process. Defaults to False.
-        Returns:
-            Path: The path to the stacked image file. This will either be the base path or the index path
-                of the SatelliteImage object, depending on whether indices were included.      
-        Raises:
-            FileNotFoundError: If no band matches the desired resolution.
-            Exception: For any other unexpected errors during the stacking process.
-        """
-        # Dynamic path determination based on whether indices are to be included
-        if not self.path.exists() or (include_indizes and self.get_number_of_channels() != 3):
-            if include_indizes:
-                self.calculate_CR()
-
-            band_with_desired_res = self.find_band_by_res(resolution)
-            if band_with_desired_res:            
-                with rasterio.open(band_with_desired_res.path) as src:
-                    meta = src.meta.copy()
-                    meta['count'] = len(self.bands) # with/without cross ratio
-                    meta['dtype'] = 'uint16'  
+    def stack_bands(self):
+        if self.path.exists():
+            band_path = next(iter(self.bands.values()))
+            with rasterio.open(band_path) as src:
+                meta = src.meta.copy()
+            meta['count'] = len(self.bands)
 
             with rasterio.open(self.path, 'w', **meta) as dst:
                 band_descriptions = []
                 for i, (band_id, band_filepath) in enumerate(self.bands.items(), start=1):
                     band = SatelliteBand(band_id, band_filepath)
-                    band_arr = band.resample(resolution).load_array() # will check internal if resampling is needed
-                    dst.write(np.squeeze(band_arr), i)
-                    band_descriptions.append(band_id)
+                    band_array = band.load_array()
+                    if band_array is not None:
+                        dst.write(np.squeeze(band_array), i)
+                        band_descriptions.append(band_id)
                 dst.descriptions = tuple(band_descriptions)
-
-        return self
 
     def calculate_CR(self, save=True):
         np.seterr(divide='ignore', invalid='ignore')

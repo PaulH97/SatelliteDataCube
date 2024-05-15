@@ -31,12 +31,14 @@ class SatelliteBand:
     def load_array(self):
         """Lazily loads the raster array."""
         with rasterio.open(self.path, "r") as src:
-            return src.read() 
+            array = src.read()
+        return array
 
     def load_meta(self):
         """Lazily loads the raster metadata."""
         with rasterio.open(self.path, "r") as src:
-            return src.meta 
+            meta = src.meta.copy()
+        return meta 
 
     def _calculate_scale_factor(self, new_resolution):
         """Calculate the scale factor for resampling based on new resolution."""

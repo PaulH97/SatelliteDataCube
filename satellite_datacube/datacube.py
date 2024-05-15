@@ -672,31 +672,12 @@ class Sentinel1DataCube(SatelliteDataCube):
         self.base_folder = Path(base_folder)
         if not self.base_folder.is_dir():
             raise FileNotFoundError(f"Base folder {self.base_folder} does not exist or is not a directory.")
-
         self.satellite = "sentinel-1"
         self.satellite_images_folder = self.base_folder / self.satellite
         if not self.satellite_images_folder.is_dir():
             raise FileNotFoundError(f"Satellite images folder {self.satellite_images_folder} does not exist or is not a directory.")
-
-        self.ann_file = self._init_annotation()
         self.images = self._init_images()
         self._print_initialization_info()
-
-    def _init_annotation(self):
-        """
-        Initializes the annotation file from the annotations directory.
-        
-        Returns:
-            Path: The path to the first .shp file found in the annotations directory.
-        """
-        ann_dir = self.base_folder / "annotations"
-        if not ann_dir.is_dir():
-            raise FileNotFoundError(f"Annotation directory {ann_dir} does not exist or is not a directory.")
-
-        ann_file = next(ann_dir.glob("*.shp"), None)
-        if ann_file is None:
-            raise FileNotFoundError("No .shp files found in the annotations directory.")
-        return ann_file
 
     def _init_images(self):
         """
@@ -709,7 +690,7 @@ class Sentinel1DataCube(SatelliteDataCube):
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
                 try:
-                    s1_image = Sentinel2(folder=satellite_image_folder)
+                    s1_image = Sentinel1(folder=satellite_image_folder)
                     s1_images.append(s1_image)
                 except ValueError:
                     logging.warning(f"Skipping {satellite_image_folder.name}: Does not match date format YYYYMMDD.")
@@ -754,10 +735,12 @@ class Sentinel12Datacube:
         return
 
     def create_patches(self, patch_size, total_images, overlay=0, padding=True, output_dir=None):
-        self.s1_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
-        self.s2_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
-        self.annotations.create_patches(patch_size, overlay, padding, output_dir)
-        return
+        if not self.patches_dir.exists():
+            self.patches_dir.mkdir(parents=True, exist_ok=True)
+            self.s1_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
+            self.s2_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
+            self.annotations.create_patches(patch_size, overlay, padding, output_dir)
+        return self.patches_dir
     
     def build_folds(self, fold_nr):
         pass

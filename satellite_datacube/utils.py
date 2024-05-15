@@ -63,12 +63,12 @@ def extract_band_number(key):
 
 def extract_S2band_info(file_name):
     pattern = r"(B\d+[A-Z]?|SCL|NDVI|NDWI)\.tif"
-    match = re.search(pattern, file_name)
+    match = re.search(pattern, str(file_name))
     return match.group(1) if match else None
 
 def extract_S1band_info(file_name):
-    pattern = r"(VV|VH)\.tif"
-    match = re.search(pattern, file_name)
+    pattern = r'(vv|vh).*\.tif'
+    match = re.search(pattern, str(file_name))
     return match.group(1) if match else None
 
 def available_workers(reduce_by=10):

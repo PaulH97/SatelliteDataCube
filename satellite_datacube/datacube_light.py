@@ -754,9 +754,11 @@ class Sentinel12Datacube:
     def create_patches(self, patch_size, total_images, overlay=0, padding=True, output_dir=None):
         # TODO have aparameter that recalls the create patches function to generate more different patches because inside the patch function there is a random selection of total images 
         # this can be kind of an augmentation
-        self.s1_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
-        self.s2_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
-        self.annotations.create_patches(patch_size, overlay, padding, output_dir)
+        if not self.patches_dir.exists():
+            self.patches_dir.mkdir(parents=True, exist_ok=True)
+            self.s1_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
+            self.s2_datacube.create_patches(patch_size, total_images, overlay, padding, output_dir)
+            self.annotations.create_patches(patch_size, overlay, padding, output_dir)
         return
     
     def build_folds(self, fold_nr):
