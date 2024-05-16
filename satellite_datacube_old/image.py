@@ -101,7 +101,7 @@ class Sentinel2(SatelliteImage):
             print("No stacked image exists. Please use stack_bands() to create such a file.") 
             return None
 
-    def stack_bands(self, resolution=10, include_indizes=True):
+    def stack_bands(self, resolution=10):
         """
         Stacks all bands and indices (if requested) of the satellite image into a single multi-band raster file.
         Args:
@@ -116,16 +116,15 @@ class Sentinel2(SatelliteImage):
             Exception: For any other unexpected errors during the stacking process.
         """
         # Dynamic path determination based on whether indices are to be included
-        if not self.path.exists() or (include_indizes and self.get_number_of_channels() != 13):
-            if include_indizes:
-                self.calculate_all_indizes()
-
+        if not self.path.exists():
             band_with_desired_res = self.find_band_by_res(resolution)
             if band_with_desired_res:            
                 with rasterio.open(band_with_desired_res.path) as src:
                     meta = src.meta.copy()
                     meta['count'] = len(self.bands)
-                    meta['dtype'] = 'uint16'  
+                    meta['dtype'] = 'uint16'
+            else:
+                print(f"No band with resolution {resolution} found. Only bands with 10/20m resolution are supported.")  
 
             with rasterio.open(self.path, 'w', **meta) as dst:
                 band_descriptions = []
@@ -253,7 +252,7 @@ class Sentinel1(SatelliteImage):
         return {k: bands_with_path[k] for k in sorted_keys}
 
     def stack_bands(self):
-        if self.path.exists():
+        if not self.path.exists():
             band_path = next(iter(self.bands.values()))
             with rasterio.open(band_path) as src:
                 meta = src.meta.copy()

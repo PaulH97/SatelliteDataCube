@@ -248,7 +248,7 @@ class SatelliteDataCube:
             result["traceback"] = traceback.format_exc()  # Capture full traceback
         return result
 
-    def stack_bands_of_images(self, resolution, include_indizes):
+    def stack_bands(self, resolution, include_indizes):
         tasks = [(image, resolution, include_indizes) for image in self.images] # necessary to put it in tuple - for serialization 
         with ProcessPoolExecutor(max_workers=available_workers()) as executor:
             future_tasks = {executor.submit(SatelliteDataCube._stacking_image_bands, task): task for task in tasks}
@@ -624,17 +624,6 @@ class Sentinel2DataCube(SatelliteDataCube):
 
     @staticmethod
     def _calculate_ndvis_of_image(task):
-        """
-        Helper function to calculate NDVI around annotations for a single image.
-        Intended to be used with concurrent execution in mind.
-
-        Parameters:
-        - task (tuple): A tuple containing the image, annotation file path, and buffer distance.
-
-        Returns:
-        - tuple: Contains the image date, calculated NDVI around annotations, and a result dictionary
-        indicating the status of the operation.
-        """
         image, ann_file, good_pixel_threshold = task
         result = {"status": "", "details": "", "error": "", "traceback": ""}
         try:
@@ -662,60 +651,33 @@ class Sentinel2DataCube(SatelliteDataCube):
 class Sentinel1DataCube(SatelliteDataCube):
 
     def __init__(self, base_folder):
-        """
-        Initializes a Sentinel1DataCube with a specified base folder.
-        
-        Parameters:
-            base_folder (str): The path to the base directory where the satellite data is stored.
-        """
         super().__init__()
         self.base_folder = Path(base_folder)
-        if not self.base_folder.is_dir():
-            raise FileNotFoundError(f"Base folder {self.base_folder} does not exist or is not a directory.")
         self.satellite = "sentinel-1"
         self.satellite_images_folder = self.base_folder / self.satellite
-        if not self.satellite_images_folder.is_dir():
-            raise FileNotFoundError(f"Satellite images folder {self.satellite_images_folder} does not exist or is not a directory.")
         self.images = self._init_images()
         self._print_initialization_info()
 
     def _init_images(self):
-        """
-        Initializes satellite images from the satellite images folder, organizing them chronologically in a list.
-
-        Returns:
-        list: A list of Sentinel2 image instances, sorted by date.
-        """
         s1_images = []
         for satellite_image_folder in self.satellite_images_folder.iterdir():
             if satellite_image_folder.is_dir():
-                try:
-                    s1_image = Sentinel1(folder=satellite_image_folder)
-                    s1_images.append(s1_image)
-                except ValueError:
-                    logging.warning(f"Skipping {satellite_image_folder.name}: Does not match date format YYYYMMDD.")
+                s1_image = Sentinel1(folder=satellite_image_folder)
+                s1_images.append(s1_image)
         return s1_images
 
     def add_image(self, image_folder):
-
-        """
-        Adds a new satellite image to the data cube.
-
-        This method allows the addition of a new Sentinel2 image to the images_by_date dictionary,
-        mapping it to a specific date. It assumes the existence of a Sentinel2 class that initializes
-        with the image's folder path.
-
-        Parameters:
-        - image_folder (str): The folder path where the satellite image is stored.
-        - date (datetime.date): The date associated with the satellite image.
-
-        Returns:
-        - None
-        """
         self.images.append(Sentinel2(image_folder))
         self.images.sort(key=lambda image: image.date)
         pass
 
+    def stack_bands(self, reset=False):
+        for image in self.images:
+            if reset:
+                if image.path.exists():
+                    image.path.unlink()
+            image.stack_bands()
+            
 class Sentinel12Datacube:
     def __init__(self, base_folder):
         self.base_folder = Path(base_folder)
