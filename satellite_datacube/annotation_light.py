@@ -2,6 +2,7 @@ import rasterio
 from pathlib import Path
 import geopandas as gpd
 from rasterio.features import geometry_mask
+import numpy as np
  
 class SatCubeAnnotation:
     def __init__(self, inventory_dir):
@@ -27,18 +28,21 @@ class SatCubeAnnotation:
             print("No shapefile found in the annotations folder.")
             return None
     
-    def rasterize_annotations(self, raster_meta):
+    def rasterize_annotations(self, raster_meta, reset=False):
+        if reset and self.mask_path.exists():
+            self.mask_path.unlink()
+            
         raster_crs = raster_meta["crs"]
         if self.gdf.crs != raster_crs:
             self.gdf.to_crs(raster_crs, inplace=True)
 
         if not self.mask_path.exists():
             geometries = self.gdf["geometry"].values
-            raster_meta.update({'dtype': 'uint8', 'count': 1})
+            raster_meta.update({'dtype': 'uint8', 'count': 1, "nodata": 255})
 
             with rasterio.open(self.mask_path, 'w', **raster_meta) as dst:
                 mask = geometry_mask(geometries=geometries, invert=True, transform=dst.transform, out_shape=dst.shape)
-                dst.write(mask.astype(rasterio.uint8), 1)
+                dst.write(mask.astype(np.uint8), 1)
         else:
             print("Mask file already exists in the annotations folder.")
 

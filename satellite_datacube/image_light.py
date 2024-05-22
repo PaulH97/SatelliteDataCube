@@ -1,10 +1,12 @@
 from pathlib import Path
 from datetime import datetime
 import rioxarray
-from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_raster, extract_band_number, normalize
+from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_band, extract_band_number, normalize
 import xarray as xr
 import numpy as np
 from matplotlib import pyplot as plt
+import rasterio
+import dask
 
 class Sentinel2():
     def __init__(self, folder):
@@ -34,24 +36,36 @@ class Sentinel2():
         bands = {k: bands[k] for k in sorted_keys}
         return bands
 
-    def stack_bands(self, resolution=10):
-        if not self.path.exists():
-            resampled_rasters = []
-            band_names = []
+    def stack_bands(self, resolution=10, reset=False):
+        try:
+            if reset and self.path.exists():
+                self.path.unlink()
+                print(f"Removed existing file: {self.path}")
 
-            for band_name, band_path in self.band_files.items():
-                with rioxarray.open_rasterio(band_path) as raster:
-                    if raster.rio.resolution() != (resolution, resolution):
-                        raster = resample_raster(raster, resolution)
-                    resampled_rasters.append(raster)
+            if not self.path.exists():
+                # Use Dask to parallelize the processing of each band
+                band_names = []
+                tasks = []
+                for band_name, band_path in self.band_files.items():
                     band_names.append(band_name)
-                                  
-            stacked_raster = xr.concat(resampled_rasters, dim='band')
-            stacked_raster = stacked_raster.assign_coords(band=band_names)
-            stacked_raster = stacked_raster.chunk("auto")
-            stacked_raster.rio.to_raster(self.path)
-        
-        return self
+                    tasks.append(dask.delayed(resample_band)(band_path, resolution)) 
+
+                resampled_bands = dask.compute(*tasks)
+
+                # Stack the rasters using Dask
+                stacked_raster = xr.concat(resampled_bands, dim='band')
+                stacked_raster = stacked_raster.assign_coords(band=band_names)
+
+                # Save the stacked raster using Dask
+                stacked_raster.rio.to_raster(self.path, compute=True)
+                print(f"Stacked bands successfully and saved under: {self.path}")
+            else:
+                print(f"File already exists: {self.path}")
+
+            return self
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            raise
 
     def load_data(self):
         stacked_raster = rioxarray.open_rasterio(self.path).chunk({"x": 1000, "y": 1000})
@@ -60,15 +74,10 @@ class Sentinel2():
             ds[band_name] = stacked_raster.isel(band=i).drop_vars('band')
         return ds
     
-    def extract_spatial_metadata(self):
+    def get_metadata(self):
         if self.path.exists():
-            raster = rioxarray.open_rasterio(self.path)
-            meta = {
-                "crs": raster.rio.crs,
-                "transform": raster.rio.transform(),
-                "shape": raster.rio.shape,
-                "bounds": raster.rio.bounds()
-                }
+            with rasterio.open(self.path) as src:
+                meta = src.meta.copy()
             return meta
         else:
             return None
@@ -142,29 +151,36 @@ class Sentinel1():
         return bands
 
     def stack_bands(self, resolution=10, reset=False):
-        if reset and self.path.exists():
-            self.path.unlink()
-            print(f"Removed existing file: {self.path}")
+        try:
+            if reset and self.path.exists():
+                self.path.unlink()
+                print(f"Removed existing file: {self.path}")
 
-        if not self.path.exists():
-            resampled_rasters = []
-            band_names = []
-
-            for band_name, band_path in self.band_files.items():
-                with rioxarray.open_rasterio(band_path) as raster:
-                    if raster.rio.resolution() != (resolution, resolution):
-                        raster = resample_raster(raster, resolution)
-                    resampled_rasters.append(raster)
+            if not self.path.exists():
+                # Use Dask to parallelize the processing of each band
+                band_names = []
+                tasks = []
+                for band_name, band_path in self.band_files.items():
                     band_names.append(band_name)
-                                  
-            stacked_raster = xr.concat(resampled_rasters, dim='band')
-            stacked_raster = stacked_raster.assign_coords(band=band_names)
-            stacked_raster = stacked_raster.chunk("auto")
-            stacked_raster.rio.to_raster(self.path)
-            print(f"Stacked bands successfully and saved under: {self.path}")
-        else:
-            print(f"File {self.path} already exists. Skipping stacking.")
-        return self
+                    tasks.append(dask.delayed(resample_band)(band_path, resolution)) 
+
+                resampled_bands = dask.compute(*tasks)
+
+                # Stack the rasters using Dask
+                stacked_raster = xr.concat(resampled_bands, dim='band')
+                stacked_raster = stacked_raster.assign_coords(band=band_names)
+
+                # Save the stacked raster using Dask
+                stacked_raster.rio.to_raster(self.path, compute=True)
+                print(f"Stacked bands successfully and saved under: {self.path}")
+            else:
+                print(f"File already exists: {self.path}")
+
+            return self
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            raise
+
 
     def load_data(self):
         stacked_raster = rioxarray.open_rasterio(self.path).chunk({"x": 1000, "y": 1000})
@@ -173,15 +189,10 @@ class Sentinel1():
             ds[band_name] = stacked_raster.isel(band=i).drop_vars('band')
         return ds
         
-    def extract_spatial_metadata(self):
+    def get_metadata(self):
         if self.path.exists():
-            raster = rioxarray.open_rasterio(self.path)
-            meta = {
-                "crs": raster.rio.crs,
-                "transform": raster.rio.transform(),
-                "shape": raster.rio.shape,
-                "bounds": raster.rio.bounds()
-                }
+            with rasterio.open(self.path) as src:
+                meta = src.meta.copy()
             return meta
         else:
             return None

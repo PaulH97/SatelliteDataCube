@@ -6,13 +6,104 @@ import pandas as pd
 from affine import Affine
 import numpy as np 
 import xarray as xr
+import rioxarray
+from dask.distributed import Client
+from rasterio.features import geometry_mask
+from typing import Tuple, List
+from dask_jobqueue import SLURMCluster
+import dask
+from contextlib import contextmanager
+import signal
+from xarray.core.dataarray import DataArray
 
-def resample_raster(raster, target_resolution=10):
-    current_resolution = raster.rio.resolution()
-    scale_factor = current_resolution[0] / target_resolution
-    new_shape = (int(raster.rio.shape[0] * scale_factor), int(raster.rio.shape[1] * scale_factor))
-    resampled_raster = raster.rio.reproject(raster.rio.crs,shape=new_shape,resampling=Resampling.bilinear)
-    return resampled_raster
+def process_annotation(geometry, xds, bands):
+    mask = geometry_mask([geometry], transform=xds.attrs['transform'], invert=True, out_shape=(xds.dims['y'], xds.dims['x']))
+    mask = xr.DataArray(mask, dims=['y', 'x'])
+    masked_data = xds[bands].where(mask)
+    spectral_signature = masked_data.mean(dim=["x", "y"])
+    return spectral_signature
+
+def classify_patch(i: int, j: int, xds: xr.Dataset, patch_x_end: int, patch_y_end: int) -> Tuple[str, Tuple[int, int]]:
+    patch = xds.isel(x=slice(i, patch_x_end), y=slice(j, patch_y_end))
+    if patch.MASK.values.sum() != 0:
+        return "Annotation", (i, j)
+    else:
+        return "No-Annotation", (i, j)
+
+@dask.delayed
+def set_nan_value(xds, fill_value=-9999):
+    # this is not filling the nan - sets a metadata attribute that can be used by downstream tools 
+    # to interpret the missing values correctly 
+    for var_name in xds.variables:
+        if var_name not in xds.coords and var_name not in xds.attrs:          
+            xds[var_name].encoding['_FillValue'] = fill_value
+    return xds
+
+@dask.delayed
+def pad_patch(patch, patch_size):
+    pad_x = max(0, patch_size - patch.sizes['x'])
+    pad_y = max(0, patch_size - patch.sizes['y'])
+    if pad_x > 0 or pad_y > 0:
+        padding = ((0, 0), (0, pad_y), (0, pad_x))  # No padding for the band dimension
+        for var in patch.data_vars:
+            patch[var] = xr.DataArray(
+                np.pad(patch[var].values, padding, mode='constant', constant_values=0),
+                dims=patch[var].dims,
+                coords=patch[var].coords)
+    return patch
+
+@dask.delayed
+def update_patch_spatial_ref(patch, i, j, patch_size, original_transform, original_spatial_ref):
+    x_offset = i * patch_size * original_transform.a
+    y_offset = j * patch_size * original_transform.e  # Negative if north-up
+    new_transform = Affine(original_transform.a, original_transform.b, original_transform.c + x_offset,
+                        original_transform.d, original_transform.e, original_transform.f + y_offset)
+    patch = patch.assign_coords({'spatial_ref': original_spatial_ref})
+    patch.spatial_ref.attrs['GeoTransform'] = list(new_transform)
+    return patch
+
+def process_patch(patch_idx:List[Tuple], xds:xr.Dataset, patch_size:int, patch_folder:Path) -> Path:
+    i, j = patch_idx
+    patch = xds.isel(x=slice(i, min(i + patch_size, xds.x.size)),y=slice(j, min(j + patch_size, xds.y.size)))
+    patch = pad_patch(patch, patch_size)
+    xds_spatial_ref = xds.spatial_ref.copy()
+    xds_transform = extract_transform(xds)
+    patch = update_patch_spatial_ref(patch, i, j, patch_size, xds_transform, xds_spatial_ref)
+    patch = set_nan_value(patch, fill_value=-9999)
+    filename = Path(patch_folder, f"patch_{i}_{j}.nc")
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    # may be necessary to set the environment variable HDF5_USE_FILE_LOCKING=FALSE 
+    delayed_obj = patch.to_netcdf(filename, format="NETCDF4", engine="netcdf4", compute=False)
+    return delayed_obj
+
+def process_patch_chunk(patch_idxs_chunk:List[Tuple], xds:xr.Dataset, xds_transform:Affine, xds_spatial_ref:DataArray, patch_size:int, patch_folder:Path) -> List[Path]:
+    tasks = []
+    for patch_idx in patch_idxs_chunk:
+        i, j = patch_idx
+        patch = xds.isel(x=slice(i, min(i + patch_size, xds.x.size)), y=slice(j, min(j + patch_size, xds.y.size)))
+        patch = pad_patch(patch, patch_size)
+        patch = update_patch_spatial_ref(patch, i, j, patch_size, xds_transform, xds_spatial_ref)
+        patch = set_nan_value(patch, fill_value=-9999)  
+        
+        filename = Path(patch_folder, f"patch_{i}_{j}.nc")
+        filename.parent.mkdir(parents=True, exist_ok=True)
+
+        delayed_obj = patch.to_netcdf(filename, format="NETCDF4", engine="netcdf4", compute=False)
+        tasks.append(delayed_obj)
+    return tasks
+
+def resample_band(band_path, target_resolution=10):
+    with rioxarray.open_rasterio(band_path, chunks='auto') as raster:
+        current_resolution = raster.rio.resolution()
+        if current_resolution != (target_resolution, target_resolution):
+            scale_factor = current_resolution[0] / target_resolution
+            new_shape = (int(raster.rio.shape[0] * scale_factor), int(raster.rio.shape[1] * scale_factor))
+            resampled_raster = raster.rio.reproject(
+                raster.rio.crs,
+                shape=new_shape,
+                resampling=Resampling.bilinear
+            )
+        return resampled_raster
 
 def extract_S2_band_name(file_name):
     pattern = r"(B\d+[A-Z]?|SCL)\.tif"
@@ -35,6 +126,59 @@ def available_workers(reduce_by=1):
     free_cores = max(1, min(total_cores, int(total_cores - load_average)))
     return max(1, free_cores - reduce_by)
 
+@contextmanager
+def setup_dask_client(slurm_config):
+    """Setup the Dask client with dynamic worker and thread configuration."""
+
+    # Initialize the SLURM cluster with the configuration parameters
+    cluster = SLURMCluster(
+        queue=slurm_config['partition'],
+        account=slurm_config['account'],
+        walltime=slurm_config['walltime'],
+        cores=slurm_config['cpus_per_task'],
+        memory=slurm_config['memory'],
+        log_directory=slurm_config['log_directory'],
+        job_cpu=slurm_config['cpus_per_task'],  # Ensure correct CPU allocation
+        job_mem=slurm_config['memory'],  # Ensure correct memory allocation
+        job_script_prologue=[
+            f'export DASK_WORKER_NTHREADS={slurm_config["cpus_per_task"]}',
+            f'export DASK_WORKER_MEMORY_LIMIT={slurm_config["memory"]}'
+        ],
+        job_extra_directives=[
+            f"--clusters={slurm_config['clusters']}",
+            f"--job-name={slurm_config['job_name']}",
+            f"--error={slurm_config['error_file']}",
+            f"--output={slurm_config['output_file']}"
+        ],
+    )
+
+    import pdb; pdb.set_trace()
+        
+    # Scale the cluster to the desired number of workers - CAREFUL: based on the settings (CPUs + RAM) it can use multiple nodes 
+    cluster.scale(jobs=slurm_config['jobs']) # # Request 1 worker 
+
+    client = Client(cluster)
+
+    # Signal handler to ensure cleanup
+    def cleanup(signum, frame):
+        print("Cleaning up Dask cluster...")
+        client.close()
+        cluster.close()
+        print("Dask cluster cleaned up.")
+        exit(0)
+
+    # Register the signal handlers
+    signal.signal(signal.SIGINT, cleanup)  # Handle Ctrl+C
+    signal.signal(signal.SIGTERM, cleanup)  # Handle termination signals
+    
+    try:
+        yield client
+    finally:
+        # Ensure resources are closed in normal execution
+        print("Normal cleanup of Dask cluster...")
+        client.close()
+        cluster.close()
+
 def normalize(array):
     # Normalize the bands for plotting
     array_min, array_max = array.min(), array.max()
@@ -43,7 +187,8 @@ def normalize(array):
 def S2_xds_preprocess(ds):
     # Extract the date from the file path and set as a time coordinate
     date_str = Path(ds.encoding['source']).parent.stem
-    ds = ds.expand_dims(time=[pd.to_datetime(date_str)])
+    date_np = np.datetime64(pd.to_datetime(date_str)).astype('datetime64[ns]')
+    ds = ds.expand_dims(time=[date_np])
 
     band_names = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"]
     for i, band_name in enumerate(band_names):
@@ -56,7 +201,8 @@ def S2_xds_preprocess(ds):
 def S1_xds_preprocess(ds):
     # Extract the date from the file path and set as a time coordinate
     date_str = Path(ds.encoding['source']).parent.stem
-    ds = ds.expand_dims(time=[pd.to_datetime(date_str)])
+    date_np = np.datetime64(pd.to_datetime(date_str)).astype('datetime64[ns]')
+    ds = ds.expand_dims(time=[date_np])
 
     band_names = ["VH", "VV"]
     for i, band_name in enumerate(band_names):
@@ -71,32 +217,3 @@ def extract_transform(xds):
     original_transform = [float(val) for val in original_transform]
     original_transform = [original_transform[i] for i in new_order_indices]
     return Affine(*original_transform)
-
-def fill_nans(xds, fill_value=-9999):
-    for var_name in xds.variables:
-        if var_name not in xds.coords and var_name not in xds.attrs:          
-            xds[var_name].encoding['_FillValue'] = fill_value
-    return xds
-
-def pad_patch(patch, patch_size):
-    pad_x = max(0, patch_size - patch.sizes['x'])
-    pad_y = max(0, patch_size - patch.sizes['y'])
-    if pad_x > 0 or pad_y > 0:
-        padding = ((0, 0), (0, pad_y), (0, pad_x))  # No padding for the band dimension
-        for var in patch.data_vars:
-            patch[var] = xr.DataArray(
-                np.pad(patch[var].values, padding, mode='constant', constant_values=0),
-                dims=patch[var].dims,
-                coords=patch[var].coords)
-    return patch
-
-def update_patch_spatial_ref(patch, i, j, patch_size, original_dataset):
-    original_transform = extract_transform(original_dataset)
-    original_spatial_ref = original_dataset.spatial_ref.copy()
-    x_offset = i * patch_size * original_transform.a
-    y_offset = j * patch_size * original_transform.e  # Negative if north-up
-    new_transform = Affine(original_transform.a, original_transform.b, original_transform.c + x_offset,
-                        original_transform.d, original_transform.e, original_transform.f + y_offset)
-    patch = patch.assign_coords({'spatial_ref': original_spatial_ref})
-    patch.spatial_ref.attrs['GeoTransform'] = list(new_transform)
-    return patch
