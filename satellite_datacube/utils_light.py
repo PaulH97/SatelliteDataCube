@@ -8,20 +8,71 @@ import numpy as np
 import xarray as xr
 import rioxarray
 from dask.distributed import Client
-from rasterio.features import geometry_mask
 from typing import Tuple, List
 from dask_jobqueue import SLURMCluster
 import dask
 from contextlib import contextmanager
 import signal
 from xarray.core.dataarray import DataArray
+from dask import delayed
+from rasterio.features import geometry_mask
+def geotransform_to_affine(geotransform_str):
+    """Convert a GeoTransform string to an Affine transformation object."""
+    parts = list(map(float, geotransform_str.split()))
+    if len(parts) != 6:
+        raise ValueError("GeoTransform string must have exactly 6 components.")
+    return Affine(parts[1], parts[2], parts[0], parts[4], parts[5], parts[3])
 
-def process_annotation(geometry, xds, bands):
-    mask = geometry_mask([geometry], transform=xds.attrs['transform'], invert=True, out_shape=(xds.dims['y'], xds.dims['x']))
-    mask = xr.DataArray(mask, dims=['y', 'x'])
-    masked_data = xds[bands].where(mask)
-    spectral_signature = masked_data.mean(dim=["x", "y"])
-    return spectral_signature
+def create_mask(geometry, buffer_dist, transform, shape):
+    """Create a mask for the given geometry and buffer distance."""
+    return geometry_mask([geometry.buffer(buffer_dist)], transform=transform, invert=True, out_shape=shape)
+
+def calculate_good_pixel_mask(scl_data, bad_pixel_values):
+    """Calculate the good pixel mask for the entire dataset."""
+    bad_pixel_mask = scl_data.isin(bad_pixel_values)
+    good_pixel_mask = ~bad_pixel_mask
+    return good_pixel_mask
+
+def extract_ndvi_for_dating(ann, xds, min_good_pixel_ratio=0.7):
+    bad_pixel_values = [0, 1, 2, 3, 8, 9, 10, 11]
+    geometry = ann['geometry']
+    xform = geotransform_to_affine(xds.spatial_ref.attrs['GeoTransform'])
+    shape = (xds.dims['y'], xds.dims['x'])
+
+    # Create mask for the annotation
+    ann_mask = create_mask(geometry, 0, xform, shape)
+    ann_mask_da = xr.DataArray(ann_mask, dims=['y', 'x'])
+
+    # Calculate good pixel mask for the entire dataset
+    good_pixel_mask = calculate_good_pixel_mask(xds['SCL'], bad_pixel_values)
+
+    # Prepare results
+    results = []
+    for time_slice in xds.time:
+        print(f"Processing time slice: {time_slice.values}")
+
+        # Select the good pixel mask for the current time slice
+        good_pixel_ratio = good_pixel_mask.sel(time=time_slice).mean(dim=['y', 'x']).compute()
+        print(f"Good pixel ratio: {good_pixel_ratio.values}")
+
+        if good_pixel_ratio >= min_good_pixel_ratio:
+            # Calculate NDVI mean for annotation for the current time slice
+            ndvi_time = xds['NDVI'].sel(time=time_slice)
+            ann_ndvi_mean = calculate_ndvi_mean(ndvi_time, ann_mask_da).compute()
+
+            result = {
+                'time': np.datetime_as_string(time_slice.values, unit='s'),
+                'annotation_id': ann.get('id', 'N/A'),
+                'annotation_ndvi_mean': float(ann_ndvi_mean.values),
+            }
+            results.append(result)
+
+    return results
+def calculate_ndvi_mean(ndvi_data, mask):
+    """Apply mask to NDVI data and calculate mean."""
+    filtered_ndvi = ndvi_data.where(mask, drop=True)
+    return filtered_ndvi.mean(dim=['y', 'x'])
+
 
 def classify_patch(i: int, j: int, xds: xr.Dataset, patch_x_end: int, patch_y_end: int) -> Tuple[str, Tuple[int, int]]:
     patch = xds.isel(x=slice(i, patch_x_end), y=slice(j, patch_y_end))
@@ -196,6 +247,7 @@ def S2_xds_preprocess(ds):
     
     # Drop the original multi-band data variable if it is no longer needed
     ds = ds.drop_vars('band_data')
+
     return ds
 
 def S1_xds_preprocess(ds):

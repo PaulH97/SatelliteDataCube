@@ -1,5 +1,5 @@
 from satellite_datacube.image_light import Sentinel1, Sentinel2
-from satellite_datacube.utils_light import S1_xds_preprocess, S2_xds_preprocess, process_patch, process_annotation
+from satellite_datacube.utils_light import S1_xds_preprocess, S2_xds_preprocess, process_patch, extract_ndvi_for_dating
 from satellite_datacube.utils_light import extract_transform, pad_patch, update_patch_spatial_ref, set_nan_value
 from pathlib import Path
 import xarray as xr
@@ -11,7 +11,7 @@ import geopandas as gpd
 from dask.distributed import Client
 from typing import List, Union, Dict, Tuple
 from tqdm import tqdm
-from dask import delayed, compute
+from rasterio.features import geometry_mask
 from dask.diagnostics import ProgressBar
 
 class Sentinel2DataCube():
@@ -49,6 +49,7 @@ class Sentinel2DataCube():
     def _load_data(self):
         # This need to be images where the bands are already stacked
         s2_files = [s2.path for s2 in self.images if s2.path.exists()]
+        # HERE WE NEED TO MAKE THE CHECK IF DATA NEEDS TO BE STACKED FIRST -> maybe Sentinel1/2 function _ is_stacked()?
         self.data = xr.open_mfdataset(
             s2_files,
             engine="rasterio",
@@ -75,25 +76,44 @@ class Sentinel2DataCube():
         self.data['NDVI'] = ndvi
         return self
 
-    def extract_spectral_signature(self, bands: Union[str, List[str]], ann_gdf: gpd.GeoDataFrame, client: Client) -> List[xr.DataArray]:
+    # def extract_spectral_signature(self, bands: Union[str, List[str]], ann_gdf: gpd.GeoDataFrame) -> List[xr.DataArray]:
         
-        if isinstance(bands, str):
-            bands = [bands]
+    #     if isinstance(bands, str):
+    #         bands = [bands]
 
-        for band in bands:
-            if band not in self.data.data_vars:
-                raise ValueError(f"Band {band} not found in the data-cube.")
-            
-        S2_xds = client.scatter(self.data)
-        futures = []
+    #     for band in bands:
+    #         if band not in self.data.data_vars:
+    #             raise ValueError(f"Band {band} not found in the data-cube.")
+        
+    #     xds = self.data.chunk("auto")
+    #     tasks = []
+    #     for idx, ann in ann_gdf.iterrows():
+    #         ann_geom = [ann['geometry']]
+    #         ann_spectral_sig = calculate_spectral_signature(xds, ann_geom, bands)
+    #         tasks.append((ann["id"], ann_spectral_sig))
+
+    #     with ProgressBar():
+    #         ann_spectral_signatures = dask.compute(*tasks)
+        
+    #     # ann_spectral_signatures = xr.concat(
+    #     #     [xr.DataArray(res[0], dims=["band"], coords={"band": [band], "annotation_id": [res[1]]}) for res in ann_spectral_signatures], 
+    #     #     dim="annotation_id"
+    #     # )
+    #     return ann_spectral_signatures
+    
+    def extract_ndvi_signatures(self, ann_gdf: gpd.GeoDataFrame):
+
+        crs_wkt = self.data.spatial_ref.crs_wkt
+        ann_gdf.to_crs(crs_wkt, inplace=True)
+
+        xds = self.data.chunk("auto")
+        tasks = []
         for idx, ann in ann_gdf.iterrows():
-            geom = ann['geometry']
-            future = client.submit(process_annotation, geom, S2_xds, bands)
-            futures.append(future)
-
-        spectral_signatures = client.gather(futures)
-        # spectral_signature = xr.concat(spectral_signatures, dim="Annotation")
-        return spectral_signatures
+            ann_ndvis = extract_ndvi_for_dating(ann, xds)
+            tasks.append(ann_ndvis)
+        
+        results = dask.compute(*tasks)
+        return results
 
     def select_patches_based_on_ann(self, patch_size, overlap, ratio=0.3, seed=42) -> Dict[str, List[Tuple[int, int]]]:
         # Check if MASK is a data variable
@@ -158,7 +178,8 @@ class Sentinel2DataCube():
         S2_xds_transform = extract_transform(S2_xds)
         S2_xds_spatial_ref = S2_xds.spatial_ref.copy()
         S2_xds_x, S2_xds_y = S2_xds.x.size, S2_xds.y.size
-
+        
+        patch_files = []
         total_patches = len(patch_indices)
         for start in range(0, total_patches, chunk_size):
             print(f"Processing chunk {start} to {min(start + chunk_size, total_patches)}")
@@ -177,14 +198,16 @@ class Sentinel2DataCube():
                         # patch = pad_patch(patch, patch_size) # Fix issues later
                         continue
                     patch = update_patch_spatial_ref(patch, i, j, patch_size, S2_xds_transform, S2_xds_spatial_ref)
-                    patch = set_nan_value(patch, fill_value=-9999)  
-                    
+                    patch = set_nan_value(patch, fill_value=-9999)         
                     delayed_obj = patch.to_netcdf(filename, format="NETCDF4", engine="netcdf4", compute=False)
+                    patch_files.append(filename)
                     tasks.append(delayed_obj)
             if tasks:
                 print("Saving patches")
                 with ProgressBar():
                     dask.compute(*tasks)
+
+        return patch_files
 
 class Sentinel1DataCube():
     def __init__(self, base_folder):
@@ -291,3 +314,42 @@ class Sentinel1DataCube():
                 print("Patch saved to:", patch_filename)
         else:
             print("Patches already exist in the folder:", patch_folder)
+    
+    def create_patches_fast(self, patch_size:int, patch_indices:dict, chunk_size:int, reset=False) -> List[str]:
+        patch_folder = Path(self.base_folder) / "patches" / self.satellite
+        if reset and patch_folder.exists():
+            shutil.rmtree(patch_folder)
+        
+        patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
+
+        S1_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+        S1_xds_transform = extract_transform(S1_xds)
+        S1_xds_spatial_ref = S1_xds.spatial_ref.copy()
+        S1_xds_x, S1_xds_y = S1_xds.x.size, S1_xds.y.size
+
+        total_patches = len(patch_indices)
+        for start in range(0, total_patches, chunk_size):
+            print(f"Processing chunk {start} to {min(start + chunk_size, total_patches)}")
+            end = min(start + chunk_size, total_patches)
+            chunk = patch_indices[start:end]
+            
+            tasks = []
+            for patch_idx in tqdm(chunk, desc="Create patches of chunk"):
+                i, j = patch_idx
+                filename = Path(patch_folder, f"patch_{i}_{j}.nc")
+                if not filename.exists():
+                    filename.parent.mkdir(parents=True, exist_ok=True)
+                    # min() makes sure that the available index range of the dataset is not exceeded
+                    patch = S1_xds.isel(x=slice(i, min(i + patch_size, S1_xds_x)), y=slice(j, min(j + patch_size, S1_xds_y)))
+                    if patch.x.size < patch_size or patch.y.size < patch_size:
+                        # patch = pad_patch(patch, patch_size) # Fix issues later
+                        continue
+                    patch = update_patch_spatial_ref(patch, i, j, patch_size, S1_xds_transform, S1_xds_spatial_ref)
+                    patch = set_nan_value(patch, fill_value=-9999)  
+                    
+                    delayed_obj = patch.to_netcdf(filename, format="NETCDF4", engine="netcdf4", compute=False)
+                    tasks.append(delayed_obj)
+            if tasks:
+                print("Saving patches")
+                with ProgressBar():
+                    dask.compute(*tasks)
