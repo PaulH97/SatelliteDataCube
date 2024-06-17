@@ -1,6 +1,6 @@
 from satellite_datacube.image_light import Sentinel1, Sentinel2
-from satellite_datacube.utils_light import S1_xds_preprocess, S2_xds_preprocess, process_patch, extract_ndvi_for_dating
-from satellite_datacube.utils_light import extract_transform, pad_patch, update_patch_spatial_ref, set_nan_value
+from satellite_datacube.utils_light import process_patch, extract_ndvi_values
+from satellite_datacube.utils_light import extract_transform, update_patch_spatial_ref, set_nan_value
 from pathlib import Path
 import xarray as xr
 import rasterio 
@@ -8,19 +8,19 @@ import dask
 import shutil
 import random
 import geopandas as gpd
-from dask.distributed import Client
-from typing import List, Union, Dict, Tuple
+from typing import List, Dict, Tuple
 from tqdm import tqdm
-from rasterio.features import geometry_mask
 from dask.diagnostics import ProgressBar
+import numpy as np 
 
 class Sentinel2DataCube():
-    def __init__(self, base_folder):
+    def __init__(self, base_folder, load=True):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-2"
         self.si_folder = self.base_folder / self.satellite
         self.images = self._init_images()
-        self.data = self._load_data()
+        if load:
+            self.data = self._load_data()
         self._print_initialization_info()
 
     def _print_initialization_info(self):
@@ -49,16 +49,17 @@ class Sentinel2DataCube():
     def _load_data(self):
         # This need to be images where the bands are already stacked
         s2_files = [s2.path for s2 in self.images if s2.path.exists()]
-        # HERE WE NEED TO MAKE THE CHECK IF DATA NEEDS TO BE STACKED FIRST -> maybe Sentinel1/2 function _ is_stacked()?
         self.data = xr.open_mfdataset(
             s2_files,
-            engine="rasterio",
+            engine='netcdf4',
             chunks="auto",
-            preprocess=S2_xds_preprocess,
-            parallel=True, # use dask delayed
+            parallel=True, # use dask 
             combine="nested",
             concat_dim="time")
-        
+    
+        # for var in self.data.data_vars:
+        #     self.data[var] = self.data[var].astype(np.float16)
+
         return self.data
 
     def add_mask(self, mask_file):
@@ -66,7 +67,6 @@ class Sentinel2DataCube():
             mask = src.read(1)
         mask_da = xr.DataArray(mask, dims=("y", "x"), coords={"y": self.data.y.values,"x": self.data.x.values})
         self.data["MASK"] = mask_da
-        self.data = self.data.chunk("auto")
         return self
 
     def calculate_ndvi(self):
@@ -74,45 +74,33 @@ class Sentinel2DataCube():
         red = self.data['B04']
         ndvi = (nir - red) / (nir + red)
         self.data['NDVI'] = ndvi
+        self.data['NDVI'] = self.data['NDVI'].fillna(0)
+        
         return self
 
-    # def extract_spectral_signature(self, bands: Union[str, List[str]], ann_gdf: gpd.GeoDataFrame) -> List[xr.DataArray]:
-        
-    #     if isinstance(bands, str):
-    #         bands = [bands]
+    def apply_landslide_dating(self, ann_gdf: gpd.GeoDataFrame) -> List[Dict[str, List[float]]]:
 
-    #     for band in bands:
-    #         if band not in self.data.data_vars:
-    #             raise ValueError(f"Band {band} not found in the data-cube.")
-        
-    #     xds = self.data.chunk("auto")
-    #     tasks = []
-    #     for idx, ann in ann_gdf.iterrows():
-    #         ann_geom = [ann['geometry']]
-    #         ann_spectral_sig = calculate_spectral_signature(xds, ann_geom, bands)
-    #         tasks.append((ann["id"], ann_spectral_sig))
+        if "NDVI" not in self.data:
+            self.calculate_ndvi()
 
-    #     with ProgressBar():
-    #         ann_spectral_signatures = dask.compute(*tasks)
-        
-    #     # ann_spectral_signatures = xr.concat(
-    #     #     [xr.DataArray(res[0], dims=["band"], coords={"band": [band], "annotation_id": [res[1]]}) for res in ann_spectral_signatures], 
-    #     #     dim="annotation_id"
-    #     # )
-    #     return ann_spectral_signatures
-    
-    def extract_ndvi_signatures(self, ann_gdf: gpd.GeoDataFrame):
+        if ann_gdf.crs != self.data.rio.crs:
+            ann_gdf = ann_gdf.to_crs(self.data.rio.crs)
 
-        crs_wkt = self.data.spatial_ref.crs_wkt
-        ann_gdf.to_crs(crs_wkt, inplace=True)
+        from dask.distributed import Client
+        client = Client()
+        print(client.dashboard_link)
 
-        xds = self.data.chunk("auto")
         tasks = []
-        for idx, ann in ann_gdf.iterrows():
-            ann_ndvis = extract_ndvi_for_dating(ann, xds)
-            tasks.append(ann_ndvis)
+        for idx, ann in ann_gdf[:2].iterrows():
+            print(f"Processing {ann['id']}...")
+            delayed_obj = extract_ndvi_values(ann, self.data)
+            tasks.append(delayed_obj)
         
-        results = dask.compute(*tasks)
+        import pdb; pdb.set_trace()
+
+        with ProgressBar():
+            results = dask.compute(tasks[0])
+        
         return results
 
     def select_patches_based_on_ann(self, patch_size, overlap, ratio=0.3, seed=42) -> Dict[str, List[Tuple[int, int]]]:
@@ -121,7 +109,7 @@ class Sentinel2DataCube():
             mask_file = self.base_folder / "annotations" / f"{self.base_folder.name}_mask.tif"
             self.add_mask(mask_file)
             
-        S2_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+        S2_xds = self.data
         raster_width, raster_height = S2_xds.x.size, S2_xds.y.size
         step_size = patch_size - overlap
 
@@ -158,7 +146,7 @@ class Sentinel2DataCube():
             shutil.rmtree(patch_folder)
         
         if not patch_folder.exists():
-            S2_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+            S2_xds = self.data
             patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
 
             for patch_idx in patch_indices:
@@ -174,7 +162,7 @@ class Sentinel2DataCube():
         
         patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
 
-        S2_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+        S2_xds = self.data
         S2_xds_transform = extract_transform(S2_xds)
         S2_xds_spatial_ref = S2_xds.spatial_ref.copy()
         S2_xds_x, S2_xds_y = S2_xds.x.size, S2_xds.y.size
@@ -210,12 +198,13 @@ class Sentinel2DataCube():
         return patch_files
 
 class Sentinel1DataCube():
-    def __init__(self, base_folder):
+    def __init__(self, base_folder, load=True):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-1"
         self.si_folder = self.base_folder / self.satellite
         self.images = self._init_images()
-        self.data = self._load_data()
+        if load:
+            self.data = self._load_data()
         self._print_initialization_info()
 
     def _print_initialization_info(self):
@@ -246,12 +235,14 @@ class Sentinel1DataCube():
         s1_files = [s1.path for s1 in self.images if s1.path.exists()]
         self.data = xr.open_mfdataset(
             s1_files,
-            engine="rasterio",
+            engine='netcdf4',
             chunks="auto",
-            preprocess=S1_xds_preprocess,
-            parallel=True,
+            parallel=True, # use dask 
             combine="nested",
             concat_dim="time")
+        
+        # for var in self.data.data_vars:
+        #     self.data[var] = self.data[var].astype(np.float16)
         
         return self.data
 
@@ -260,7 +251,6 @@ class Sentinel1DataCube():
             mask = src.read(1)
         mask_da = xr.DataArray(mask, dims=("y", "x"), coords={"y": self.data.y.values,"x": self.data.x.values})
         self.data["MASK"] = mask_da
-        self.data = self.data.chunk("auto")
         return self
 
     def select_patches_based_on_ann(self, patch_size, overlap, ratio=0.3, seed=42) -> Dict[str, List[Tuple[int, int]]]:
@@ -269,7 +259,7 @@ class Sentinel1DataCube():
             mask_file = self.base_folder / "annotations" / f"{self.base_folder.name}_mask.tif"
             self.add_mask(mask_file)
             
-        S1_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+        S1_xds = self.data
         raster_width, raster_height = S1_xds.x.size, S1_xds.y.size
         step_size = patch_size - overlap
 
@@ -306,7 +296,7 @@ class Sentinel1DataCube():
             shutil.rmtree(patch_folder)
         
         if not patch_folder.exists():
-            S1_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+            S1_xds = self.data
             patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
 
             for patch_idx in patch_indices:
@@ -322,7 +312,7 @@ class Sentinel1DataCube():
         
         patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
 
-        S1_xds = self.data.chunk({'x': patch_size, 'y': patch_size})
+        S1_xds = self.data
         S1_xds_transform = extract_transform(S1_xds)
         S1_xds_spatial_ref = S1_xds.spatial_ref.copy()
         S1_xds_x, S1_xds_y = S1_xds.x.size, S1_xds.y.size

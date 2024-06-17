@@ -3,6 +3,10 @@ from pathlib import Path
 import geopandas as gpd
 from rasterio.features import geometry_mask
 import numpy as np
+from rasterio.mask import mask
+from shapely.geometry import MultiPolygon
+from satellite_datacube.utils_light import resample_band, calculate_lst
+from tqdm import tqdm
  
 class SatCubeAnnotation:
     def __init__(self, inventory_dir):
@@ -47,3 +51,131 @@ class SatCubeAnnotation:
             print("Mask file already exists in the annotations folder.")
 
         return self.mask_path
+    
+    def calculate_lst_values(self, s1_t_prev, s1_t_curr):
+            
+            anns_lst_data = {}
+                        
+            with rasterio.open(s1_t_prev.path) as s1_t_prev_src, rasterio.open(s1_t_curr.path) as s1_t_curr_src:
+                
+                if self.gdf.crs != s1_t_prev_src.crs:
+                    self.gdf = self.gdf.to_crs(s1_t_prev_src.crs)
+
+                for _, row in tqdm(self.gdf.iterrows(), total=len(self.gdf), desc="Processing annotations"):
+
+                    s1_t_prev_clip, _ = mask(s1_t_prev_src, [row.geometry.__geo_interface__], crop=True)
+                    s1_t_curr_clip, _ = mask(s1_t_curr_src, [row.geometry.__geo_interface__], crop=True)
+
+                    vv_prev, vh_prev = s1_t_prev_clip[0], s1_t_prev_clip[1]
+                    vv_curr, vh_curr = s1_t_curr_clip[0], s1_t_curr_clip[1]
+                    
+                    vv_lst = calculate_lst(vv_prev, vv_curr, nodata=s1_t_prev_src.nodata)
+                    vh_lst = calculate_lst(vh_prev, vh_curr, nodata=s1_t_prev_src.nodata)
+                    lst = vv_lst + vh_lst 
+
+                    anns_lst_data[row["id"]] = {"VV_LST": vv_lst, "VH_LST": vh_lst, "LST": lst}
+    
+            return anns_lst_data
+
+    def calculate_ndvi_values(self, ndvi_path, scl_path, good_pixel_threshold=70):
+
+        anns_ndvi_data = {}
+        annotation_zones = self.preprocess_annotation_zones(buffer_distance=20)
+
+        scl_path = resample_band(scl_path, save=True)
+
+        with rasterio.open(scl_path) as scl_src, rasterio.open(ndvi_path) as ndvi_src:
+            
+            if self.gdf.crs != scl_src.crs:
+                self.gdf = self.gdf.to_crs(scl_src.crs)
+            
+            for _, row in tqdm(self.gdf.iterrows(), total=len(self.gdf), desc="Processing annotations"):
+            
+                annotation_ndvi_mean, annotation_ndvi_median, ann_pixel_count = self.calculate_annotation_ndvi(
+                    clip_geom=row.geometry.__geo_interface__, 
+                    scl_src=scl_src, 
+                    ndvi_src=ndvi_src, 
+                    good_pixel_threshold=good_pixel_threshold
+                    )
+                
+                buffer_ndvi_mean, buffer_ndvi_median = self.calculate_annotation_buffer_ndvi(
+                    row.geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count)
+                                
+                anns_ndvi_data[row["id"]] = {
+                    "NDVI_mean": annotation_ndvi_mean,
+                    "NDVI_median": annotation_ndvi_median,
+                    "NDVI_undist_mean": buffer_ndvi_mean,
+                    "NDVI_undist_mdian": buffer_ndvi_median
+                }
+
+        return anns_ndvi_data
+
+    def calculate_annotation_ndvi(self, clip_geom, scl_src, ndvi_src, good_pixel_threshold):
+
+        bad_pixel_values = [0, 1, 2, 3, 8, 9, 10, 11]
+        scl_ann, _ = mask(scl_src, [clip_geom], crop=True, nodata=99)
+        ndvi_ann, _ = mask(ndvi_src, [clip_geom], crop=True)
+        
+        valid_scl_mask = scl_ann != 99
+        valid_ndvi_mask = ~np.isnan(ndvi_ann)
+        combined_valid_mask = valid_scl_mask & valid_ndvi_mask
+        
+        good_pixel_mask = (~np.isin(scl_ann[combined_valid_mask], bad_pixel_values))
+        valid_ndvi_ann = ndvi_ann[combined_valid_mask].flatten()
+
+        if good_pixel_mask.size != valid_ndvi_ann.size:
+            raise ValueError("Mismatch in good pixel mask and valid NDVI data sizes.")
+            
+        if good_pixel_mask.size != 0:
+            good_pixel_percentage = (np.sum(good_pixel_mask) / good_pixel_mask.size) * 100.0
+        else:
+            good_pixel_percentage = 0
+
+        if good_pixel_percentage >= good_pixel_threshold:
+            ndvi_masked_ann = valid_ndvi_ann[good_pixel_mask]
+
+            if ndvi_masked_ann.size > 0:
+                ndvi_mean_ann = np.nanmean(ndvi_masked_ann)
+                ndvi_median_ann = np.nanmedian(ndvi_masked_ann)
+            else:
+                ndvi_mean_ann = ndvi_median_ann = None
+        else:
+            ndvi_mean_ann = ndvi_median_ann = None
+
+        ann_pixel_count = np.sum(combined_valid_mask)
+
+        return ndvi_mean_ann, ndvi_median_ann, ann_pixel_count
+    
+    def preprocess_annotation_zones(self, buffer_distance=20):
+        annotation_zones = MultiPolygon([geom.buffer(buffer_distance) for geom in self.gdf.geometry])
+        annotation_zones = MultiPolygon([geom.buffer(0) for geom in self.gdf.geometry if not geom.is_valid])
+        return annotation_zones.simplify(1.0, preserve_topology=True)
+
+    def calculate_annotation_buffer_ndvi(self, geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count):
+        buffer_dist = 100  # Starting buffer distance
+        num_of_pixels = ann_pixel_count * 5
+        while True:
+            ann_large_buffer = geometry.buffer(buffer_dist)
+            buffered_zone = ann_large_buffer.difference(annotation_zones)
+            scl_data, _ = mask(scl_src, [buffered_zone], crop=True)
+            ndvi_data, _ = mask(ndvi_src, [buffered_zone], crop=True)
+            vegetation_mask = scl_data[0] == 4  # Targets only vegetation pixels
+            ndvi_masked = ndvi_data[0][vegetation_mask].flatten()
+
+            if ndvi_masked.size > 0 and ndvi_masked.size >= num_of_pixels:
+                # ndvi_masked = np.random.choice(ndvi_masked, num_of_pixels, replace=False)
+                ndvi_mean = np.mean(ndvi_masked)
+                ndvi_median = np.median(ndvi_masked)
+                break
+            elif ndvi_masked.size > 0 and ndvi_masked.size < num_of_pixels:
+                # If there's some data but not enough, adjust the buffer and try again
+                buffer_dist *= 1.5
+            else:
+                buffer_dist *= 1.5 
+                if buffer_dist > 500:  # Prevent infinite loop
+                    ndvi_mean = None 
+                    ndvi_median = None
+                    break
+
+        return ndvi_mean, ndvi_median
+

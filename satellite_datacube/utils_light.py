@@ -15,64 +15,265 @@ from contextlib import contextmanager
 import signal
 from xarray.core.dataarray import DataArray
 from dask import delayed
-from rasterio.features import geometry_mask
-def geotransform_to_affine(geotransform_str):
-    """Convert a GeoTransform string to an Affine transformation object."""
-    parts = list(map(float, geotransform_str.split()))
-    if len(parts) != 6:
-        raise ValueError("GeoTransform string must have exactly 6 components.")
-    return Affine(parts[1], parts[2], parts[0], parts[4], parts[5], parts[3])
+import ruptures as rpt
+from matplotlib import pyplot as plt
+from memory_profiler import profile
+import dask.dataframe as dd
+import geopandas as gpd
 
-def create_mask(geometry, buffer_dist, transform, shape):
-    """Create a mask for the given geometry and buffer distance."""
-    return geometry_mask([geometry.buffer(buffer_dist)], transform=transform, invert=True, out_shape=shape)
+def calculate_lst(t_prev, t_curr, nodata=-9999):
+    """
+    Calculate the LST index for a given pair of time-step arrays, ignoring nodata values.
 
-def calculate_good_pixel_mask(scl_data, bad_pixel_values):
-    """Calculate the good pixel mask for the entire dataset."""
-    bad_pixel_mask = scl_data.isin(bad_pixel_values)
-    good_pixel_mask = ~bad_pixel_mask
-    return good_pixel_mask
+    Parameters:
+    t_prev (np.ndarray): The array of backscatter values at the previous time step.
+    t_curr (np.ndarray): The array of backscatter values at the current time step.
+    nodata (float): The value representing nodata in the arrays.
 
-def extract_ndvi_for_dating(ann, xds, min_good_pixel_ratio=0.7):
-    bad_pixel_values = [0, 1, 2, 3, 8, 9, 10, 11]
-    geometry = ann['geometry']
-    xform = geotransform_to_affine(xds.spatial_ref.attrs['GeoTransform'])
-    shape = (xds.dims['y'], xds.dims['x'])
+    Returns:
+    float: The calculated LST index.
+    """
+    # Mask nodata values
+    mask = (t_prev == nodata) | (t_curr == nodata)
+    t_prev = np.ma.masked_array(t_prev, mask)
+    t_curr = np.ma.masked_array(t_curr, mask)
 
-    # Create mask for the annotation
-    ann_mask = create_mask(geometry, 0, xform, shape)
-    ann_mask_da = xr.DataArray(ann_mask, dims=['y', 'x'])
+    # Calculate the squared differences, ignoring masked values
+    diff_squared = (t_curr - t_prev) ** 2
 
-    # Calculate good pixel mask for the entire dataset
-    good_pixel_mask = calculate_good_pixel_mask(xds['SCL'], bad_pixel_values)
+    # Sum the squared differences, ignoring masked values
+    sum_diff_squared = np.sum(diff_squared)
 
-    # Prepare results
-    results = []
-    for time_slice in xds.time:
-        print(f"Processing time slice: {time_slice.values}")
+    # Count the number of valid (non-masked) pixels
+    n = np.count_nonzero(~np.ma.getmaskarray(diff_squared))
 
-        # Select the good pixel mask for the current time slice
-        good_pixel_ratio = good_pixel_mask.sel(time=time_slice).mean(dim=['y', 'x']).compute()
-        print(f"Good pixel ratio: {good_pixel_ratio.values}")
+    # Calculate the LST index
+    lst_index = sum_diff_squared / n if n > 0 else np.nan
 
-        if good_pixel_ratio >= min_good_pixel_ratio:
-            # Calculate NDVI mean for annotation for the current time slice
-            ndvi_time = xds['NDVI'].sel(time=time_slice)
-            ann_ndvi_mean = calculate_ndvi_mean(ndvi_time, ann_mask_da).compute()
+    return lst_index
 
-            result = {
-                'time': np.datetime_as_string(time_slice.values, unit='s'),
-                'annotation_id': ann.get('id', 'N/A'),
-                'annotation_ndvi_mean': float(ann_ndvi_mean.values),
-            }
-            results.append(result)
+def extract_metadata(raster_path): 
+    with rioxarray.open_rasterio(raster_path) as raster:
+        crs_wkt = raster.rio.crs.to_wkt()
+        transform = raster.rio.transform()
+        return {"crs_wkt": crs_wkt, "GeoTransform": transform}
 
-    return results
-def calculate_ndvi_mean(ndvi_data, mask):
-    """Apply mask to NDVI data and calculate mean."""
-    filtered_ndvi = ndvi_data.where(mask, drop=True)
-    return filtered_ndvi.mean(dim=['y', 'x'])
+def build_xr_dataset(data_array, band_names, date, metadata):
 
+    ds = data_array.to_dataset(name='band_data')
+    
+    crs_wkt = metadata['crs_wkt']
+    geo_transform = metadata['GeoTransform']
+    date_np = np.datetime64(date).astype('datetime64[ns]')
+    ds = ds.expand_dims(time=[date_np])
+    
+    for i, band_name in enumerate(band_names):
+        ds[band_name] = ds['band_data'].isel(band=i)
+    
+    ds = ds.drop_vars('band_data')
+    ds = ds.drop_vars('band')
+    
+    ds.rio.write_crs(crs_wkt, inplace=True)
+    
+    transform_values = list(map(float, geo_transform.split()))
+    affine_transform = Affine(*transform_values[:6])
+    ds.rio.write_transform(affine_transform, inplace=True)
+    
+    return ds
+
+def plot_buffer(buffer1, buffer2):
+    # Step 3: Extract coordinates for plotting
+    x1, y1 = buffer1.exterior.xy
+    x2, y2 = buffer2.exterior.xy
+    #   Step 4: Plotting using Matplotlib
+    plt.figure()
+    plt.plot(x1, y1)
+    plt.fill(x1, y1, alpha=0.5)  # Fill the polygon with a semi-transparent fill
+    plt.plot(x2, y2)
+    plt.fill(x2, y2, alpha=0.5)  # Fill the polygon with a semi-transparent fill
+    plt.title('Shapely Polygon Plot')
+    plt.xlabel('X coordinate')
+    plt.ylabel('Y coordinate')
+    plt.grid(True)
+    plt.show()
+    plt.savefig('buffer.png')
+
+def plot_cdndvi(ndvi_df):
+    plt.figure(figsize=(10, 6))
+    plt.plot(ndvi_df.index, ndvi_df["CDNDVI"], marker='o', linestyle='-')
+    plt.title('CDNDVI Over Time')
+    plt.xlabel('Date')
+    plt.ylabel('CDNDVI')
+    plt.grid(True)
+    plt.savefig('cdndvi_plot.png')
+
+def despike_timeseries(data, window=5, z_threshold=2):
+    """
+    Removes spikes from the provided NDVI timeseries data using a moving median and Z-score thresholding.
+
+    Parameters:
+    - data (pd.Series): A pandas Series with NDVI values.
+    - window (int): The size of the moving window for the median calculation.
+    - z_threshold (int or float): The Z-score threshold to identify spikes.
+
+    Returns:
+    - pd.Series: The despiked NDVI timeseries.
+    """
+    # Calculate the moving median and absolute deviation from the median
+    rolling_median = data.rolling(window, center=True, min_periods=1).median()
+    deviation = np.abs(data - rolling_median)
+    median_deviation = deviation.rolling(window, center=True, min_periods=1).median()
+
+    # Replace with NaN where the deviation is too large (i.e., beyond the threshold of median deviation)
+    z_score = 0.6745 * deviation / median_deviation
+    data_clean = data.copy()
+    data_clean[z_score > z_threshold] = rolling_median[z_score > z_threshold]
+
+    return data_clean
+
+def calculate_cdndvi(ndvi_df, window_size=5):
+    # Ensure the column names match those in the DataFrame
+    smoothed_ndvi = ndvi_df["NDVI"].rolling(window=window_size, center=True, min_periods=1).mean()
+    smoothed_undist_ndvi = ndvi_df["NDVI_UNDIST"].rolling(window=window_size, center=True, min_periods=1).mean()
+    cdndvi = smoothed_undist_ndvi - smoothed_ndvi
+    return cdndvi
+
+def find_significant_changes_v2(ann_ndvi_df, look_back=4, look_ahead=3, threshold_multiplier=2):
+    
+    ann_ndvi_df['DatesNumeric'] = (ann_ndvi_df.index - ann_ndvi_df.index.min()).days
+    slopes = np.diff(ann_ndvi_df['CDNDVI']) / np.diff(ann_ndvi_df['DatesNumeric'])
+    slopes_df = pd.Series(slopes, index=ann_ndvi_df.index[:-1])
+
+    # Calculate rolling statistics
+    rolling_mean = slopes_df.rolling(window=look_back).mean()
+    rolling_std = slopes_df.rolling(window=look_back).std()
+
+    significant_points = []
+    # Compare each point to its rolling statistics
+    for i in range(len(slopes)):
+        if i >= look_back and i < len(slopes) - look_ahead:
+            if pd.notna(rolling_mean[i]) and pd.notna(rolling_std[i]):
+                if slopes[i] > rolling_mean[i] + threshold_multiplier * rolling_std[i]:
+                    if all(slopes[i + j] > rolling_mean[i] for j in range(1, look_ahead + 1)):
+                        significant_points.append(ndvi_df.index[i])
+        # Optionally, handle edge cases more gracefully
+
+    return significant_points
+
+def detect_change_points(cdndvi, penalty_value):
+
+    model = "l1"  # "l1" norm cost (mean absolute deviation), which can be more robust to outliers
+    algo = rpt.Binseg(model=model).fit(cdndvi.array)
+    
+    # Predict change points, 'pen' controls the number of breakpoints
+    breakpoints = algo.predict(pen=penalty_value)
+
+    change_points_dates = [cdndvi.index[bkpt - 1] for bkpt in breakpoints if bkpt < len(data)]
+    
+    return change_points_dates
+
+# def extract_ndvi_values(ann, xds, ann_gdf_crs):
+#     time_mask = xds["SCL"].rio.clip([ann.geometry], crs=ann_gdf_crs, drop=True).isin([4,5,6]).mean(dim=("x", "y")) >= 0.5
+#     ann_ndvi = xds["NDVI"].rio.clip([ann.geometry], crs=ann_gdf_crs, drop=True).sel(time=time_mask).mean(dim=("x", "y"))
+#     ann_geom_buffer = create_differential_buffer(ann.geometry, large_buffer_size=200, small_buffer_size=10)
+#     ann_scl_buffer = xds["SCL"].rio.clip([ann_geom_buffer], crs=ann_gdf_crs, drop=True).sel(time=time_mask)
+#     ann_ndvi_buffer = xds["NDVI"].rio.clip([ann_geom_buffer], crs=ann_gdf_crs, drop=True).sel(time=time_mask).where(ann_scl_buffer == 4).mean(dim=("x", "y"))
+#     ann_ndvi_df = pd.DataFrame({"NDVI": ann_ndvi.values, "NDVI_UNDIST": ann_ndvi_buffer.values}, index=ann_ndvi.time.values)
+#     return ann_ndvi_df
+
+@dask.delayed
+def clip_dataset(geometry, xds, crs):
+    return xds.rio.clip([geometry], crs=crs, all_touched=True, drop=True, from_disk=True)
+
+def create_time_mask(xds, valid_scl_keys=[4,5,6]): 
+    valid_values_mask = xds["SCL"].isin(valid_scl_keys)
+    non_nan_mask = ~np.isnan(xds["SCL"])
+    combined_mask = valid_values_mask & non_nan_mask
+    valid_count = non_nan_mask.sum(dim=("x", "y"))
+    condition_count = combined_mask.sum(dim=("x", "y"))
+    time_mask = (condition_count / valid_count) > 0.5
+    return time_mask
+
+@dask.delayed
+def compute_ndvi(clipped_xds, time_mask):
+    return clipped_xds["NDVI"].sel(time=time_mask).mean(dim=("x", "y"))
+
+@dask.delayed
+def compute_buffer_ndvi(xds, buffer_geometry, crs, time_mask):
+    clipped_buffer_xds = xds.rio.clip([buffer_geometry], crs=crs, all_touched=True, drop=True, from_disk=True)
+    ann_scl_buffer = clipped_buffer_xds["SCL"].sel(time=time_mask)
+    ann_ndvi_buffer = clipped_buffer_xds["NDVI"].sel(time=time_mask).where(ann_scl_buffer == 4).mean(dim=("x", "y"), skipna=True)
+    return ann_ndvi_buffer
+
+@dask.delayed
+def create_dataframe(ann_ndvi, ann_ndvi_buffer, time_values):
+    return pd.DataFrame({"NDVI": ann_ndvi, "NDVI_UNDIST": ann_ndvi_buffer}, index=time_values)
+
+@dask.delayed
+def extract_ndvi_buffer(ann, xds):
+    ann_geom_buffer = create_differential_buffer(ann.geometry, large_buffer_size=200, small_buffer_size=10)
+    xds_buffer = xds.rio.clip([ann_geom_buffer], crs=xds.rio.crs, all_touched=True, drop=True, from_disk=True)
+    ann_ndvi_buffer = xds_buffer["NDVI"].where(xds_buffer["SCL"] == 4).mean(dim=("x", "y"), skipna=True)
+    return ann_ndvi_buffer
+
+@dask.delayed
+def extract_ndvi(ann: pd.Series, xds: xr.Dataset) -> pd.DataFrame:
+    clipped_xds = xds.rio.clip([ann.geometry], crs=xds.rio.crs, all_touched=True, drop=True, from_disk=True)
+    ann_ndvi = clipped_xds["NDVI"].mean(dim=("x", "y"))
+    return ann_ndvi
+
+def extract_ndvi_values(ann, xds):
+    crs = xds.rio.crs
+    clipped_xds = clip_dataset(ann.geometry, xds, crs)
+    time_mask = create_time_mask(clipped_xds, valid_scl_keys=[4, 5, 6])
+    ann_ndvi = compute_ndvi(clipped_xds, time_mask)
+    
+    ann_geom_buffer = create_differential_buffer(ann.geometry, large_buffer_size=200, small_buffer_size=10)
+    ann_ndvi_buffer = compute_buffer_ndvi(xds, ann_geom_buffer, crs, time_mask)
+    
+    ann_ndvi_df = create_dataframe(ann_ndvi, ann_ndvi_buffer, ann_ndvi.time)
+    
+    return clipped_xds
+
+def extract_ndvi_values(ann, xds):
+    clipped_xds = xds.rio.clip([ann.geometry], crs=xds.rio.crs, all_touched=True, drop=True)
+    time_mask = create_time_mask(clipped_xds, valid_scl_keys=[4, 5, 6])
+    if time_mask.values:
+        ann_ndvi = clipped_xds["NDVI"].mean(dim=("x", "y"), skipna=True).item()
+        ann_geom_buffer = create_differential_buffer(ann.geometry, large_buffer_size=200, small_buffer_size=10)
+        clipped_buffer_xds = xds.rio.clip([ann_geom_buffer], crs=xds.rio.crs, all_touched=True, drop=True)
+        ann_ndvi_buffer = clipped_buffer_xds["NDVI"].where(clipped_buffer_xds["SCL"] == 4).mean(dim=("x", "y"), skipna=True).item()
+        return {"ID": ann["id"], "NDVI": ann_ndvi, "NDVI_UNDIST": ann_ndvi_buffer,"Date": clipped_xds.time.values[0]}
+    else:
+        return {"ID": ann["id"], "NDVI": None, "NDVI_UNDIST": None,"Date": None}
+
+def process_image_and_extract_ndvi(s2, s2_ann: gpd.GeoDataFrame):
+    if s2.path.exists():
+        xds = s2.load_data()
+        if "NDVI" not in xds:
+            xds = s2.calculate_ndvi()
+        # For each image dataset, extract NDVI values for all annotations
+        ndvi_results = [extract_ndvi_values(ann, xds) for _, ann in s2_ann.iterrows()]
+        return ndvi_results
+    return []
+
+# @dask.delayed
+# def find_ndvi_windows(ann, xds, ann_gdf_crs, window_size: int = 5):
+#     ann_ndvi_df = extract_ndvi_values(ann, xds, ann_gdf_crs)
+#     ann_ndvi_df['CDNDVI'] = calculate_cdndvi(ann_ndvi_df, window_size=window_size)
+#     change_points_dates = detect_change_points(cdndvi=ann_ndvi_df['CDNDVI'], penalty_value=1)
+#     # for change_point in change_points_dates:
+#     #     start_date = change_point - pd.DateOffset(months=3)
+#     #     end_date = change_point + pd.DateOffset(months=3)
+#     #     windowed_data = ann_ndvi_df.loc[start_date:end_date]
+#     #     windowed_data['Despiked_NDVI'] = despike_timeseries(windowed_data['NDVI'], window_size=window_size, z_threshold=2)
+#     return change_points_dates
+
+def create_differential_buffer(geometry, large_buffer_size=200, small_buffer_size=10):
+    large_buffer = geometry.buffer(large_buffer_size)
+    small_buffer = geometry.buffer(small_buffer_size)
+    differential_buffer = large_buffer.difference(small_buffer)
+    return differential_buffer
 
 def classify_patch(i: int, j: int, xds: xr.Dataset, patch_x_end: int, patch_y_end: int) -> Tuple[str, Tuple[int, int]]:
     patch = xds.isel(x=slice(i, patch_x_end), y=slice(j, patch_y_end))
@@ -143,7 +344,7 @@ def process_patch_chunk(patch_idxs_chunk:List[Tuple], xds:xr.Dataset, xds_transf
         tasks.append(delayed_obj)
     return tasks
 
-def resample_band(band_path, target_resolution=10):
+def resample_band(band_path, target_resolution=10, save=True):
     with rioxarray.open_rasterio(band_path, chunks='auto') as raster:
         current_resolution = raster.rio.resolution()
         if current_resolution != (target_resolution, target_resolution):
@@ -152,8 +353,11 @@ def resample_band(band_path, target_resolution=10):
             resampled_raster = raster.rio.reproject(
                 raster.rio.crs,
                 shape=new_shape,
-                resampling=Resampling.bilinear
-            )
+                resampling=Resampling.bilinear)
+    if save:
+        resampled_raster.rio.to_raster(band_path, driver='GTiff')
+        return band_path
+    else:
         return resampled_raster
 
 def extract_S2_band_name(file_name):
@@ -202,8 +406,6 @@ def setup_dask_client(slurm_config):
             f"--output={slurm_config['output_file']}"
         ],
     )
-
-    import pdb; pdb.set_trace()
         
     # Scale the cluster to the desired number of workers - CAREFUL: based on the settings (CPUs + RAM) it can use multiple nodes 
     cluster.scale(jobs=slurm_config['jobs']) # # Request 1 worker 
@@ -235,33 +437,33 @@ def normalize(array):
     array_min, array_max = array.min(), array.max()
     return ((array - array_min) / (array_max - array_min))
 
-def S2_xds_preprocess(ds):
-    # Extract the date from the file path and set as a time coordinate
-    date_str = Path(ds.encoding['source']).parent.stem
-    date_np = np.datetime64(pd.to_datetime(date_str)).astype('datetime64[ns]')
-    ds = ds.expand_dims(time=[date_np])
+# def S2_xds_preprocess(ds):
+#     # Extract the date from the file path and set as a time coordinate
+#     date_str = Path(ds.encoding['source']).parent.stem
+#     date_np = np.datetime64(pd.to_datetime(date_str)).astype('datetime64[ns]')
+#     ds = ds.expand_dims(time=[date_np])
 
-    band_names = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"]
-    for i, band_name in enumerate(band_names):
-        ds[band_name] = ds['band_data'].isel(band=i)
+#     band_names = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"]
+#     for i, band_name in enumerate(band_names):
+#         ds[band_name] = ds['band_data'].isel(band=i)
     
-    # Drop the original multi-band data variable if it is no longer needed
-    ds = ds.drop_vars('band_data')
+#     # Drop the original multi-band data variable if it is no longer needed
+#     ds = ds.drop_vars('band_data')
 
-    return ds
+#     return ds
 
-def S1_xds_preprocess(ds):
-    # Extract the date from the file path and set as a time coordinate
-    date_str = Path(ds.encoding['source']).parent.stem
-    date_np = np.datetime64(pd.to_datetime(date_str)).astype('datetime64[ns]')
-    ds = ds.expand_dims(time=[date_np])
+# def S1_xds_preprocess(ds):
+#     # Extract the date from the file path and set as a time coordinate
+#     date_str = Path(ds.encoding['source']).parent.stem
+#     date_np = np.datetime64(pd.to_datetime(date_str)).astype('datetime64[ns]')
+#     ds = ds.expand_dims(time=[date_np])
 
-    band_names = ["VH", "VV"]
-    for i, band_name in enumerate(band_names):
-        ds[band_name] = ds['band_data'].isel(band=i)
+#     band_names = ["VH", "VV"]
+#     for i, band_name in enumerate(band_names):
+#         ds[band_name] = ds['band_data'].isel(band=i)
     
-    ds = ds.drop_vars('band_data')
-    return ds
+#     ds = ds.drop_vars('band_data')
+#     return ds
 
 def extract_transform(xds):
     new_order_indices = [1, 2, 0, 4, 5, 3] 
