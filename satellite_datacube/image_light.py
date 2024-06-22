@@ -142,6 +142,7 @@ class Sentinel1():
         self.band_files = self._initialize_bands()
         self.name = self._initialize_name()
         self.date = self._initialize_date()
+        self.orbit_state = self._initialize_orbit_state()
         self.path = self.folder / f"{self.name}.tif"
 
     def _initialize_name(self):
@@ -162,6 +163,11 @@ class Sentinel1():
                 band_name = band_name.upper()
                 bands[band_name] = tif_file
         return bands
+    
+    def _initialize_orbit_state(self):
+        orbit_names = {"asc": "ascending", "dsc": "descending"}
+        orbit_info = Path(next(iter(self.band_files.values()))).stem.split("_")[-1]
+        return orbit_names[orbit_info]
 
     def stack_bands(self, resolution=10, reset=False):
         try:

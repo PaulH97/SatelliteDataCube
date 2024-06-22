@@ -5,7 +5,7 @@ from rasterio.features import geometry_mask
 import numpy as np
 from rasterio.mask import mask
 from shapely.geometry import MultiPolygon
-from satellite_datacube.utils_light import resample_band, calculate_lst
+from satellite_datacube.utils_light import resample_band, calculate_lst, linear_to_db
 from tqdm import tqdm
  
 class SatCubeAnnotation:
@@ -54,28 +54,31 @@ class SatCubeAnnotation:
     
     def calculate_lst_values(self, s1_t_prev, s1_t_curr):
             
-            anns_lst_data = {}
-                        
-            with rasterio.open(s1_t_prev.path) as s1_t_prev_src, rasterio.open(s1_t_curr.path) as s1_t_curr_src:
+        anns_lst_data = {}
+
+        with rasterio.open(s1_t_prev.path) as s1_t_prev_src, rasterio.open(s1_t_curr.path) as s1_t_curr_src:
+            
+            if self.gdf.crs != s1_t_prev_src.crs:
+                self.gdf = self.gdf.to_crs(s1_t_prev_src.crs)
+
+            for _, row in self.gdf.iterrows():
+
+                s1_t_prev_clip, _ = mask(s1_t_prev_src, [row.geometry.__geo_interface__], crop=True)
+                s1_t_curr_clip, _ = mask(s1_t_curr_src, [row.geometry.__geo_interface__], crop=True)
+
+                s1_t_prev_db = linear_to_db(s1_t_prev_clip) # converts nodata value from -9999 to np.nan
+                s1_t_curr_db = linear_to_db(s1_t_curr_clip)
+
+                vv_prev, vh_prev = s1_t_prev_db[0], s1_t_prev_db[1]
+                vv_curr, vh_curr = s1_t_curr_db[0], s1_t_curr_db[1]
                 
-                if self.gdf.crs != s1_t_prev_src.crs:
-                    self.gdf = self.gdf.to_crs(s1_t_prev_src.crs)
+                vv_lst = calculate_lst(vv_prev, vv_curr, nodata=np.nan)
+                vh_lst = calculate_lst(vh_prev, vh_curr, nodata=np.nan)
+                lst = vv_lst + vh_lst 
 
-                for _, row in tqdm(self.gdf.iterrows(), total=len(self.gdf), desc="Processing annotations"):
+                anns_lst_data[row["id"]] = {"LST_VV": vv_lst, "LST_VH": vh_lst, "LST": lst}
 
-                    s1_t_prev_clip, _ = mask(s1_t_prev_src, [row.geometry.__geo_interface__], crop=True)
-                    s1_t_curr_clip, _ = mask(s1_t_curr_src, [row.geometry.__geo_interface__], crop=True)
-
-                    vv_prev, vh_prev = s1_t_prev_clip[0], s1_t_prev_clip[1]
-                    vv_curr, vh_curr = s1_t_curr_clip[0], s1_t_curr_clip[1]
-                    
-                    vv_lst = calculate_lst(vv_prev, vv_curr, nodata=s1_t_prev_src.nodata)
-                    vh_lst = calculate_lst(vh_prev, vh_curr, nodata=s1_t_prev_src.nodata)
-                    lst = vv_lst + vh_lst 
-
-                    anns_lst_data[row["id"]] = {"VV_LST": vv_lst, "VH_LST": vh_lst, "LST": lst}
-    
-            return anns_lst_data
+        return anns_lst_data
 
     def calculate_ndvi_values(self, ndvi_path, scl_path, good_pixel_threshold=70):
 
@@ -89,7 +92,7 @@ class SatCubeAnnotation:
             if self.gdf.crs != scl_src.crs:
                 self.gdf = self.gdf.to_crs(scl_src.crs)
             
-            for _, row in tqdm(self.gdf.iterrows(), total=len(self.gdf), desc="Processing annotations"):
+            for _, row in self.gdf.iterrows():
             
                 annotation_ndvi_mean, annotation_ndvi_median, ann_pixel_count = self.calculate_annotation_ndvi(
                     clip_geom=row.geometry.__geo_interface__, 
@@ -101,12 +104,7 @@ class SatCubeAnnotation:
                 buffer_ndvi_mean, buffer_ndvi_median = self.calculate_annotation_buffer_ndvi(
                     row.geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count)
                                 
-                anns_ndvi_data[row["id"]] = {
-                    "NDVI_mean": annotation_ndvi_mean,
-                    "NDVI_median": annotation_ndvi_median,
-                    "NDVI_undist_mean": buffer_ndvi_mean,
-                    "NDVI_undist_mdian": buffer_ndvi_median
-                }
+                anns_ndvi_data[row["id"]] = {"NDVI": annotation_ndvi_mean, "NDVI_undist": buffer_ndvi_mean}
 
         return anns_ndvi_data
 

@@ -21,7 +21,25 @@ from memory_profiler import profile
 import dask.dataframe as dd
 import geopandas as gpd
 
-def calculate_lst(t_prev, t_curr, nodata=-9999):
+def linear_to_db(linear_array):
+    """
+    Convert linear scale Sentinel-1 data back to decibel (dB) scale.
+
+    Parameters:
+    linear_array (np.ndarray): The array of linear scale values.
+
+    Returns:
+    np.ndarray: The array of dB values.
+    """
+    # Ensure no log of zero
+    linear_array = np.where(linear_array <= 0, np.nan, linear_array)
+    
+    # Convert to dB
+    db_array = 10 * np.log10(linear_array)
+    
+    return db_array
+
+def calculate_lst(t_prev, t_curr, nodata):
     """
     Calculate the LST index for a given pair of time-step arrays, ignoring nodata values.
 
@@ -155,9 +173,8 @@ def find_significant_changes_v2(ann_ndvi_df, look_back=4, look_ahead=3, threshol
             if pd.notna(rolling_mean[i]) and pd.notna(rolling_std[i]):
                 if slopes[i] > rolling_mean[i] + threshold_multiplier * rolling_std[i]:
                     if all(slopes[i + j] > rolling_mean[i] for j in range(1, look_ahead + 1)):
-                        significant_points.append(ndvi_df.index[i])
-        # Optionally, handle edge cases more gracefully
-
+                        significant_points.append(ann_ndvi_df.index[i])
+                        
     return significant_points
 
 def detect_change_points(cdndvi, penalty_value):
