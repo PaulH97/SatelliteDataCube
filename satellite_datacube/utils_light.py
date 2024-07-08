@@ -6,7 +6,7 @@ import pandas as pd
 from affine import Affine
 import numpy as np 
 import xarray as xr
-import rioxarray
+import rioxarray as rxr
 from dask.distributed import Client
 from typing import Tuple, List
 from dask_jobqueue import SLURMCluster
@@ -20,6 +20,34 @@ from matplotlib import pyplot as plt
 from memory_profiler import profile
 import dask.dataframe as dd
 import geopandas as gpd
+
+
+# Function to load a single file with rioxarray
+def load_file(file):
+    data = rxr.open_rasterio(file, chunks="auto")
+
+    time = data.attrs['time']
+    data_arrays = []
+
+    for i, long_name in enumerate(data.attrs['long_name']):
+        band_data = data.sel(band=i+1)
+        band_data = band_data.squeeze(drop=True).drop_vars("band")
+        band_data = band_data.expand_dims({'time': [time]})
+        
+        new_da = xr.DataArray(
+            band_data,coords={'time': [time],'y': band_data['y'],'x': band_data['x']},
+            dims=['time', 'y', 'x'],
+            name=long_name
+        )
+        data_arrays.append(new_da)
+    ds = xr.Dataset({da.name: da for da in data_arrays})
+    ds.attrs["spatial_ref"] = data.spatial_ref.copy()
+    return ds
+
+def calculate_mean_sar_data(vv_data, vh_data):
+    if np.isnan(vv_data).all() or np.isnan(vh_data).all():
+        return {"VV": np.nan, "VH": np.nan}
+    return {"VV": float(np.nanmean(vv_data)), "VH": float(np.nanmean(vh_data))}
 
 def linear_to_db(linear_array):
     """
@@ -38,37 +66,6 @@ def linear_to_db(linear_array):
     db_array = 10 * np.log10(linear_array)
     
     return db_array
-
-def calculate_lst(t_prev, t_curr, nodata):
-    """
-    Calculate the LST index for a given pair of time-step arrays, ignoring nodata values.
-
-    Parameters:
-    t_prev (np.ndarray): The array of backscatter values at the previous time step.
-    t_curr (np.ndarray): The array of backscatter values at the current time step.
-    nodata (float): The value representing nodata in the arrays.
-
-    Returns:
-    float: The calculated LST index.
-    """
-    # Mask nodata values
-    mask = (t_prev == nodata) | (t_curr == nodata)
-    t_prev = np.ma.masked_array(t_prev, mask)
-    t_curr = np.ma.masked_array(t_curr, mask)
-
-    # Calculate the squared differences, ignoring masked values
-    diff_squared = (t_curr - t_prev) ** 2
-
-    # Sum the squared differences, ignoring masked values
-    sum_diff_squared = np.sum(diff_squared)
-
-    # Count the number of valid (non-masked) pixels
-    n = np.count_nonzero(~np.ma.getmaskarray(diff_squared))
-
-    # Calculate the LST index
-    lst_index = sum_diff_squared / n if n > 0 else np.nan
-
-    return lst_index
 
 def extract_metadata(raster_path): 
     with rioxarray.open_rasterio(raster_path) as raster:
@@ -299,7 +296,6 @@ def classify_patch(i: int, j: int, xds: xr.Dataset, patch_x_end: int, patch_y_en
     else:
         return "No-Annotation", (i, j)
 
-@dask.delayed
 def set_nan_value(xds, fill_value=-9999):
     # this is not filling the nan - sets a metadata attribute that can be used by downstream tools 
     # to interpret the missing values correctly 
@@ -322,19 +318,22 @@ def pad_patch(patch, patch_size):
     return patch
 
 @dask.delayed
-def update_patch_spatial_ref(patch, i, j, patch_size, original_transform, original_spatial_ref):
+def update_patch_spatial_ref(patch, i, j, patch_size, xds):
+    original_transform = extract_transform(xds)
     x_offset = i * patch_size * original_transform.a
     y_offset = j * patch_size * original_transform.e  # Negative if north-up
     new_transform = Affine(original_transform.a, original_transform.b, original_transform.c + x_offset,
                         original_transform.d, original_transform.e, original_transform.f + y_offset)
-    patch = patch.assign_coords({'spatial_ref': original_spatial_ref})
-    patch.spatial_ref.attrs['GeoTransform'] = list(new_transform)
+    patch.attrs['GeoTransform'] = list(new_transform)
+    patch.rio.write_crs(xds.rio.crs, inplace=True)
     return patch
 
 def process_patch(patch_idx:List[Tuple], xds:xr.Dataset, patch_size:int, patch_folder:Path) -> Path:
     i, j = patch_idx
     patch = xds.isel(x=slice(i, min(i + patch_size, xds.x.size)),y=slice(j, min(j + patch_size, xds.y.size)))
-    patch = pad_patch(patch, patch_size)
+    # pad patch with .rio.pad_box
+        
+    patch = pad_patch(patch, patch_size) 
     xds_spatial_ref = xds.spatial_ref.copy()
     xds_transform = extract_transform(xds)
     patch = update_patch_spatial_ref(patch, i, j, patch_size, xds_transform, xds_spatial_ref)
@@ -361,22 +360,16 @@ def process_patch_chunk(patch_idxs_chunk:List[Tuple], xds:xr.Dataset, xds_transf
         tasks.append(delayed_obj)
     return tasks
 
-def resample_band(band_path, target_resolution=10, save=True):
-    with rioxarray.open_rasterio(band_path, chunks='auto') as raster:
-        current_resolution = raster.rio.resolution()
-        if current_resolution != (target_resolution, target_resolution):
-            scale_factor = current_resolution[0] / target_resolution
-            new_shape = (int(raster.rio.shape[0] * scale_factor), int(raster.rio.shape[1] * scale_factor))
-            resampled_raster = raster.rio.reproject(
-                raster.rio.crs,
-                shape=new_shape,
-                resampling=Resampling.bilinear)
-    if save:
-        resampled_raster.rio.to_raster(band_path, driver='GTiff')
-        return band_path
-    else:
+def resample_raster(raster, target_resolution=10):
+    current_resolution = raster.rio.resolution()
+    if current_resolution != (target_resolution, target_resolution):
+        scale_factor = current_resolution[0] / target_resolution
+        new_shape = (int(raster.rio.shape[0] * scale_factor), int(raster.rio.shape[1] * scale_factor))
+        resampled_raster = raster.rio.reproject(raster.rio.crs, shape=new_shape, resampling=Resampling.bilinear)
         return resampled_raster
-
+    else:
+        return raster
+    
 def extract_S2_band_name(file_name):
     pattern = r"(B\d+[A-Z]?|SCL)\.tif"
     match = re.search(pattern, str(file_name))

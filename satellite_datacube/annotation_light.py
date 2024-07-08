@@ -5,8 +5,8 @@ from rasterio.features import geometry_mask
 import numpy as np
 from rasterio.mask import mask
 from shapely.geometry import MultiPolygon
-from satellite_datacube.utils_light import resample_band, calculate_lst, linear_to_db
-from tqdm import tqdm
+from satellite_datacube.utils_light import resample_raster, linear_to_db
+import rioxarray as rxr
  
 class SatCubeAnnotation:
     def __init__(self, inventory_dir):
@@ -61,6 +61,8 @@ class SatCubeAnnotation:
             if self.gdf.crs != s1_t_prev_src.crs:
                 self.gdf = self.gdf.to_crs(s1_t_prev_src.crs)
 
+            nodata = s1_t_prev_src.nodata
+
             for _, row in self.gdf.iterrows():
 
                 s1_t_prev_clip, _ = mask(s1_t_prev_src, [row.geometry.__geo_interface__], crop=True)
@@ -72,20 +74,45 @@ class SatCubeAnnotation:
                 vv_prev, vh_prev = s1_t_prev_db[0], s1_t_prev_db[1]
                 vv_curr, vh_curr = s1_t_curr_db[0], s1_t_curr_db[1]
                 
-                vv_lst = calculate_lst(vv_prev, vv_curr, nodata=np.nan)
-                vh_lst = calculate_lst(vh_prev, vh_curr, nodata=np.nan)
+                vv_lst = self.calculate_lst(vv_prev, vv_curr)
+                vh_lst = self.calculate_lst(vh_prev, vh_curr)
                 lst = vv_lst + vh_lst 
 
                 anns_lst_data[row["id"]] = {"LST_VV": vv_lst, "LST_VH": vh_lst, "LST": lst}
 
         return anns_lst_data
+    
+    @staticmethod
+    def calculate_lst(t_prev, t_curr):
+        """
+        Calculate the LST index for a given pair of time-step arrays, ignoring nodata values.
+
+        Parameters:
+        t_prev (np.ndarray): The array of backscatter values at the previous time step.
+        t_curr (np.ndarray): The array of backscatter values at the current time step.
+        nodata (float): The value representing nodata in the arrays.
+
+        Returns:
+        float: The calculated LST index.
+        """
+        masked_t_curr = np.ma.masked_array(t_curr, np.isnan(t_curr))
+        masked_t_prev = np.ma.masked_array(t_prev, np.isnan(t_prev))
+
+        diff_squared = (masked_t_curr - masked_t_prev) ** 2
+        sum_diff_squared = np.sum(diff_squared)
+        n = np.ma.count(diff_squared)
+
+        lst_index = sum_diff_squared / n if n > 0 else np.nan
+        return lst_index
 
     def calculate_ndvi_values(self, ndvi_path, scl_path, good_pixel_threshold=70):
 
         anns_ndvi_data = {}
         annotation_zones = self.preprocess_annotation_zones(buffer_distance=20)
 
-        scl_path = resample_band(scl_path, save=True)
+        with rxr.open_rasterio(scl_path) as scl_src:
+            scl_resampled = resample_raster(scl_path)
+            scl_resampled.rio.to_raster(scl_path)
 
         with rasterio.open(scl_path) as scl_src, rasterio.open(ndvi_path) as ndvi_src:
             

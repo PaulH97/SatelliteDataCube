@@ -1,11 +1,12 @@
 from pathlib import Path
 from datetime import datetime
-from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_band, extract_band_number, extract_metadata, normalize, build_xr_dataset
+from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_raster, extract_band_number, extract_metadata, normalize, build_xr_dataset
 import xarray as xr
 import rioxarray as rxr
 import numpy as np
 from matplotlib import pyplot as plt
 import dask
+import rasterio
 
 class Sentinel2():
     def __init__(self, folder):
@@ -13,7 +14,7 @@ class Sentinel2():
         self.band_files = self._initialize_bands()
         self.name = self._initialize_name()
         self.date = self._initialize_date()
-        self.path = self.folder / f"{self.name}.nc"
+        self.path = self.folder / f"{self.name}.tif"
         
     def _initialize_name(self):
         filepath = next(iter(self.band_files.values()))
@@ -38,28 +39,31 @@ class Sentinel2():
     def reset(self):
         if self.path.exists():
             self.path.unlink()
-            print(f"Removed existing file: {self.path}")
 
     def resample_bands(self, resolution):
         band_names = []
-        tasks = []
+        resampled_bands = []
         for band_name, band_path in self.band_files.items():
             band_names.append(band_name)
-            tasks.append(dask.delayed(resample_band)(band_path, resolution))
-
-        resampled_bands = dask.compute(*tasks)
+            with rxr.open_rasterio(band_path) as raster:
+                resampled_raster = resample_raster(raster, resolution)
+            resampled_bands.append(resampled_raster)
         return band_names, resampled_bands
 
     def create_dataset(self, band_names, resampled_bands):
         image = xr.concat(resampled_bands, dim='band')
         image = image.assign_coords(band=band_names)
         ds = image.to_dataset(name='band_data')
-        date_np = np.datetime64(self.date).astype('datetime64[ns]')
-        ds = ds.expand_dims(time=[date_np])
+
+        data_vars = {}
         for i, band_name in enumerate(band_names):
-            ds[band_name] = ds['band_data'].isel(band=i).astype(np.int16) # still need to fix the data type
-        ds = ds.drop_vars('band_data')
-        ds = ds.drop_vars('band')
+            band_data = ds['band_data'].isel(band=i).astype(np.int16)
+            band_data = band_data.squeeze(drop=True).drop('band')
+            data_vars[band_name] = band_data
+
+        ds = xr.Dataset(data_vars)
+        ds.attrs['time'] = str(np.datetime64(self.date).astype('datetime64[ns]'))
+
         return ds
 
     def stack_bands(self, resolution=10, reset=False):
@@ -70,8 +74,7 @@ class Sentinel2():
             if not self.path.exists():
                 band_names, resampled_bands = self.resample_bands(resolution)
                 ds = self.create_dataset(band_names, resampled_bands)
-                ds.to_netcdf(self.path, compute=True)
-                print(f"Stacked bands successfully and saved under: {self.path}")
+                ds.rio.to_raster(self.path)
             else:
                 print(f"File already exists: {self.path}")
         except Exception as e:
@@ -79,12 +82,16 @@ class Sentinel2():
             raise
 
     def load_data(self):
-        return xr.open_dataset(self.path)
-    
+        if self.path.exists():
+            with rxr.open_rasterio(self.path) as src:
+                return src
+        else:
+            return None
+            
     def get_metadata(self):
         if self.path.exists():
-            image = self.load_data()
-            meta = image["spatial_ref"].attrs
+            with rasterio.open(self.path) as src:
+                meta = src.meta
             return meta
         else:
             return None
@@ -176,43 +183,53 @@ class Sentinel1():
                 print(f"Removed existing file: {self.path}")
 
             if not self.path.exists():
-                # Use Dask to parallelize the processing of each band
-                band_names = []
-                tasks = []
-                for band_name, band_path in self.band_files.items():
-                    band_names.append(band_name)
-                    tasks.append(dask.delayed(resample_band)(band_path, resolution)) 
+                if len(self.band_files.values()) > 1:
+                    band_names = []
+                    resampled_bands = []
+                    for band_name, band_path in self.band_files.items():
+                        with rxr.open_rasterio(band_path) as raster:
+                            if raster.rio.resolution() != (resolution, resolution):
+                                raster = resample_raster(raster, resolution)
+                            resampled_bands.append(raster)
+                            band_names.append(band_name)
 
-                resampled_bands = dask.compute(*tasks)
+                    stacked_raster = xr.concat(resampled_bands, dim='band')
+                    stacked_raster = stacked_raster.assign_coords(band=band_names)
 
-                # Stack the rasters using Dask
-                stacked_raster = xr.concat(resampled_bands, dim='band')
-                stacked_raster = stacked_raster.assign_coords(band=band_names)
+                    ds = stacked_raster.to_dataset(name='band_data')
+                    ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
+                    
+                    for i, band_name in enumerate(self.band_files.keys()):
+                        ds[band_name] = ds['band_data'].isel(band=i)
 
-                ds = stacked_raster.to_dataset(name='band_data')
-                date_np = np.datetime64(self.date).astype('datetime64[ns]')
-                ds = ds.expand_dims(time=[date_np])
-                band_names = self.band_files.keys() # ["VV", "VH"]                    
-                for i, band_name in enumerate(band_names):
-                    ds[band_name] = ds['band_data'].isel(band=i).drop_vars('band')
-                ds = ds.drop_vars('band_data')
-                ds.to_netcdf(self.path, compute=True)
-                print(f"Stacked bands successfully and saved under: {self.path}")
+                    ds = ds.drop_vars('band')
+                    ds = ds.drop_vars('band_data')
+                    ds.rio.to_raster(self.path) #ds.to_netcdf(self.path, compute=True)
+                    print(f"Stacked bands successfully and saved as GeoTIFF under: {self.path}")
+                else:
+                    print(f"Only one band available. No need to stack. Renaming the file to {self.name}.tif")
+                    for band_name, band_path in self.band_files.items():
+                        band_path.rename(self.path)
             else:
                 print(f"File already exists: {self.path}")
-
             return self
+        
         except Exception as e:
             print(f"An error occurred: {e}")
             raise
 
     def load_data(self):
-        return xr.open_dataset(self.path)
+        if self.path.exists():
+            with rasterio.open(self.path) as src:
+                image = src.read()
+            return image
+        else:
+            return None
             
     def get_metadata(self):
         if self.path.exists():
-            image = self.load_data()
-            meta = image["spatial_ref"].attrs
+            with rasterio.open(self.path) as src:
+                meta = src.meta
             return meta
         else:
             return None
