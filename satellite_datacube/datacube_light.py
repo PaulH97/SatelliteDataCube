@@ -1,29 +1,27 @@
 from satellite_datacube.image_light import Sentinel1, Sentinel2
-from satellite_datacube.utils_light import process_patch, extract_ndvi_values, load_file
-from satellite_datacube.utils_light import extract_transform, update_patch_spatial_ref, set_nan_value
+from satellite_datacube.utils_light import process_patch, load_file, create_patch
+from satellite_datacube.utils_light import extract_transform
 from pathlib import Path
 import xarray as xr
-import rioxarray as rxr
 import rasterio 
-import dask
 import shutil
 import random
-import geopandas as gpd
 from typing import List, Dict, Tuple
 from tqdm import tqdm
-from dask.diagnostics import ProgressBar
-from dask import delayed
-import h5py
+import numpy as np
+
+np.seterr(divide='ignore', invalid='ignore')
 
 class Sentinel2DataCube():
-    def __init__(self, base_folder, load=True):
+    def __init__(self, base_folder, load=True, print=True):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-2"
         self.si_folder = self.base_folder / self.satellite
         self.images = self._init_images()
         if load:
             self.data = self._load_data()
-        self._print_initialization_info()
+        if print:
+            self._print_initialization_info()
 
     def _print_initialization_info(self):
         divider = "-" * 20
@@ -41,9 +39,10 @@ class Sentinel2DataCube():
 
     def _init_images(self):
         images = []
-        for satellite_image_folder in self.si_folder.iterdir():
-            if satellite_image_folder.is_dir():
-                image_instance = Sentinel2(folder=satellite_image_folder)
+        images_folder = self.si_folder / "images"
+        for folder in images_folder.iterdir():
+            if folder.is_dir() and "patches" not in folder.stem:
+                image_instance = Sentinel2(folder=folder)
                 images.append(image_instance)
         images.sort(key=lambda image: image.date)
         return images
@@ -69,40 +68,6 @@ class Sentinel2DataCube():
         mask_da = xr.DataArray(mask, dims=("y", "x"), coords={"y": self.data.y.values,"x": self.data.x.values})
         self.data["MASK"] = mask_da
         return self
-
-    def calculate_ndvi(self):
-        nir = self.data['B08']
-        red = self.data['B04']
-        ndvi = (nir - red) / (nir + red)
-        self.data['NDVI'] = ndvi
-        self.data['NDVI'] = self.data['NDVI'].fillna(0)
-        
-        return self
-
-    def apply_landslide_dating(self, ann_gdf: gpd.GeoDataFrame) -> List[Dict[str, List[float]]]:
-
-        if "NDVI" not in self.data:
-            self.calculate_ndvi()
-
-        if ann_gdf.crs != self.data.rio.crs:
-            ann_gdf = ann_gdf.to_crs(self.data.rio.crs)
-
-        from dask.distributed import Client
-        client = Client()
-        print(client.dashboard_link)
-
-        tasks = []
-        for idx, ann in ann_gdf[:2].iterrows():
-            print(f"Processing {ann['id']}...")
-            delayed_obj = extract_ndvi_values(ann, self.data)
-            tasks.append(delayed_obj)
-        
-        import pdb; pdb.set_trace()
-
-        with ProgressBar():
-            results = dask.compute(tasks[0])
-        
-        return results
 
     def select_patches_based_on_ann(self, patch_size, overlap, ratio=0.3, seed=42) -> Dict[str, List[Tuple[int, int]]]:
         # Check if MASK is a data variable
@@ -141,69 +106,32 @@ class Sentinel2DataCube():
 
         return patches_idx_by_ann
 
-    # def create_patches(self, patch_size, patch_indices, reset=False):
-    #     patch_folder = Path(self.base_folder) / "patches" / self.satellite
-    #     if reset and patch_folder.exists():
-    #         shutil.rmtree(patch_folder)
-        
-    #     if not patch_folder.exists():
-    #         S2_xds = self.data
-    #         patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
-
-    #         for patch_idx in patch_indices:
-    #             patch_filename = process_patch(patch_idx, S2_xds, patch_size, patch_folder)
-    #             print("Patch saved to:", patch_filename)
-    #     else:
-    #         print("Patches already exist in the folder:", patch_folder)
-    
-    def write_patch_hdf5(self, filename, patch):
-        with h5py.File(filename, 'w') as f:
-            
-            for dim in patch.dims:
-                f.create_dataset(dim, data=patch[dim].values)
-            
-            for coord in patch.coords:
-                f.create_dataset(coord, data=patch[coord].values)
-            
-            for var in patch.data_vars:
-                dset = f.create_dataset(var, data=patch[var].values, compression="gzip", compression_opts=9)
-                for attr_name, attr_value in patch[var].attrs.items():
-                    dset.attrs[attr_name] = attr_value
-            
-            f.attrs['transform'] = patch.rio.transform()
-            f.attrs['crs'] = patch.rio.crs
-
-    def create_patches(self, patch_size:int, patch_indices:dict, reset=False) -> List[str]:
-        
+    def create_patches(self, patch_size, patch_indices, reset=False):
         patch_folder = Path(self.base_folder) / "patches" / self.satellite
         if reset and patch_folder.exists():
             shutil.rmtree(patch_folder)
-            patch_folder.mkdir(parents=True, exist_ok=True)
         
-        patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
-        tasks = []
-        for patch_idx in patch_indices:
-            i, j = patch_idx
-            filename = Path(patch_folder, f"patch_{i}_{j}.nc")
-            if not filename.exists():
-                patch = self.data.isel(x=slice(i, min(i + patch_size, self.data.x.size)), y=slice(j, min(j + patch_size, self.data.y.size)))
-                delayed_obj = patch.to_netcdf(filename, format="NETCDF4", engine="netcdf4", compute=False)
-                tasks.append(delayed_obj)  
-        
-        if tasks:
-            print("Saving patches")
-            with ProgressBar():
-                dask.compute(*tasks)
+        if not patch_folder.exists():
+            S2_xds = self.data
+            patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
 
+            for patch_idx in patch_indices:
+                patch_filename = process_patch(patch_idx, S2_xds, patch_size, patch_folder)
+                print("Patch saved to:", patch_filename)
+        else:
+            print("Patches already exist in the folder:", patch_folder)
+    
 class Sentinel1DataCube():
-    def __init__(self, base_folder, load=True):
+    def __init__(self, base_folder, orbit, load=True, print=True):
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-1"
-        self.si_folder = self.base_folder / self.satellite
+        self.orbit = orbit
+        self.si_folder = self.base_folder / self.satellite / self.orbit 
         self.images = self._init_images()
         if load:
             self.data = self._load_data()
-        self._print_initialization_info()
+        if print:
+            self._print_initialization_info()
 
     def _print_initialization_info(self):
         try:
@@ -223,20 +151,27 @@ class Sentinel1DataCube():
 
     def _init_images(self):
         images = []
-        for satellite_image_folder in self.si_folder.iterdir():
-            if satellite_image_folder.is_dir():
-                image_instance = Sentinel1(folder=satellite_image_folder)
-                images.append(image_instance)
+        images_folder = self.si_folder / "images"
+        for folder in images_folder.iterdir():
+            if folder.is_dir() and "patches" not in folder.stem:
+                image = Sentinel1(folder=folder)
+                if image.orbit_state == self.orbit:
+                    images.append(image)
         images.sort(key=lambda image: image.date)
         return images
     
     def _load_data(self):
         s1_files = [s1.path for s1 in self.images if s1.path.exists()]
-
-        lazy_datasets = [delayed(load_file)(file) for file in s1_files]
-        datasets = dask.compute(*lazy_datasets)
-
+        datasets = [load_file(file) for file in s1_files]
         self.data = xr.concat(datasets, dim='time')
+                
+        crs = self.data.attrs["spatial_ref"].crs_wkt
+        transform = extract_transform(self.data)
+
+        self.data.rio.write_crs(crs, inplace=True)
+        self.data.rio.write_transform(transform, inplace=True)
+
+        self.data.attrs.pop("spatial_ref", None)
 
         return self.data
 
@@ -299,41 +234,3 @@ class Sentinel1DataCube():
         else:
             print("Patches already exist in the folder:", patch_folder)
     
-    def create_patches_fast(self, patch_size:int, patch_indices:dict, chunk_size:int, reset=False) -> List[str]:
-        patch_folder = Path(self.base_folder) / "patches" / self.satellite
-        if reset and patch_folder.exists():
-            shutil.rmtree(patch_folder)
-        
-        patch_indices = patch_indices["Annotation"] + patch_indices["No-Annotation"]
-
-        S1_xds = self.data
-        S1_xds_transform = extract_transform(S1_xds)
-        S1_xds_spatial_ref = S1_xds.spatial_ref.copy()
-        S1_xds_x, S1_xds_y = S1_xds.x.size, S1_xds.y.size
-
-        total_patches = len(patch_indices)
-        for start in range(0, total_patches, chunk_size):
-            print(f"Processing chunk {start} to {min(start + chunk_size, total_patches)}")
-            end = min(start + chunk_size, total_patches)
-            chunk = patch_indices[start:end]
-            
-            tasks = []
-            for patch_idx in tqdm(chunk, desc="Create patches of chunk"):
-                i, j = patch_idx
-                filename = Path(patch_folder, f"patch_{i}_{j}.nc")
-                if not filename.exists():
-                    filename.parent.mkdir(parents=True, exist_ok=True)
-                    # min() makes sure that the available index range of the dataset is not exceeded
-                    patch = S1_xds.isel(x=slice(i, min(i + patch_size, S1_xds_x)), y=slice(j, min(j + patch_size, S1_xds_y)))
-                    if patch.x.size < patch_size or patch.y.size < patch_size:
-                        # patch = pad_patch(patch, patch_size) # Fix issues later
-                        continue
-                    patch = update_patch_spatial_ref(patch, i, j, patch_size, S1_xds_transform, S1_xds_spatial_ref)
-                    patch = set_nan_value(patch, fill_value=-9999)  
-                    
-                    delayed_obj = patch.to_netcdf(filename, format="NETCDF4", engine="netcdf4", compute=False)
-                    tasks.append(delayed_obj)
-            if tasks:
-                print("Saving patches")
-                with ProgressBar():
-                    dask.compute(*tasks)

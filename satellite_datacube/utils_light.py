@@ -14,13 +14,145 @@ import dask
 from contextlib import contextmanager
 import signal
 from xarray.core.dataarray import DataArray
-from dask import delayed
 import ruptures as rpt
 from matplotlib import pyplot as plt
-from memory_profiler import profile
-import dask.dataframe as dd
+import rasterio
 import geopandas as gpd
+from datetime import datetime
+from sklearn.cluster import DBSCAN
 
+def extract_rasterio_metadata_from_zarr(zarr_file_path):
+    # Open the .zarr file using xarray
+    ds = xr.open_zarr(zarr_file_path)
+    
+    # Extract metadata
+    meta = {
+        'driver': 'ZARR',
+        'dtype': ds.dtype,
+        'nodata': ds.attrs.get('_FillValue', None),
+        'width': ds.dims['x'],
+        'height': ds.dims['y'],
+        'count': len(ds.data_vars),  # Count the number of data arrays
+        'crs': ds.attrs.get('crs', None),
+        'transform': ds.attrs.get('transform', None),
+        'compress': ds.encoding.get('compressor', None)
+    }
+    
+    # Handle transform if stored as a list
+    if isinstance(meta['transform'], list):
+        meta['transform'] = tuple(meta['transform'])
+    
+    return meta
+
+def identify_best_date_weighted(dates_with_confidences):
+
+    dates = [datetime.strptime(date, "%Y-%m-%d") for date, _ in dates_with_confidences]
+    confidences = [conf for _, conf in dates_with_confidences]
+
+    date_ordinals = np.array([date.toordinal() for date in dates]).reshape(-1, 1)
+    dbscan = DBSCAN(eps=40, min_samples=1)
+    clusters = dbscan.fit_predict(date_ordinals)
+
+    # Determine the most promising cluster using weighted counts
+    unique_clusters = np.unique(clusters)
+    cluster_weights = {cluster: 0 for cluster in unique_clusters}
+    for idx, cluster in enumerate(clusters):
+        cluster_weights[cluster] += confidences[idx]
+
+    most_promising_cluster = max(cluster_weights, key=cluster_weights.get)
+    cluster_dates = [dates[i] for i in range(len(dates)) if clusters[i] == most_promising_cluster]
+
+    # Calculate the weighted center of the cluster
+    weighted_central_date = sum([date.toordinal() * conf for date, conf in zip(cluster_dates, [confidences[i] for i in range(len(dates)) if clusters[i] == most_promising_cluster])]) / sum([confidences[i] for i in range(len(dates)) if clusters[i] == most_promising_cluster])
+    return datetime.fromordinal(int(weighted_central_date))
+
+def get_ann_in_window(ann_gdf, date_dict, window_bounds, crs):
+
+    window_polygon = gpd.GeoSeries.box(*window_bounds, ccw=True)
+    window_gdf = gpd.GeoDataFrame(geometry=[window_polygon], crs=crs)
+    intersecting_anns = gpd.sjoin(ann_gdf, window_gdf, how="inner", op='intersects')
+
+    # For each intersecting annotation, extract the dates
+    anns = []
+    for idx, row in intersecting_anns.iterrows():
+        ann_id = row['id']
+        if ann_id in date_dict.keys():
+            dates_with_scores = date_dict[ann_id]
+            best_date = identify_best_date_weighted(dates_with_scores)
+        else:
+            print(f"ID: {ann_id} has no associated dates in date_dict.")
+
+
+    window_polygon = gpd.GeoSeries.box(*window_bounds, ccw=True)
+    window_gdf = gpd.GeoDataFrame(geometry=[window_polygon], crs=crs)
+
+    # Find intersections with annotations
+    intersecting_annotations = gpd.sjoin(annotations_gdf, window_gdf, how="inner", op='intersects')
+
+    return annotation.geometry.within(window)
+
+
+def create_xr_dataset(patches, timesteps, transform, crs, band_names):
+
+    time_coords = np.array(timesteps, dtype='datetime64[ns]')
+    patch = np.stack(patches, axis=0) if len(patches) > 1 else np.expand_dims(patches[0], axis=0)
+
+    nx, ny = patch.shape[3], patch.shape[2]
+    x_coords = np.arange(nx) * transform.a + transform.c
+    y_coords = np.arange(ny) * transform.e + transform.f
+
+    data_vars = {}
+    for i, band_name in enumerate(band_names):
+        data_vars[band_name] = (("time", "y", "x"), patch[:, i, :, :])
+    
+    coords = {"time": time_coords,"y": y_coords,"x": x_coords}
+
+    ds = xr.Dataset(data_vars, coords)
+    ds = ds.rio.write_crs(crs)
+    ds = ds.rio.write_transform(transform)
+    return ds
+
+def pad_patch(patch, window):
+    pad_x = window.width - patch.shape[1]
+    pad_y = window.height - patch.shape[2]
+    padded_patch = np.pad(patch, ((0, 0), (0, pad_x), (0, pad_y)), mode='constant', constant_values=0)
+    return padded_patch
+
+def create_patch(images, window, output_file):
+    if not output_file.exists():
+        
+        patches = []
+        timesteps = []
+        transform, crs = None, None
+        band_names = []
+
+        for image in images:
+            with rasterio.open(image.path) as src:
+                patch = src.read(window=window, boundless=True, fill_value=0)
+                if (patch.shape[1] != window.width or patch.shape[2] != window.height):
+                    patch = pad_patch(patch, window)
+                if transform is None and crs is None:
+                    transform = src.window_transform(window)
+                    crs = src.crs
+                band_names.append(src.descriptions)
+                patches.append(patch)
+                timesteps.append(image.date)
+        
+        if all([band == band_names[0] for band in band_names]):
+            band_names = band_names[0]
+        else:
+            raise ValueError("Band names are not consistent across images.")
+
+        # Create mask file for window and save it in patch xarray datset 
+        
+
+        ds = create_xr_dataset(patches, timesteps, transform, crs, band_names)
+        ds.to_netcdf(output_file, format="NETCDF4", engine="h5netcdf")
+
+def extract_patch(file_path, window):
+    with rasterio.open(file_path) as src:
+        patch = src.read(window=window, boundless=True, fill_value=0)
+    return patch
 
 # Function to load a single file with rioxarray
 def load_file(file):
@@ -41,6 +173,8 @@ def load_file(file):
         )
         data_arrays.append(new_da)
     ds = xr.Dataset({da.name: da for da in data_arrays})
+    ds = ds.rio.write_crs(data.rio.crs)
+    ds = ds.rio.write_transform(data.rio.transform())
     ds.attrs["spatial_ref"] = data.spatial_ref.copy()
     return ds
 
@@ -304,7 +438,6 @@ def set_nan_value(xds, fill_value=-9999):
             xds[var_name].encoding['_FillValue'] = fill_value
     return xds
 
-@dask.delayed
 def pad_patch(patch, patch_size):
     pad_x = max(0, patch_size - patch.sizes['x'])
     pad_y = max(0, patch_size - patch.sizes['y'])
@@ -317,7 +450,6 @@ def pad_patch(patch, patch_size):
                 coords=patch[var].coords)
     return patch
 
-@dask.delayed
 def update_patch_spatial_ref(patch, i, j, patch_size, xds):
     original_transform = extract_transform(xds)
     x_offset = i * patch_size * original_transform.a
@@ -362,13 +494,10 @@ def process_patch_chunk(patch_idxs_chunk:List[Tuple], xds:xr.Dataset, xds_transf
 
 def resample_raster(raster, target_resolution=10):
     current_resolution = raster.rio.resolution()
-    if current_resolution != (target_resolution, target_resolution):
-        scale_factor = current_resolution[0] / target_resolution
-        new_shape = (int(raster.rio.shape[0] * scale_factor), int(raster.rio.shape[1] * scale_factor))
-        resampled_raster = raster.rio.reproject(raster.rio.crs, shape=new_shape, resampling=Resampling.bilinear)
-        return resampled_raster
-    else:
-        return raster
+    scale_factor = current_resolution[0] / target_resolution
+    new_shape = (int(raster.rio.shape[0] * scale_factor), int(raster.rio.shape[1] * scale_factor))
+    resampled_raster = raster.rio.reproject(raster.rio.crs, shape=new_shape, resampling=Resampling.bilinear, nodata=raster.rio.nodata)
+    return resampled_raster
     
 def extract_S2_band_name(file_name):
     pattern = r"(B\d+[A-Z]?|SCL)\.tif"
@@ -381,8 +510,12 @@ def extract_S1_band_name(file_name):
     return match.group(1) if match else None
 
 def extract_band_number(key):
-    order = {"SCL": 100}
-    return order.get(key, int(re.findall(r'\d+', key)[0]) if re.findall(r'\d+', key) else float('inf'))
+    order = {
+        "B01": 1, "B02": 2, "B03": 3, "B04": 4, "B05": 5,
+        "B06": 6, "B07": 7, "B08": 8, "B8A": 9, "B09": 10,
+        "B10": 11, "B11": 12, "B12": 13, "SCL": 100
+    }
+    return order.get(key, float('inf'))
 
 def available_workers(reduce_by=1):
     """Calculate the number of available workers for Dask."""
