@@ -41,7 +41,7 @@ class Sentinel2DataCube():
         images = []
         images_folder = self.si_folder / "images"
         for folder in images_folder.iterdir():
-            if folder.is_dir() and "patches" not in folder.stem:
+            if folder.is_dir():
                 image_instance = Sentinel2(folder=folder)
                 images.append(image_instance)
         images.sort(key=lambda image: image.date)
@@ -126,7 +126,7 @@ class Sentinel1DataCube():
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-1"
         self.orbit = orbit
-        self.si_folder = self.base_folder / self.satellite / self.orbit 
+        self.si_folder = self.base_folder / self.satellite / self.orbit
         self.images = self._init_images()
         if load:
             self.data = self._load_data()
@@ -153,10 +153,9 @@ class Sentinel1DataCube():
         images = []
         images_folder = self.si_folder / "images"
         for folder in images_folder.iterdir():
-            if folder.is_dir() and "patches" not in folder.stem:
+            if folder.is_dir():
                 image = Sentinel1(folder=folder)
-                if image.orbit_state == self.orbit:
-                    images.append(image)
+                images.append(image)
         images.sort(key=lambda image: image.date)
         return images
     

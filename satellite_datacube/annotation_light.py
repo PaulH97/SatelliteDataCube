@@ -130,7 +130,7 @@ class SatCubeAnnotation:
                 
                 buffer_ndvi_mean, buffer_ndvi_median = self.calculate_annotation_buffer_ndvi(
                     row.geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count)
-                                
+                                                
                 anns_ndvi_data[int(row["id"])] = {"NDVI": annotation_ndvi_mean, "NDVI_undist": buffer_ndvi_mean}
 
         return anns_ndvi_data
