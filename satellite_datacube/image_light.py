@@ -49,36 +49,32 @@ class Sentinel1():
             orbit_info = name_parts[-1]
         return orbit_names[orbit_info]
     
-    def stack_bands(self, resolution=10, reset=False):
+    def stack_bands(self, resolution=10):
         try:
-            if reset and self.path.exists():
-                self.path.unlink()
+            resampled_bands = []
+            for band_path in self.band_files.values():
+                with rxr.open_rasterio(band_path) as raster:
+                    if raster.rio.transform() is not None:
+                        if raster.rio.resolution() != (resolution, resolution):
+                            resampled_raster = resample_raster(raster, resolution)
+                        else:
+                            resampled_raster = raster  # No resampling needed
+                        resampled_bands.append(resampled_raster)
 
-            if not self.path.exists() and len(self.band_files) > 1:
-                resampled_bands = []
-                for band_path in self.band_files.values():
-                    with rxr.open_rasterio(band_path) as raster:
-                        if raster.rio.transform() is not None:
-                            if raster.rio.resolution() != (resolution, resolution):
-                                resampled_raster = resample_raster(raster, resolution)
-                            else:
-                                resampled_raster = raster  # No resampling needed
-                            resampled_bands.append(resampled_raster)
+            if not resampled_bands:
+                raise ValueError("No valid bands to stack. Exiting stacking process.")
 
-                if not resampled_bands:
-                    raise ValueError("No valid bands to stack. Exiting stacking process.")
+            ds = xr.concat(resampled_bands, dim='band').assign_coords(band=list(self.band_files.keys())).to_dataset(name='band_data')
+            ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
+            
+            for i, band_name in enumerate(self.band_files.keys()):
+                ds[band_name] = ds['band_data'].isel(band=i)
 
-                ds = xr.concat(resampled_bands, dim='band').assign_coords(band=list(self.band_files.keys())).to_dataset(name='band_data')
-                ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
-                
-                for i, band_name in enumerate(self.band_files.keys()):
-                    ds[band_name] = ds['band_data'].isel(band=i)
-
-                ds = ds.drop_vars('band')
-                ds = ds.drop_vars('band_data')
-                ds.rio.to_raster(self.path, compute=True) #ds.to_netcdf(self.path, compute=True)
-                ds.close()
-                gc.collect()
+            ds = ds.drop_vars('band')
+            ds = ds.drop_vars('band_data')
+            ds.rio.to_raster(self.path, compute=True) #ds.to_netcdf(self.path, compute=True)
+            ds.close()
+            gc.collect()
 
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -136,42 +132,39 @@ class Sentinel2():
                 bands[band_name] = tif_file
         sorted_keys = sorted(bands.keys(), key=extract_band_number)
         bands = {k: bands[k] for k in sorted_keys}
+        if "SCL" not in bands.keys():
+            print(f"SCL missing for: {self.folder}")
         return bands
 
-    def reset(self):
-        if self.path.exists():
-            self.path.unlink()
+    def stack_bands(self, resolution=10):
+        try:            
+            resampled_bands = []
+            for band_path in self.band_files.values():
+                with rxr.open_rasterio(band_path) as raster:
+                    if raster.rio.transform() is not None:
+                        if raster.rio.resolution() != (resolution, resolution):
+                            resampled_raster = resample_raster(raster, resolution)
+                        else:
+                            resampled_raster = raster  # No resampling needed
+                        resampled_bands.append(resampled_raster)
 
-    def stack_bands(self, resolution=10, reset=False):
-        try:
-            if reset and self.path.exists():
+            if not resampled_bands:
+                raise ValueError("No valid bands to stack. Exiting stacking process.")
+
+            ds = xr.concat(resampled_bands, dim='band').assign_coords(band=list(self.band_files.keys())).to_dataset(name='band_data').chunk({'x': 1000, 'y': 1000})
+            ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
+            
+            for i, band_name in enumerate(self.band_files.keys()):
+                ds[band_name] = ds['band_data'].isel(band=i)
+
+            ds = ds.drop_vars('band')
+            ds = ds.drop_vars('band_data')
+            ds = ds.persist() 
+            if self.path.exists():
                 self.path.unlink()
-
-            if not self.path.exists() and len(self.band_files) > 1:
-                resampled_bands = []
-                for band_path in self.band_files.values():
-                    with rxr.open_rasterio(band_path) as raster:
-                        if raster.rio.transform() is not None:
-                            if raster.rio.resolution() != (resolution, resolution):
-                                resampled_raster = resample_raster(raster, resolution)
-                            else:
-                                resampled_raster = raster  # No resampling needed
-                            resampled_bands.append(resampled_raster)
-
-                if not resampled_bands:
-                    raise ValueError("No valid bands to stack. Exiting stacking process.")
-
-                ds = xr.concat(resampled_bands, dim='band').assign_coords(band=list(self.band_files.keys())).to_dataset(name='band_data')
-                ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
-                
-                for i, band_name in enumerate(self.band_files.keys()):
-                    ds[band_name] = ds['band_data'].isel(band=i)
-
-                ds = ds.drop_vars('band')
-                ds = ds.drop_vars('band_data')
-                ds.rio.to_raster(self.path, compute=True) #ds.to_netcdf(self.path, compute=True)
-                ds.close()
-                gc.collect()
+            ds.rio.to_raster(self.path, compute=True) #ds.to_netcdf(self.path, compute=True)
+            ds.close()
+            gc.collect()
                 
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -194,11 +187,12 @@ class Sentinel2():
         if 'SCL' not in data:
             raise ValueError("SCL band is missing from the dataset. Cannot calculate bad pixel ratio.")
         scl_band = data['SCL'].values  
-        bad_pixels = np.isin(scl_band, [0, 1, 2, 3, 7, 8, 9, 10, 11])
+        bad_pixels = np.isin(scl_band, [0, 1, 2, 3, 8, 9, 10, 11])
         bad_pixel_ratio = np.sum(bad_pixels) / scl_band.size * 100
         return bad_pixel_ratio
     
-    def calculate_ndvi(self, save=False, reset=False): 
+    def calculate_ndvi(self, save=False): 
+
         if self.path.exists():
             image = self.load_data()
             nir = image.B08.values
@@ -219,9 +213,9 @@ class Sentinel2():
             
             if save:
                 ndvi_path = self.path.parent / f"{self.name}_NDVI.tif"
-                if reset and ndvi_path.exists():
+                if ndvi_path.exists():
                     ndvi_path.unlink()
-                image['NDVI'].rio.to_raster(ndvi_path, driver='GTiff')
+                image['NDVI'].rio.to_raster(ndvi_path)
                 self.band_files['NDVI'] = ndvi_path
         
         return image

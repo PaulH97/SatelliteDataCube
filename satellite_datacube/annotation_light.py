@@ -7,6 +7,7 @@ from rasterio.mask import mask
 from satellite_datacube.utils_light import resample_raster, linear_to_db
 import rioxarray as rxr
 import numpy as np 
+import logging
 
 np.seterr(divide='ignore', invalid='ignore')
  
@@ -17,27 +18,26 @@ class SatCubeAnnotation:
         self.name = f"{inventory_dir.name}" 
         self.shp_file = self.folder / f"{self.name}.shp"
         self.mask_path = self.folder / f"{self.name}_mask.tif"
-        self.gdf = self._initalize_dataframe()
+        self.gdf = self._initialize_dataframe()
         
-    def _initalize_dataframe(self):
-        
-        def repair_geometry(geom):
-            if geom is None or not geom.is_valid:
-                return geom.buffer(0) if geom else None
-            return geom
+    def _initialize_dataframe(self):
+        if not self.shp_file.exists():
+            logging.error("No shapefile found in the specified path.")
+            return None
 
-        if self.shp_file.exists():
+        try:
             gdf = gpd.read_file(self.shp_file)
-            gdf["geometry"] = gdf["geometry"].apply(repair_geometry)
+            gdf["geometry"] = gdf["geometry"].apply(lambda geom: geom.buffer(0) if geom and not geom.is_valid else geom)
+            gdf = gdf.dropna(subset=['geometry'])
             return gdf
-        else:
-            print("No shapefile found in the annotations folder.")
+        
+        except Exception as e:
+            logging.error(f"Failed to process shapefile: {str(e)}")
             return None
     
-    def rasterize_annotations(self, raster_meta, reset=False):
-        if reset and self.mask_path.exists():
-            self.mask_path.unlink()
-            
+    def rasterize_annotations(self, raster_meta):
+        if self.mask_path.exists():
+            return self.mask_path
         raster_crs = raster_meta["crs"]
         if self.gdf.crs != raster_crs:
             self.gdf.to_crs(raster_crs, inplace=True)
@@ -54,57 +54,6 @@ class SatCubeAnnotation:
 
         return self.mask_path
     
-    def calculate_lst_values(self, s1_t_prev, s1_t_curr):
-            
-        anns_lst_data = {}
-
-        with rasterio.open(s1_t_prev.path) as s1_t_prev_src, rasterio.open(s1_t_curr.path) as s1_t_curr_src:
-            
-            if self.gdf.crs != s1_t_prev_src.crs:
-                self.gdf = self.gdf.to_crs(s1_t_prev_src.crs)
-
-            for _, row in self.gdf.iterrows():
-
-                s1_t_prev_clip, _ = mask(s1_t_prev_src, [row.geometry.__geo_interface__], crop=True)
-                s1_t_curr_clip, _ = mask(s1_t_curr_src, [row.geometry.__geo_interface__], crop=True)
-
-                s1_t_prev_db = linear_to_db(s1_t_prev_clip) # converts nodata value from -9999 to np.nan
-                s1_t_curr_db = linear_to_db(s1_t_curr_clip)
-
-                vv_prev, vh_prev = s1_t_prev_db[0], s1_t_prev_db[1]
-                vv_curr, vh_curr = s1_t_curr_db[0], s1_t_curr_db[1]
-                
-                vv_lst = self.calculate_lst(vv_prev, vv_curr)
-                vh_lst = self.calculate_lst(vh_prev, vh_curr)
-                lst = vv_lst + vh_lst 
-
-                anns_lst_data[row["id"]] = {"LST_VV": vv_lst, "LST_VH": vh_lst, "LST": lst}
-
-        return anns_lst_data
-    
-    @staticmethod
-    def calculate_lst(t_prev, t_curr):
-        """
-        Calculate the LST index for a given pair of time-step arrays, ignoring nodata values.
-
-        Parameters:
-        t_prev (np.ndarray): The array of backscatter values at the previous time step.
-        t_curr (np.ndarray): The array of backscatter values at the current time step.
-        nodata (float): The value representing nodata in the arrays.
-
-        Returns:
-        float: The calculated LST index.
-        """
-        masked_t_curr = np.ma.masked_array(t_curr, np.isnan(t_curr))
-        masked_t_prev = np.ma.masked_array(t_prev, np.isnan(t_prev))
-
-        diff_squared = (masked_t_curr - masked_t_prev) ** 2
-        sum_diff_squared = np.sum(diff_squared)
-        n = np.ma.count(diff_squared)
-
-        lst_index = sum_diff_squared / n if n > 0 else np.nan
-        return lst_index
-
     def calculate_ndvi_values(self, ndvi_path, scl_path, good_pixel_threshold=70):
 
         anns_ndvi_data = {}
