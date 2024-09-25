@@ -8,6 +8,7 @@ from satellite_datacube.utils_light import resample_raster, linear_to_db
 import rioxarray as rxr
 import numpy as np 
 import logging
+import tempfile
 
 np.seterr(divide='ignore', invalid='ignore')
  
@@ -55,31 +56,33 @@ class SatCubeAnnotation:
         return self.mask_path
     
     def calculate_ndvi_values(self, ndvi_path, scl_path, good_pixel_threshold=70):
-
         anns_ndvi_data = {}
         annotation_zones = self.preprocess_annotation_zones(buffer_distance=20)
-
+ 
         with rxr.open_rasterio(scl_path) as scl_src:
-            scl_resampled = resample_raster(scl_src)
-            scl_resampled.rio.to_raster(scl_path)
+            x_res = abs(scl_src.rio.resolution()[0])
+            y_res = abs(scl_src.rio.resolution()[1])
+            if (x_res,y_res) != (10,10):
+                scl_resampled = resample_raster(scl_src)
+                scl_resampled.rio.to_raster(scl_path)
 
-        with rasterio.open(scl_path) as scl_src, rasterio.open(ndvi_path) as ndvi_src:
-            
+        with rasterio.open(ndvi_path) as ndvi_src, rasterio.open(scl_path) as scl_src:
+
             if self.gdf.crs != scl_src.crs:
                 self.gdf = self.gdf.to_crs(scl_src.crs)
-            
+
             for _, row in self.gdf.iterrows():
-            
                 annotation_ndvi_mean, annotation_ndvi_median, ann_pixel_count = self.calculate_annotation_ndvi(
                     clip_geom=row.geometry.__geo_interface__, 
                     scl_src=scl_src, 
                     ndvi_src=ndvi_src, 
                     good_pixel_threshold=good_pixel_threshold
-                    )
-                
+                )
+
                 buffer_ndvi_mean, buffer_ndvi_median = self.calculate_annotation_buffer_ndvi(
-                    row.geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count)
-                                                
+                    row.geometry, annotation_zones, scl_src, ndvi_src, ann_pixel_count
+                )
+
                 anns_ndvi_data[int(row["id"])] = {"NDVI": annotation_ndvi_mean, "NDVI_undist": buffer_ndvi_mean}
 
         return anns_ndvi_data
@@ -87,10 +90,10 @@ class SatCubeAnnotation:
     def calculate_annotation_ndvi(self, clip_geom, scl_src, ndvi_src, good_pixel_threshold):
 
         bad_pixel_values = [0, 1, 2, 3, 8, 9, 10, 11]
-        scl_ann, _ = mask(scl_src, [clip_geom], crop=True, nodata=99)
+        scl_ann, _ = mask(scl_src, [clip_geom], crop=True, nodata=-9999)
         ndvi_ann, _ = mask(ndvi_src, [clip_geom], crop=True)
         
-        valid_scl_mask = scl_ann != 99
+        valid_scl_mask = scl_ann != -9999
         valid_ndvi_mask = ~np.isnan(ndvi_ann)
         combined_valid_mask = valid_scl_mask & valid_ndvi_mask
         

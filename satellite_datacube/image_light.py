@@ -192,31 +192,38 @@ class Sentinel2():
         return bad_pixel_ratio
     
     def calculate_ndvi(self, save=False): 
-
-        if self.path.exists():
-            image = self.load_data()
-            nir = image.B08.values
-            red = image.B04.values
-            with np.errstate(divide='ignore', invalid='ignore'):
-                ndvi = np.where((nir + red) == 0, np.nan, (nir - red) / (nir + red))
-            
-            ndvi = np.nan_to_num(ndvi, nan=np.nan, posinf=np.nan, neginf=np.nan)
-            ndvi = np.clip(ndvi, -1, 1)
-
-            ndvi_data_array = xr.DataArray(
-                ndvi,
-                dims=['time', 'y', 'x'],  
-                coords={'time': image['time'].data,'y': image['y'].data,'x': image['x'].data},
-                name='NDVI')
-            
-            image = image.assign(NDVI=ndvi_data_array)
-            
-            if save:
-                ndvi_path = self.path.parent / f"{self.name}_NDVI.tif"
-                if ndvi_path.exists():
-                    ndvi_path.unlink()
-                image['NDVI'].rio.to_raster(ndvi_path)
-                self.band_files['NDVI'] = ndvi_path
+        # Early exit if the input path does not exist
+        if not self.path.exists():
+            raise FileNotFoundError(f"The path {self.path} does not exist.")
+        
+        image = self.load_data()
+        nir = image.B08.values
+        red = image.B04.values
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ndvi = np.where((nir + red) == 0, np.nan, (nir - red) / (nir + red))
+        
+        ndvi = np.nan_to_num(ndvi, nan=np.nan, posinf=np.nan, neginf=np.nan)
+        ndvi = np.clip(ndvi, -1, 1)
+        ndvi_data_array = xr.DataArray(
+            ndvi,
+            dims=['time', 'y', 'x'],  
+            coords={
+                'time': image['time'].data,
+                'y': image['y'].data,
+                'x': image['x'].data
+            },
+            name='NDVI'
+        )
+        
+        image = image.assign(NDVI=ndvi_data_array)
+        
+        if save:
+            ndvi_path = self.path.parent / f"{self.name}_NDVI.tif"
+            if ndvi_path.exists():
+                ndvi_path.unlink()
+            image['NDVI'].rio.to_raster(ndvi_path) 
+            self.band_files['NDVI'] = ndvi_path
         
         return image
 
