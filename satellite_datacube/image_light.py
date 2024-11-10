@@ -1,6 +1,6 @@
 from pathlib import Path
 from datetime import datetime
-from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_raster, extract_band_number, load_file, normalize, build_xr_dataset
+from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_raster, extract_band_number, load_file, normalize
 import xarray as xr
 import rioxarray as rxr
 import numpy as np
@@ -8,6 +8,7 @@ from matplotlib import pyplot as plt
 import rasterio
 import numpy as np
 import gc
+import re
 
 class Sentinel1():
     def __init__(self, folder):
@@ -16,18 +17,22 @@ class Sentinel1():
         self.name = self._initialize_name()
         self.date = self._initialize_date()
         self.orbit_state = self._initialize_orbit_state()
-        self.path = self.folder / f"{self.name}.tif"
+        self.path = self._initialize_path()
 
     def _initialize_name(self):
-        raster_filepath = Path(next(iter(self.band_files.values()))) # s1a_iw_nrb_20170219t095846_015351_0192dd_20ppc-20ppb_vv_dsc.tif
+        raster_filepath = Path(next(iter(self.band_files.values())))
         name_parts = raster_filepath.stem.split("_")
         return "_".join(name_parts[:-2])
-    
+
     def _initialize_date(self):
         date_str = self.name.split("_")[3]
-        date = datetime.strptime(date_str, "%Y%m%dt%H%M%S").date()
-        return date 
-    
+        match = re.match(r"(\d{8})", date_str)  # Updated to match 8-digit date format
+        if match:
+            date = datetime.strptime(match.group(0), "%Y%m%d").date()  # Updated format to YYYYMMDD
+            return date
+        else:
+            raise ValueError(f"Date string {date_str} does not match the expected pattern.")
+
     def _initialize_bands(self):
         bands = {}
         for tif_file in self.folder.glob('*.tif'):
@@ -41,13 +46,18 @@ class Sentinel1():
     
     def _initialize_orbit_state(self):
         orbit_names = {"asc": "ascending", "dsc": "descending"}
-        raster_filepath = Path(next(iter(self.band_files.values())))
-        name_parts = raster_filepath.stem.split("_")
-        if "copied" in name_parts:
-            orbit_info = name_parts[-2]
-        else:
-            orbit_info = name_parts[-1]
-        return orbit_names[orbit_info]
+        for tif_file in self.band_files.values():
+            if 'asc' in tif_file.stem.lower():
+                return orbit_names['asc']
+            elif 'dsc' in tif_file.stem.lower():
+                return orbit_names['dsc']
+        raise ValueError("No valid orbit state found in the file names.")
+
+    def _initialize_path(self):
+        for tif_file in self.folder.glob('*.tif'):
+            if 'vv' not in tif_file.stem.lower() and 'vh' not in tif_file.stem.lower():
+                return tif_file
+        raise ValueError("No valid path found for stacked Sentinel-1 data.")
     
     def stack_bands(self, resolution=10):
         try:
@@ -177,8 +187,12 @@ class Sentinel2():
             return None
                     
     def get_metadata(self):
-        with rasterio.open(self.path) as src:
-            return src.meta.copy()
+        if self.path.exists():
+            with rasterio.open(self.path) as src:
+                meta = src.meta
+            return meta
+        else:
+            return None
         
     def calculate_bad_pixel_ratio(self):
         data = self.load_data()
@@ -191,14 +205,24 @@ class Sentinel2():
         bad_pixel_ratio = np.sum(bad_pixels) / scl_band.size * 100
         return bad_pixel_ratio
     
+    def get_ndvi_path(self):
+        ndvi_path = self.path.parent / f"{self.name}_NDVI.tif"
+        if not ndvi_path.exists():
+            self.calculate_ndvi(save=True)
+        return ndvi_path
+    
     def calculate_ndvi(self, save=False): 
         # Early exit if the input path does not exist
         if not self.path.exists():
             raise FileNotFoundError(f"The path {self.path} does not exist.")
         
         image = self.load_data()
-        nir = image.B08.values
-        red = image.B04.values
+        nir = np.clip(image.B08.values, 0, 10000)
+        red = np.clip(image.B04.values, 0, 10000)
+
+        # Scale to 0-1 range
+        nir = nir / 10000.0
+        red = red / 10000.0
         
         with np.errstate(divide='ignore', invalid='ignore'):
             ndvi = np.where((nir + red) == 0, np.nan, (nir - red) / (nir + red))

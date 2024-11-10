@@ -59,12 +59,12 @@ class SatCubeAnnotation:
         anns_ndvi_data = {}
         annotation_zones = self.preprocess_annotation_zones(buffer_distance=20)
  
-        with rxr.open_rasterio(scl_path) as scl_src:
-            x_res = abs(scl_src.rio.resolution()[0])
-            y_res = abs(scl_src.rio.resolution()[1])
-            if (x_res,y_res) != (10,10):
-                scl_resampled = resample_raster(scl_src)
-                scl_resampled.rio.to_raster(scl_path)
+        # with rxr.open_rasterio(scl_path) as scl_src:
+        #     x_res = abs(scl_src.rio.resolution()[0])
+        #     y_res = abs(scl_src.rio.resolution()[1])
+        #     if (x_res,y_res) != (10,10):
+        #         scl_resampled = resample_raster(scl_src)
+        #         scl_resampled.rio.to_raster(scl_path)
 
         with rasterio.open(ndvi_path) as ndvi_src, rasterio.open(scl_path) as scl_src:
 
