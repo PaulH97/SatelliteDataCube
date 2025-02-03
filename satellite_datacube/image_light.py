@@ -2,13 +2,13 @@ from pathlib import Path
 from datetime import datetime
 from satellite_datacube.utils_light import extract_S2_band_name, extract_S1_band_name, resample_raster, extract_band_number, load_file, normalize
 import xarray as xr
-import rioxarray as rxr
 import numpy as np
 from matplotlib import pyplot as plt
 import rasterio
 import numpy as np
 import gc
 import re
+from rasterio.warp import reproject, Resampling as RioResampling
 
 class Sentinel1():
     def __init__(self, folder):
@@ -17,7 +17,7 @@ class Sentinel1():
         self.name = self._initialize_name()
         self.date = self._initialize_date()
         self.orbit_state = self._initialize_orbit_state()
-        self.path = self._initialize_path()
+        self.path = self.folder / f"{self.name}.tif"
 
     def _initialize_name(self):
         raster_filepath = Path(next(iter(self.band_files.values())))
@@ -25,13 +25,12 @@ class Sentinel1():
         return "_".join(name_parts[:-2])
 
     def _initialize_date(self):
-        date_str = self.name.split("_")[3]
-        match = re.match(r"(\d{8})", date_str)  # Updated to match 8-digit date format
+        match = re.search(r"\d{8}", self.name)  # Updated to search for 8-digit date format
         if match:
             date = datetime.strptime(match.group(0), "%Y%m%d").date()  # Updated format to YYYYMMDD
             return date
         else:
-            raise ValueError(f"Date string {date_str} does not match the expected pattern.")
+            raise ValueError(f"Date string does not match the expected pattern.")
 
     def _initialize_bands(self):
         bands = {}
@@ -52,44 +51,63 @@ class Sentinel1():
             elif 'dsc' in tif_file.stem.lower():
                 return orbit_names['dsc']
         raise ValueError("No valid orbit state found in the file names.")
+                
+    def stack_bands(self):
+            try:
+                # Use the transform and CRS of the first band as the reference
+                first_band_path = next(iter(self.band_files.values()))
+                with rasterio.open(first_band_path) as ref:
+                    ref_transform = ref.transform
+                    ref_crs = ref.crs
+                    ref_width = ref.width
+                    ref_height = ref.height
 
-    def _initialize_path(self):
-        for tif_file in self.folder.glob('*.tif'):
-            if 'vv' not in tif_file.stem.lower() and 'vh' not in tif_file.stem.lower():
-                return tif_file
-        raise ValueError("No valid path found for stacked Sentinel-1 data.")
-    
-    def stack_bands(self, resolution=10):
-        try:
-            resampled_bands = []
-            for band_path in self.band_files.values():
-                with rxr.open_rasterio(band_path) as raster:
-                    if raster.rio.transform() is not None:
-                        if raster.rio.resolution() != (resolution, resolution):
-                            resampled_raster = resample_raster(raster, resolution)
+                stacked_bands = []
+                band_names = []
+
+                for band_name, band_path in self.band_files.items():
+                    with rasterio.open(band_path) as src:
+                        if src.transform != ref_transform or src.crs != ref_crs:
+                            # Reproject the raster to match the reference transform and CRS
+                            data = src.read(1)
+                            reprojected_data = np.empty((ref_height, ref_width), dtype=src.dtypes[0])
+                            reproject(
+                                source=data,
+                                destination=reprojected_data,
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=ref_transform,
+                                dst_crs=ref_crs,
+                                resampling=RioResampling.bilinear
+                            )
                         else:
-                            resampled_raster = raster  # No resampling needed
-                        resampled_bands.append(resampled_raster)
+                            reprojected_data = src.read(1)
 
-            if not resampled_bands:
-                raise ValueError("No valid bands to stack. Exiting stacking process.")
+                        stacked_bands.append(reprojected_data)
+                        if band_name:
+                            band_names.append(band_name)
 
-            ds = xr.concat(resampled_bands, dim='band').assign_coords(band=list(self.band_files.keys())).to_dataset(name='band_data')
-            ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
+                # Save the stacked bands as a GeoTIFF with band descriptions
+                with rasterio.open(
+                    self.path,
+                    "w",
+                    driver="GTiff",
+                    height=ref_height,
+                    width=ref_width,
+                    count=len(stacked_bands),
+                    dtype=stacked_bands[0].dtype,
+                    crs=ref_crs,
+                    transform=ref_transform
+                ) as dst:
+                    for idx, (band_data, band_name) in enumerate(zip(stacked_bands, band_names), start=1):
+                        dst.write(band_data, idx)
+                    # Set all band descriptions at once:
+                    dst.descriptions = tuple(band_names)
+
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                raise
             
-            for i, band_name in enumerate(self.band_files.keys()):
-                ds[band_name] = ds['band_data'].isel(band=i)
-
-            ds = ds.drop_vars('band')
-            ds = ds.drop_vars('band_data')
-            ds.rio.to_raster(self.path, compute=True) #ds.to_netcdf(self.path, compute=True)
-            ds.close()
-            gc.collect()
-
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            raise
-
     def load_data(self):
         if self.path.exists():
             return load_file(self.path)
@@ -146,36 +164,58 @@ class Sentinel2():
             print(f"SCL missing for: {self.folder}")
         return bands
 
-    def stack_bands(self, resolution=10):
-        try:            
-            resampled_bands = []
-            for band_path in self.band_files.values():
-                with rxr.open_rasterio(band_path) as raster:
-                    if raster.rio.transform() is not None:
-                        if raster.rio.resolution() != (resolution, resolution):
-                            resampled_raster = resample_raster(raster, resolution)
-                        else:
-                            resampled_raster = raster  # No resampling needed
-                        resampled_bands.append(resampled_raster)
+    def stack_bands(self):
+        try:
+            # Use the transform and CRS of the first band as the reference
+            first_band_path = next(iter(self.band_files.values()))
+            with rasterio.open(first_band_path) as ref:
+                ref_transform = ref.transform
+                ref_crs = ref.crs
+                ref_width = ref.width
+                ref_height = ref.height
 
-            if not resampled_bands:
-                raise ValueError("No valid bands to stack. Exiting stacking process.")
+            stacked_bands = []
+            band_names = []
 
-            ds = xr.concat(resampled_bands, dim='band').assign_coords(band=list(self.band_files.keys())).to_dataset(name='band_data').chunk({'x': 1000, 'y': 1000})
-            ds.attrs["time"] = np.datetime64(self.date).astype('datetime64[ns]')
-            
-            for i, band_name in enumerate(self.band_files.keys()):
-                ds[band_name] = ds['band_data'].isel(band=i)
+            for band_name, band_path in self.band_files.items():
+                with rasterio.open(band_path) as src:
+                    if src.transform != ref_transform or src.crs != ref_crs:
+                        # Reproject the raster to match the reference transform and CRS
+                        data = src.read(1)
+                        reprojected_data = np.empty((ref_height, ref_width), dtype=src.dtypes[0])
+                        reproject(
+                            source=data,
+                            destination=reprojected_data,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=ref_transform,
+                            dst_crs=ref_crs,
+                            resampling=RioResampling.bilinear
+                        )
+                    else:
+                        reprojected_data = src.read(1)
 
-            ds = ds.drop_vars('band')
-            ds = ds.drop_vars('band_data')
-            ds = ds.persist() 
-            if self.path.exists():
-                self.path.unlink()
-            ds.rio.to_raster(self.path, compute=True) #ds.to_netcdf(self.path, compute=True)
-            ds.close()
-            gc.collect()
-                
+                    stacked_bands.append(reprojected_data)
+                    if band_name:
+                        band_names.append(band_name)
+
+            # Save the stacked bands as a GeoTIFF with band descriptions
+            with rasterio.open(
+                self.path,
+                "w",
+                driver="GTiff",
+                height=ref_height,
+                width=ref_width,
+                count=len(stacked_bands),
+                dtype=stacked_bands[0].dtype,
+                crs=ref_crs,
+                transform=ref_transform
+            ) as dst:
+                for idx, (band_data, band_name) in enumerate(zip(stacked_bands, band_names), start=1):
+                    dst.write(band_data, idx)
+                # Set all band descriptions at once:
+                dst.descriptions = tuple(band_names)
+
         except Exception as e:
             print(f"An error occurred: {e}")
             raise

@@ -126,7 +126,7 @@ class Sentinel1DataCube():
         self.base_folder = Path(base_folder)
         self.satellite = "sentinel-1"
         self.orbit = orbit
-        self.si_folder = self.base_folder / self.satellite / self.orbit
+        self.si_folder = self.base_folder / "sentinel-1-new" / self.orbit
         self.images = self._init_images()
         if load:
             self.data = self._load_data()
@@ -151,8 +151,7 @@ class Sentinel1DataCube():
 
     def _init_images(self):
         images = []
-        images_folder = self.si_folder / "images"
-        for folder in images_folder.iterdir():
+        for folder in self.si_folder.iterdir():
             if folder.is_dir():
                 image = Sentinel1(folder=folder)
                 images.append(image)
